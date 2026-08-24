@@ -349,6 +349,38 @@ impl ConfigValidator {
             errors.push(format!("Invalid disallowed account address: {e}"));
         }
 
+        let ata = &config.validation.fee_payer_policy.system.canonical_ata_creation;
+        if ata.enabled {
+            if config.validation.fee_payer_policy.system.allow_create_account {
+                errors.push(
+                    "canonical_ata_creation requires global allow_create_account=false".to_string(),
+                );
+            }
+            if ata.allowed_output_mints.is_empty() {
+                errors.push("canonical_ata_creation requires at least one output mint".to_string());
+            } else if let Err(e) = TokenUtil::check_valid_tokens(&ata.allowed_output_mints) {
+                errors.push(format!("Invalid canonical ATA output mint: {e}"));
+            }
+            for mint in &ata.allowed_output_mints {
+                if !config.validation.allowed_tokens.contains(mint) {
+                    errors
+                        .push(format!("Canonical ATA output mint {mint} is not in allowed_tokens"));
+                }
+            }
+            for program in [
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+                spl_associated_token_account_interface::program::id().to_string(),
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+                "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
+            ] {
+                if !config.validation.allowed_programs.contains(&program) {
+                    errors
+                        .push(format!("canonical_ata_creation requires allowed program {program}"));
+                }
+            }
+        }
+
         // Validate Token2022 extensions
         if let Err(e) = validate_token2022_extensions(&config.validation.token_2022) {
             errors.push(format!("Token2022 extension validation failed: {e}"));
@@ -1434,6 +1466,7 @@ mod tests {
                 price_source: PriceSource::Jupiter,
                 fee_payer_policy: FeePayerPolicy {
                     system: SystemInstructionPolicy {
+                        canonical_ata_creation: Default::default(),
                         allow_transfer: true,
                         allow_assign: true,
                         allow_create_account: true,

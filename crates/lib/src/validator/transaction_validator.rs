@@ -12,9 +12,13 @@ use crate::{
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID};
 use std::str::FromStr;
 
 use crate::fee::price::PriceModel;
+
+const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 
 pub struct TransactionValidator {
     fee_payer_pubkey: Pubkey,
@@ -114,7 +118,7 @@ impl TransactionValidator {
         self.validate_programs(transaction_resolved)?;
         self.validate_transfer_amounts(transaction_resolved, rpc_client).await?;
         self.validate_disallowed_accounts(transaction_resolved)?;
-        self.validate_fee_payer_usage(transaction_resolved)?;
+        self.validate_fee_payer_usage(transaction_resolved, rpc_client).await?;
 
         Ok(())
     }
@@ -160,44 +164,56 @@ impl TransactionValidator {
         Ok(())
     }
 
-    fn validate_fee_payer_usage(
+    async fn validate_fee_payer_usage(
         &self,
         transaction_resolved: &mut VersionedTransactionResolved,
+        rpc_client: &RpcClient,
     ) -> Result<(), KoraError> {
-        let system_instructions = transaction_resolved.get_or_parse_system_instructions()?;
+        let system_instructions = transaction_resolved.get_or_parse_system_instructions()?.clone();
 
         // Validate system program instructions
-        validate_system!(self, system_instructions, SystemTransfer,
+        validate_system!(self, &system_instructions, SystemTransfer,
             ParsedSystemInstructionData::SystemTransfer { sender, .. } => sender,
             self.fee_payer_policy.system.allow_transfer, "System Transfer");
 
-        validate_system!(self, system_instructions, SystemAssign,
+        validate_system!(self, &system_instructions, SystemAssign,
             ParsedSystemInstructionData::SystemAssign { authority } => authority,
             self.fee_payer_policy.system.allow_assign, "System Assign");
 
-        validate_system!(self, system_instructions, SystemAllocate,
+        validate_system!(self, &system_instructions, SystemAllocate,
             ParsedSystemInstructionData::SystemAllocate { account } => account,
             self.fee_payer_policy.system.allow_allocate, "System Allocate");
 
-        validate_system!(self, system_instructions, SystemCreateAccount,
-            ParsedSystemInstructionData::SystemCreateAccount { payer, .. } => payer,
-            self.fee_payer_policy.system.allow_create_account, "System Create Account");
+        let payer_creations = system_instructions
+            .get(&ParsedSystemInstructionType::SystemCreateAccount)
+            .into_iter()
+            .flatten()
+            .filter(|instruction| {
+                matches!(instruction,
+                ParsedSystemInstructionData::SystemCreateAccount { payer, .. }
+                    if *payer == self.fee_payer_pubkey)
+            })
+            .count();
+        if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
+            self.validate_canonical_ata_creation(transaction_resolved, rpc_client, payer_creations)
+                .await?;
+        }
 
-        validate_system!(self, system_instructions, SystemInitializeNonceAccount,
+        validate_system!(self, &system_instructions, SystemInitializeNonceAccount,
             ParsedSystemInstructionData::SystemInitializeNonceAccount { nonce_authority, .. } => nonce_authority,
             self.fee_payer_policy.system.nonce.allow_initialize, "System Initialize Nonce Account");
 
-        validate_system!(self, system_instructions, SystemAdvanceNonceAccount,
+        validate_system!(self, &system_instructions, SystemAdvanceNonceAccount,
             ParsedSystemInstructionData::SystemAdvanceNonceAccount { nonce_authority, .. } => nonce_authority,
             self.fee_payer_policy.system.nonce.allow_advance, "System Advance Nonce Account");
 
-        validate_system!(self, system_instructions, SystemAuthorizeNonceAccount,
+        validate_system!(self, &system_instructions, SystemAuthorizeNonceAccount,
             ParsedSystemInstructionData::SystemAuthorizeNonceAccount { nonce_authority, .. } => nonce_authority,
             self.fee_payer_policy.system.nonce.allow_authorize, "System Authorize Nonce Account");
 
         // Note: SystemUpgradeNonceAccount not validated - no authority parameter
 
-        validate_system!(self, system_instructions, SystemWithdrawNonceAccount,
+        validate_system!(self, &system_instructions, SystemWithdrawNonceAccount,
             ParsedSystemInstructionData::SystemWithdrawNonceAccount { nonce_authority, .. } => nonce_authority,
             self.fee_payer_policy.system.nonce.allow_withdraw, "System Withdraw Nonce Account");
 
@@ -276,6 +292,177 @@ impl TransactionValidator {
             self.fee_payer_policy.token_2022.allow_thaw_account,
             "SPL Token ThawAccount", "Token2022 Token ThawAccount");
 
+        Ok(())
+    }
+
+    async fn validate_canonical_ata_creation(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+        payer_creations: usize,
+    ) -> Result<(), KoraError> {
+        let policy = &self.fee_payer_policy.system.canonical_ata_creation;
+        if !policy.enabled || payer_creations != 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Fee payer cannot be used for 'System Create Account'".to_string(),
+            ));
+        }
+
+        let token_program = spl_token_interface::id();
+        let ata_program = spl_associated_token_account_interface::program::id();
+        let allowed_mints = policy
+            .allowed_output_mints
+            .iter()
+            .map(|mint| Pubkey::from_str(mint))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| KoraError::ConfigError)?;
+        if allowed_mints.is_empty() {
+            return Err(KoraError::ConfigError);
+        }
+
+        let signer_count =
+            transaction.transaction.message.header().num_required_signatures as usize;
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if signer_count != 2 || signer_keys.first() != Some(&self.fee_payer_pubkey) {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA creation requires exactly the configured payer and GASLESS user signers"
+                    .to_string(),
+            ));
+        }
+        let wallet = signer_keys[1];
+
+        let jupiter_program =
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let raydium_program =
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let outer_instruction_count = transaction.transaction.message.instructions().len();
+        let outer_jupiter_indices = transaction
+            .all_instructions
+            .iter()
+            .take(outer_instruction_count)
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (instruction.program_id == jupiter_program).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let has_outer_raydium = transaction
+            .all_instructions
+            .iter()
+            .take(outer_instruction_count)
+            .any(|instruction| instruction.program_id == raydium_program);
+        if outer_jupiter_indices.len() != 1 || has_outer_raydium {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA exception requires one outer Jupiter v6 swap".to_string(),
+            ));
+        }
+        let jupiter_index = outer_jupiter_indices[0];
+        let raydium_contexts = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| context.instruction.program_id == raydium_program)
+            .collect::<Vec<_>>();
+        if raydium_contexts.is_empty()
+            || raydium_contexts.iter().any(|context| {
+                context.outer_instruction_index as usize != jupiter_index
+                    || context.stack_height != Some(2)
+            })
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA exception requires direct Jupiter to Raydium CLMM CPI".to_string(),
+            ));
+        }
+
+        let candidates = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| {
+                context.instruction.program_id == SYSTEM_PROGRAM_ID
+                    && context.instruction.accounts.first().map(|account| account.pubkey)
+                        == Some(self.fee_payer_pubkey)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA exception permits exactly one payer-funded account creation"
+                    .to_string(),
+            ));
+        }
+        let context = candidates[0];
+        if context.stack_height != Some(2) {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA account creation is not a direct CPI child".to_string(),
+            ));
+        }
+        let outer = transaction
+            .all_instructions
+            .get(context.outer_instruction_index as usize)
+            .ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Canonical ATA parent instruction could not be proven".to_string(),
+                )
+            })?;
+        if outer.program_id != ata_program
+            || outer.data.as_slice() != [1]
+            || outer.accounts.len() != 6
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA parent must be CreateIdempotent".to_string(),
+            ));
+        }
+        let payer = outer.accounts[0].pubkey;
+        let destination = outer.accounts[1].pubkey;
+        let outer_wallet = outer.accounts[2].pubkey;
+        let mint = outer.accounts[3].pubkey;
+        if payer != self.fee_payer_pubkey
+            || outer_wallet != wallet
+            || !allowed_mints.contains(&mint)
+            || outer.accounts[4].pubkey != SYSTEM_PROGRAM_ID
+            || outer.accounts[5].pubkey != token_program
+            || destination
+                != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                    &wallet,
+                    &mint,
+                    &token_program,
+                )
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA parent accounts do not match GASLESS policy".to_string(),
+            ));
+        }
+
+        let (lamports, space, owner) =
+            match bincode::deserialize::<SystemInstruction>(&context.instruction.data) {
+                Ok(SystemInstruction::CreateAccount { lamports, space, owner }) => {
+                    (lamports, space, owner)
+                }
+                _ => {
+                    return Err(KoraError::InvalidTransaction(
+                        "Canonical ATA exception does not permit this System instruction"
+                            .to_string(),
+                    ))
+                }
+            };
+        if context.instruction.accounts.len() != 2
+            || context.instruction.accounts[1].pubkey != destination
+            || owner != token_program
+            || space != 165
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA CreateAccount fields are invalid".to_string(),
+            ));
+        }
+        let rent = rpc_client.get_minimum_balance_for_rent_exemption(165).await?;
+        if lamports != rent {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA CreateAccount rent is invalid".to_string(),
+            ));
+        }
+        let existing = rpc_client.get_multiple_accounts(&[destination]).await?;
+        if existing.first().and_then(|account| account.as_ref()).is_some() {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA destination already exists".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -393,22 +580,26 @@ impl TransactionValidator {
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::FeePayerPolicy,
+        config::{CanonicalAtaCreationPolicy, FeePayerPolicy},
         state::update_config,
         tests::{config_mock::ConfigMockBuilder, rpc_mock::RpcMockBuilder},
-        transaction::TransactionUtil,
+        transaction::{InnerInstructionContext, TransactionUtil},
     };
+    use base64::Engine;
     use serial_test::serial;
 
     use super::*;
+    use serde_json::json;
+    use solana_client::rpc_request::RpcRequest;
     use solana_message::{Message, VersionedMessage};
-    use solana_sdk::instruction::Instruction;
+    use solana_sdk::instruction::{AccountMeta, Instruction};
     use solana_system_interface::{
         instruction::{
             assign, create_account, create_account_with_seed, transfer, transfer_with_seed,
         },
         program::ID as SYSTEM_PROGRAM_ID,
     };
+    use std::collections::HashMap;
 
     // Helper functions to reduce test duplication and setup config
     fn setup_default_config() {
@@ -429,6 +620,164 @@ mod tests {
             .with_fee_payer_policy(policy)
             .build();
         update_config(config).unwrap();
+    }
+
+    fn canonical_ata_fixture(
+        rent: u64,
+        existing: bool,
+    ) -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+    ) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let destination = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program);
+        let mut policy = FeePayerPolicy::default();
+        policy.system.canonical_ata_creation = CanonicalAtaCreationPolicy {
+            enabled: true,
+            allowed_output_mints: vec![mint.to_string()],
+        };
+        setup_config_with_policy(policy);
+        let ata = spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(&payer, &wallet, &mint, &token_program);
+        let jupiter_program = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
+        let raydium_program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
+        let user_signer = Instruction::new_with_bytes(
+            jupiter_program,
+            &[],
+            vec![AccountMeta::new_readonly(wallet, true)],
+        );
+        let message = VersionedMessage::Legacy(Message::new(&[ata, user_signer], Some(&payer)));
+        let mut transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        let create = create_account(&payer, &destination, rent, 165, &token_program);
+        transaction.all_instructions.push(create.clone());
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: create,
+            outer_instruction_index: 0,
+            stack_height: Some(2),
+        });
+        let raydium = Instruction::new_with_bytes(raydium_program, &[], vec![]);
+        transaction.all_instructions.push(raydium.clone());
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: raydium,
+            outer_instruction_index: 1,
+            stack_height: Some(2),
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(rent));
+        mocks.insert(RpcRequest::GetMultipleAccounts, json!({ "context": { "slot": 1 }, "value": if existing { vec![Some(json!({ "data": [base64::engine::general_purpose::STANDARD.encode(vec![0_u8; 165]), "base64"], "executable": false, "lamports": rent, "owner": token_program.to_string(), "rentEpoch": 0 }))] } else { vec![None::<serde_json::Value>] } }));
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc, payer, wallet, mint)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_canonical_ata_exception_accepts_only_exact_direct_shape() {
+        let (validator, transaction, rpc, _, _, _) = canonical_ata_fixture(2_039_280, false);
+        assert!(validator.validate_canonical_ata_creation(&transaction, &rpc, 1).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_canonical_ata_exception_rejects_mutated_fields_and_existing_destination() {
+        let (validator, original, rpc, _, _, _) = canonical_ata_fixture(2_039_280, false);
+        for mutation in 0..7 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.all_instructions[0].accounts[1].pubkey = Pubkey::new_unique(),
+                1 => transaction.all_instructions[0].accounts[2].pubkey = Pubkey::new_unique(),
+                2 => transaction.all_instructions[0].accounts[3].pubkey = Pubkey::new_unique(),
+                3 => {
+                    transaction.all_instructions[0].accounts[5].pubkey =
+                        spl_token_2022_interface::id()
+                }
+                4 => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_280,
+                            space: 165,
+                            owner: Pubkey::new_unique(),
+                        })
+                        .unwrap()
+                }
+                5 => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_279,
+                            space: 165,
+                            owner: spl_token_interface::id(),
+                        })
+                        .unwrap()
+                }
+                _ => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_280,
+                            space: 164,
+                            owner: spl_token_interface::id(),
+                        })
+                        .unwrap()
+                }
+            }
+            assert!(
+                validator.validate_canonical_ata_creation(&transaction, &rpc, 1).await.is_err(),
+                "mutation {mutation} must fail"
+            );
+        }
+        let (validator, transaction, rpc, _, _, _) = canonical_ata_fixture(2_039_280, true);
+        assert!(validator.validate_canonical_ata_creation(&transaction, &rpc, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_canonical_ata_exception_rejects_wrong_parent_depth_direct_seed_and_duplicates()
+    {
+        let (validator, original, rpc, payer, _, _) = canonical_ata_fixture(2_039_280, false);
+        let mut wrong_parent = original.clone();
+        wrong_parent.inner_instruction_contexts[0].outer_instruction_index = 1;
+        assert!(validator.validate_canonical_ata_creation(&wrong_parent, &rpc, 1).await.is_err());
+        let mut nested = original.clone();
+        nested.inner_instruction_contexts[0].stack_height = Some(3);
+        assert!(validator.validate_canonical_ata_creation(&nested, &rpc, 1).await.is_err());
+        let mut direct = original.clone();
+        direct.inner_instruction_contexts.clear();
+        assert!(validator.validate_canonical_ata_creation(&direct, &rpc, 1).await.is_err());
+        let mut seeded = original.clone();
+        let destination = seeded.inner_instruction_contexts[0].instruction.accounts[1].pubkey;
+        seeded.inner_instruction_contexts[0].instruction = create_account_with_seed(
+            &payer,
+            &destination,
+            &payer,
+            "seed",
+            2_039_280,
+            165,
+            &spl_token_interface::id(),
+        );
+        assert!(validator.validate_canonical_ata_creation(&seeded, &rpc, 1).await.is_err());
+        let mut duplicate = original.clone();
+        duplicate.inner_instruction_contexts.push(duplicate.inner_instruction_contexts[0].clone());
+        assert!(validator.validate_canonical_ata_creation(&duplicate, &rpc, 2).await.is_err());
+
+        let mut missing_raydium = original.clone();
+        missing_raydium.inner_instruction_contexts.pop();
+        missing_raydium.all_instructions.pop();
+        assert!(validator
+            .validate_canonical_ata_creation(&missing_raydium, &rpc, 1)
+            .await
+            .is_err());
+
+        let mut raydium_wrong_parent = original.clone();
+        raydium_wrong_parent.inner_instruction_contexts[1].outer_instruction_index = 0;
+        assert!(validator
+            .validate_canonical_ata_creation(&raydium_wrong_parent, &rpc, 1)
+            .await
+            .is_err());
     }
 
     fn setup_spl_config_with_policy(policy: FeePayerPolicy) {

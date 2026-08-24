@@ -25,6 +25,7 @@ use crate::{
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 
 /// A fully resolved transaction with lookup tables and inner instructions resolved
+#[derive(Clone)]
 pub struct VersionedTransactionResolved {
     pub transaction: VersionedTransaction,
 
@@ -34,6 +35,9 @@ pub struct VersionedTransactionResolved {
     // Includes all instructions, including inner instructions
     pub all_instructions: Vec<Instruction>,
 
+    // Simulation provenance for inner instructions. Outer instructions are deliberately excluded.
+    pub inner_instruction_contexts: Vec<InnerInstructionContext>,
+
     // Parsed instructions by type (None if not parsed yet)
     parsed_system_instructions:
         Option<HashMap<ParsedSystemInstructionType, Vec<ParsedSystemInstructionData>>>,
@@ -41,6 +45,13 @@ pub struct VersionedTransactionResolved {
     // Parsed SPL instructions by type (None if not parsed yet)
     parsed_spl_instructions:
         Option<HashMap<ParsedSPLInstructionType, Vec<ParsedSPLInstructionData>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InnerInstructionContext {
+    pub instruction: Instruction,
+    pub outer_instruction_index: u8,
+    pub stack_height: Option<u32>,
 }
 
 impl Deref for VersionedTransactionResolved {
@@ -78,6 +89,7 @@ impl VersionedTransactionResolved {
             transaction: transaction.clone(),
             all_account_keys: vec![],
             all_instructions: vec![],
+            inner_instruction_contexts: vec![],
             parsed_system_instructions: None,
             parsed_spl_instructions: None,
         };
@@ -110,7 +122,10 @@ impl VersionedTransactionResolved {
         let inner_instructions = resolved.fetch_inner_instructions(rpc_client, sig_verify).await?;
 
         resolved.all_instructions.extend(outer_instructions);
-        resolved.all_instructions.extend(inner_instructions);
+        resolved
+            .all_instructions
+            .extend(inner_instructions.iter().map(|context| context.instruction.clone()));
+        resolved.inner_instruction_contexts = inner_instructions;
 
         Ok(resolved)
     }
@@ -126,6 +141,7 @@ impl VersionedTransactionResolved {
                 transaction.message.instructions(),
                 transaction.message.static_account_keys(),
             )?,
+            inner_instruction_contexts: vec![],
             parsed_system_instructions: None,
             parsed_spl_instructions: None,
         })
@@ -136,7 +152,7 @@ impl VersionedTransactionResolved {
         &mut self,
         rpc_client: &RpcClient,
         sig_verify: bool,
-    ) -> Result<Vec<Instruction>, KoraError> {
+    ) -> Result<Vec<InnerInstructionContext>, KoraError> {
         let simulation_result = rpc_client
             .simulate_transaction_with_config(
                 &self.transaction,
@@ -160,32 +176,48 @@ impl VersionedTransactionResolved {
         }
 
         if let Some(inner_instructions) = simulation_result.value.inner_instructions {
-            let mut compiled_inner_instructions: Vec<CompiledInstruction> = vec![];
-
-            inner_instructions.iter().for_each(|ix| {
-                ix.instructions.iter().for_each(|inner_ix| match inner_ix {
-                    UiInstruction::Compiled(ix) => {
-                        compiled_inner_instructions.push(CompiledInstruction {
+            let mut contexts = Vec::new();
+            for group in inner_instructions {
+                for inner_ix in group.instructions {
+                    let stack_height = match &inner_ix {
+                        UiInstruction::Compiled(ix) => ix.stack_height,
+                        UiInstruction::Parsed(parsed) => match parsed {
+                            solana_transaction_status_client_types::UiParsedInstruction::Parsed(ix) => ix.stack_height,
+                            solana_transaction_status_client_types::UiParsedInstruction::PartiallyDecoded(ix) => ix.stack_height,
+                        },
+                    };
+                    let compiled = match &inner_ix {
+                        UiInstruction::Compiled(ix) => Some(CompiledInstruction {
                             program_id_index: ix.program_id_index,
                             accounts: ix.accounts.clone(),
                             data: bs58::decode(&ix.data).into_vec().unwrap_or_default(),
-                        });
-                    }
-                    UiInstruction::Parsed(ui_parsed) => {
-                        if let Some(compiled) = IxUtils::reconstruct_instruction_from_ui(
-                            &UiInstruction::Parsed(ui_parsed.clone()),
+                        }),
+                        UiInstruction::Parsed(_) => IxUtils::reconstruct_instruction_from_ui(
+                            &inner_ix,
                             &self.all_account_keys,
-                        ) {
-                            compiled_inner_instructions.push(compiled);
-                        }
+                        ),
                     }
-                });
-            });
-
-            return IxUtils::uncompile_instructions(
-                &compiled_inner_instructions,
-                &self.all_account_keys,
-            );
+                    .ok_or_else(|| {
+                        KoraError::InvalidTransaction(
+                            "Could not preserve simulated inner-instruction context".to_string(),
+                        )
+                    })?;
+                    let instruction =
+                        IxUtils::uncompile_instructions(&[compiled], &self.all_account_keys)?
+                            .pop()
+                            .ok_or_else(|| {
+                                KoraError::InvalidTransaction(
+                                    "Could not resolve simulated inner instruction".to_string(),
+                                )
+                            })?;
+                    contexts.push(InnerInstructionContext {
+                        instruction,
+                        outer_instruction_index: group.index,
+                        stack_height,
+                    });
+                }
+            }
+            return Ok(contexts);
         }
 
         Ok(vec![])
@@ -908,7 +940,7 @@ mod tests {
             resolved.fetch_inner_instructions(&rpc_client, true).await.unwrap();
 
         assert_eq!(inner_instructions.len(), 1);
-        assert_eq!(inner_instructions[0].data, vec![10, 20, 30]);
+        assert_eq!(inner_instructions[0].instruction.data, vec![10, 20, 30]);
     }
 
     #[tokio::test]
@@ -961,7 +993,7 @@ mod tests {
             resolved.fetch_inner_instructions(&rpc_client, false).await.unwrap();
 
         assert_eq!(inner_instructions.len(), 1);
-        assert_eq!(inner_instructions[0].data, vec![10, 20, 30]);
+        assert_eq!(inner_instructions[0].instruction.data, vec![10, 20, 30]);
     }
 
     #[tokio::test]

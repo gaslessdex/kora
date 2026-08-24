@@ -575,6 +575,7 @@ impl FeePayerPolicyBuilder {
         Self {
             config: FeePayerPolicy {
                 system: SystemInstructionPolicy {
+                    canonical_ata_creation: Default::default(),
                     allow_transfer: false,
                     allow_assign: false,
                     allow_create_account: false,

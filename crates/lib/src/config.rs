@@ -156,9 +156,19 @@ pub struct SystemInstructionPolicy {
     pub allow_create_account: bool,
     /// Allow fee payer to be the account in System Allocate/AllocateWithSeed instructions
     pub allow_allocate: bool,
+    /// GASLESS-only exception for one canonical legacy SPL output ATA created by the fee payer.
+    #[serde(default)]
+    pub canonical_ata_creation: CanonicalAtaCreationPolicy,
     /// Nested policy for nonce account operations
     #[serde(default)]
     pub nonce: NonceInstructionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct CanonicalAtaCreationPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_output_mints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
