@@ -336,6 +336,20 @@ impl TransactionValidator {
         let raydium_program =
             Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         let outer_instruction_count = transaction.transaction.message.instructions().len();
+        let outer_ata_indices = transaction
+            .all_instructions
+            .iter()
+            .take(outer_instruction_count)
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (instruction.program_id == ata_program).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if outer_ata_indices.len() != 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA exception requires exactly one outer ATA instruction".to_string(),
+            ));
+        }
         let outer_jupiter_indices = transaction
             .all_instructions
             .iter()
@@ -763,6 +777,23 @@ mod tests {
         let mut duplicate = original.clone();
         duplicate.inner_instruction_contexts.push(duplicate.inner_instruction_contexts[0].clone());
         assert!(validator.validate_canonical_ata_creation(&duplicate, &rpc, 2).await.is_err());
+
+        let mut duplicate_idempotent_noop = original.clone();
+        let duplicate_ata = duplicate_idempotent_noop.all_instructions[0].clone();
+        if let VersionedMessage::Legacy(message) =
+            &mut duplicate_idempotent_noop.transaction.message
+        {
+            let duplicate_compiled_ata = message.instructions[0].clone();
+            message.instructions.insert(1, duplicate_compiled_ata);
+        } else {
+            unreachable!("canonical ATA fixture uses a legacy message");
+        }
+        duplicate_idempotent_noop.all_instructions.insert(1, duplicate_ata);
+        duplicate_idempotent_noop.inner_instruction_contexts[1].outer_instruction_index = 2;
+        assert!(validator
+            .validate_canonical_ata_creation(&duplicate_idempotent_noop, &rpc, 1)
+            .await
+            .is_err());
 
         let mut missing_raydium = original.clone();
         missing_raydium.inner_instruction_contexts.pop();
