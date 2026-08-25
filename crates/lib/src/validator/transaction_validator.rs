@@ -194,9 +194,28 @@ impl TransactionValidator {
                     if *payer == self.fee_payer_pubkey)
             })
             .count();
+        let jupiter_program =
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let outer_instruction_count = transaction_resolved.transaction.message.instructions().len();
+        let outer = &transaction_resolved.all_instructions[..outer_instruction_count];
+        let has_outer_jupiter =
+            outer.iter().any(|instruction| instruction.program_id == jupiter_program);
         if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
-            self.validate_canonical_ata_creation(transaction_resolved, rpc_client, payer_creations)
+            if has_outer_jupiter {
+                self.validate_canonical_ata_creation(
+                    transaction_resolved,
+                    rpc_client,
+                    payer_creations,
+                )
                 .await?;
+            } else {
+                self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
+            }
+        } else if self.fee_payer_policy.system.send.enabled
+            && !has_outer_jupiter
+            && outer.iter().any(|instruction| instruction.program_id == spl_token_interface::id())
+        {
+            self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
         }
 
         validate_system!(self, &system_instructions, SystemInitializeNonceAccount,
@@ -480,6 +499,299 @@ impl TransactionValidator {
         Ok(())
     }
 
+    async fn validate_send(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+        payer_creations: usize,
+    ) -> Result<(), KoraError> {
+        let policy = &self.fee_payer_policy.system.send;
+        if !policy.enabled || payer_creations > 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Fee payer cannot be used for 'System Create Account'".to_string(),
+            ));
+        }
+
+        let token_program = spl_token_interface::id();
+        let ata_program = spl_associated_token_account_interface::program::id();
+        let compute_program = solana_compute_budget_interface::id();
+        let jupiter_program =
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let raydium_program =
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let settlement_wallet =
+            Pubkey::from_str(&policy.settlement_wallet).map_err(|_| KoraError::ConfigError)?;
+        if settlement_wallet == self.fee_payer_pubkey {
+            return Err(KoraError::InvalidTransaction(
+                "SEND treasury and fee payer must be distinct".to_string(),
+            ));
+        }
+
+        let signer_count =
+            transaction.transaction.message.header().num_required_signatures as usize;
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if signer_count != 2 || signer_keys.first() != Some(&self.fee_payer_pubkey) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND ATA creation requires exactly the configured payer and user signers"
+                    .to_string(),
+            ));
+        }
+        let sender = signer_keys[1];
+        if sender == self.fee_payer_pubkey || sender == settlement_wallet {
+            return Err(KoraError::InvalidTransaction(
+                "SEND identities must be distinct".to_string(),
+            ));
+        }
+
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = &transaction.all_instructions[..outer_count];
+        if transaction.all_instructions.iter().any(|instruction| {
+            instruction.program_id == jupiter_program || instruction.program_id == raydium_program
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND ATA creation does not permit swap programs".to_string(),
+            ));
+        }
+        let send_index = outer
+            .iter()
+            .position(|instruction| instruction.program_id != compute_program)
+            .ok_or_else(|| {
+                KoraError::InvalidTransaction("SEND instructions are missing".to_string())
+            })?;
+        if outer[..send_index].iter().any(|instruction| instruction.program_id != compute_program) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND only permits a compute-budget prefix".to_string(),
+            ));
+        }
+        let creates_recipient_ata = outer[send_index].program_id == ata_program;
+        let transfer_index = send_index + usize::from(creates_recipient_ata);
+        if outer.len() != transfer_index + 3
+            || outer[transfer_index..]
+                .iter()
+                .any(|instruction| instruction.program_id != token_program)
+            || creates_recipient_ata != (payer_creations == 1)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "SEND requires exactly three token transfers and at most one recipient ATA creation"
+                    .to_string(),
+            ));
+        }
+
+        let first_transfer = &outer[transfer_index];
+        if first_transfer.accounts.len() != 4 {
+            return Err(KoraError::InvalidTransaction(
+                "SEND recipient transfer accounts are invalid".to_string(),
+            ));
+        }
+        let mint = first_transfer.accounts[1].pubkey;
+        let destination = first_transfer.accounts[2].pubkey;
+        let approved = policy
+            .approved_mints
+            .iter()
+            .find(|approved| approved.mint == mint.to_string())
+            .ok_or_else(|| {
+                KoraError::InvalidTransaction("SEND mint is not approved".to_string())
+            })?;
+        if !self.allowed_tokens.contains(&mint) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND mint is not globally allowed".to_string(),
+            ));
+        }
+        let settlement = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &settlement_wallet,
+            &mint,
+            &token_program,
+        );
+
+        let recipient_from_creation = if creates_recipient_ata {
+            let ata = &outer[send_index];
+            if ata.data.as_slice() != [1]
+                || ata.accounts.len() != 6
+                || ata.accounts[0].pubkey != self.fee_payer_pubkey
+                || ata.accounts[1].pubkey != destination
+                || ata.accounts[3].pubkey != mint
+                || ata.accounts[4].pubkey != SYSTEM_PROGRAM_ID
+                || ata.accounts[5].pubkey != token_program
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "SEND ATA parent must be an exact CreateIdempotent".to_string(),
+                ));
+            }
+            Some(ata.accounts[2].pubkey)
+        } else {
+            None
+        };
+
+        let payer_system_actions = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| {
+                context.instruction.program_id == SYSTEM_PROGRAM_ID
+                    && context.instruction.accounts.first().map(|account| account.pubkey)
+                        == Some(self.fee_payer_pubkey)
+            })
+            .collect::<Vec<_>>();
+        if payer_system_actions.len() != usize::from(creates_recipient_ata) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND permits only its one payer-funded recipient ATA creation".to_string(),
+            ));
+        }
+        if let Some(creation) = payer_system_actions.first() {
+            if creation.outer_instruction_index as usize != send_index
+                || creation.stack_height != Some(2)
+                || creation.instruction.accounts.len() != 2
+                || creation.instruction.accounts[1].pubkey != destination
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "SEND ATA CreateAccount provenance is invalid".to_string(),
+                ));
+            }
+            let (lamports, space, owner) =
+                match bincode::deserialize::<SystemInstruction>(&creation.instruction.data) {
+                    Ok(SystemInstruction::CreateAccount { lamports, space, owner }) => {
+                        (lamports, space, owner)
+                    }
+                    _ => {
+                        return Err(KoraError::InvalidTransaction(
+                            "SEND ATA creation does not permit this System instruction".to_string(),
+                        ))
+                    }
+                };
+            let rent = rpc_client.get_minimum_balance_for_rent_exemption(165).await?;
+            if owner != token_program || space != 165 || lamports != rent {
+                return Err(KoraError::InvalidTransaction(
+                    "SEND ATA CreateAccount fields are invalid".to_string(),
+                ));
+            }
+        }
+
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &sender,
+            &mint,
+            &token_program,
+        );
+        let expected_destinations = [destination, settlement, settlement];
+        let mut total_debit = 0_u64;
+        for (index, instruction) in outer[transfer_index..].iter().enumerate() {
+            let (amount, decimals) =
+                match spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data)
+                {
+                    Ok(spl_token_interface::instruction::TokenInstruction::TransferChecked {
+                        amount,
+                        decimals,
+                    }) => (amount, decimals),
+                    _ => {
+                        return Err(KoraError::InvalidTransaction(
+                            "SEND requires TransferChecked instructions".to_string(),
+                        ))
+                    }
+                };
+            if amount == 0
+                || decimals != approved.decimals
+                || instruction.accounts.len() != 4
+                || instruction.accounts[0].pubkey != source
+                || instruction.accounts[1].pubkey != mint
+                || instruction.accounts[2].pubkey != expected_destinations[index]
+                || instruction.accounts[3].pubkey != sender
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "SEND transfer fields do not match policy".to_string(),
+                ));
+            }
+            total_debit = total_debit.checked_add(amount).ok_or_else(|| {
+                KoraError::InvalidTransaction("SEND token debit overflow".to_string())
+            })?;
+        }
+        if transaction.inner_instruction_contexts.iter().any(|context| {
+            context.instruction.program_id == token_program
+                && matches!(
+                    spl_token_interface::instruction::TokenInstruction::unpack(
+                        &context.instruction.data
+                    ),
+                    Ok(spl_token_interface::instruction::TokenInstruction::Transfer { .. })
+                        | Ok(spl_token_interface::instruction::TokenInstruction::TransferChecked {
+                            ..
+                        })
+                )
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "SEND does not permit inner token transfers".to_string(),
+            ));
+        }
+
+        let accounts = rpc_client.get_multiple_accounts(&[destination, source, settlement]).await?;
+        let destination_account = accounts.first().and_then(|account| account.as_ref());
+        if destination_account.is_some() == creates_recipient_ata {
+            return Err(KoraError::InvalidTransaction(
+                "SEND recipient ATA existence does not match the transaction".to_string(),
+            ));
+        }
+        let source_account =
+            accounts.get(1).and_then(|account| account.as_ref()).ok_or_else(|| {
+                KoraError::InvalidTransaction("SEND source ATA is missing".to_string())
+            })?;
+        let settlement_account =
+            accounts.get(2).and_then(|account| account.as_ref()).ok_or_else(|| {
+                KoraError::InvalidTransaction("SEND settlement ATA is missing".to_string())
+            })?;
+        let token_account_valid =
+            |account: &solana_sdk::account::Account, expected_owner: Option<Pubkey>| {
+                account.owner == token_program
+                    && account.data.len() == 165
+                    && Pubkey::try_from(&account.data[0..32]).ok() == Some(mint)
+                    && expected_owner
+                        .map(|owner| Pubkey::try_from(&account.data[32..64]).ok() == Some(owner))
+                        .unwrap_or(true)
+                    && account.data[108] == 1
+            };
+        let recipient = match recipient_from_creation {
+            Some(recipient) => recipient,
+            None => {
+                let account = destination_account.ok_or_else(|| {
+                    KoraError::InvalidTransaction("SEND recipient ATA is missing".to_string())
+                })?;
+                if !token_account_valid(account, None) {
+                    return Err(KoraError::InvalidTransaction(
+                        "SEND recipient ATA is unhealthy".to_string(),
+                    ));
+                }
+                Pubkey::try_from(&account.data[32..64]).map_err(|_| {
+                    KoraError::InvalidTransaction("SEND recipient owner is invalid".to_string())
+                })?
+            }
+        };
+        if !recipient.is_on_curve()
+            || recipient == sender
+            || recipient == self.fee_payer_pubkey
+            || recipient == settlement_wallet
+            || destination
+                != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                    &recipient,
+                    &mint,
+                    &token_program,
+                )
+        {
+            return Err(KoraError::InvalidTransaction(
+                "SEND recipient identity or canonical ATA is invalid".to_string(),
+            ));
+        }
+        if !token_account_valid(source_account, Some(sender))
+            || u64::from_le_bytes(
+                source_account.data[64..72].try_into().map_err(|_| {
+                    KoraError::InvalidTransaction("SEND source is invalid".to_string())
+                })?,
+            ) < total_debit
+            || source_account.data[72..76] != [0, 0, 0, 0]
+            || !token_account_valid(settlement_account, Some(settlement_wallet))
+            || settlement_account.data[72..76] != [0, 0, 0, 0]
+        {
+            return Err(KoraError::InvalidTransaction(
+                "SEND token accounts are not healthy".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn validate_transfer_amounts(
         &self,
         transaction_resolved: &mut VersionedTransactionResolved,
@@ -594,7 +906,7 @@ impl TransactionValidator {
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::{CanonicalAtaCreationPolicy, FeePayerPolicy},
+        config::{CanonicalAtaCreationPolicy, FeePayerPolicy, SendMintPolicy, SendPolicy},
         state::update_config,
         tests::{config_mock::ConfigMockBuilder, rpc_mock::RpcMockBuilder},
         transaction::{InnerInstructionContext, TransactionUtil},
@@ -627,12 +939,23 @@ mod tests {
     }
 
     fn setup_config_with_policy(policy: FeePayerPolicy) {
-        let config = ConfigMockBuilder::new()
+        let allowed_tokens = policy
+            .system
+            .canonical_ata_creation
+            .allowed_output_mints
+            .iter()
+            .cloned()
+            .chain(policy.system.send.approved_mints.iter().map(|approved| approved.mint.clone()))
+            .collect::<Vec<_>>();
+        let mut builder = ConfigMockBuilder::new()
             .with_price_source(PriceSource::Mock)
             .with_allowed_programs(vec![SYSTEM_PROGRAM_ID.to_string()])
             .with_max_allowed_lamports(1_000_000)
-            .with_fee_payer_policy(policy)
-            .build();
+            .with_fee_payer_policy(policy);
+        if !allowed_tokens.is_empty() {
+            builder = builder.with_allowed_tokens(allowed_tokens);
+        }
+        let config = builder.build();
         update_config(config).unwrap();
     }
 
@@ -809,6 +1132,382 @@ mod tests {
             .validate_canonical_ata_creation(&raydium_wrong_parent, &rpc, 1)
             .await
             .is_err());
+    }
+
+    fn send_token_account_json(
+        mint: &Pubkey,
+        owner: &Pubkey,
+        amount: u64,
+        token_program: &Pubkey,
+        state: u8,
+        delegated: bool,
+    ) -> serde_json::Value {
+        let mut data = vec![0_u8; 165];
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(owner.as_ref());
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        if delegated {
+            data[72..76].copy_from_slice(&1_u32.to_le_bytes());
+        }
+        data[108] = state;
+        json!({
+            "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"],
+            "executable": false,
+            "lamports": 2_039_280,
+            "owner": token_program.to_string(),
+            "rentEpoch": 0
+        })
+    }
+
+    fn send_ata_fixture_with_source(
+        existing: bool,
+        source_state: u8,
+        source_amount: u64,
+        source_delegated: bool,
+    ) -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+    ) {
+        let payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = loop {
+            let candidate = Pubkey::new_unique();
+            if candidate.is_on_curve() {
+                break candidate;
+            }
+        };
+        let treasury = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&sender, &mint, &token_program);
+        let destination = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
+        let settlement = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&treasury, &mint, &token_program);
+        let mut policy = FeePayerPolicy::default();
+        policy.system.send = SendPolicy {
+            enabled: true,
+            settlement_wallet: treasury.to_string(),
+            approved_mints: vec![SendMintPolicy { mint: mint.to_string(), decimals: 6 }],
+        };
+        setup_config_with_policy(policy);
+        let ata = spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(&payer, &recipient, &mint, &token_program);
+        let recipient_transfer = spl_token_interface::instruction::transfer_checked(
+            &token_program,
+            &source,
+            &mint,
+            &destination,
+            &sender,
+            &[],
+            500_000,
+            6,
+        )
+        .unwrap();
+        let reimbursement = spl_token_interface::instruction::transfer_checked(
+            &token_program,
+            &source,
+            &mint,
+            &settlement,
+            &sender,
+            &[],
+            2_100,
+            6,
+        )
+        .unwrap();
+        let service_fee = spl_token_interface::instruction::transfer_checked(
+            &token_program,
+            &source,
+            &mint,
+            &settlement,
+            &sender,
+            &[],
+            500,
+            6,
+        )
+        .unwrap();
+        let mut instructions = vec![recipient_transfer, reimbursement, service_fee];
+        if !existing {
+            instructions.insert(0, ata);
+        }
+        let message = VersionedMessage::Legacy(Message::new(&instructions, Some(&payer)));
+        let mut transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        if !existing {
+            let create = create_account(&payer, &destination, 2_039_280, 165, &token_program);
+            transaction.all_instructions.push(create.clone());
+            transaction.inner_instruction_contexts.push(InnerInstructionContext {
+                instruction: create,
+                outer_instruction_index: 0,
+                stack_height: Some(2),
+            });
+        }
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(2_039_280));
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({
+                "context": { "slot": 1 },
+                "value": [
+                    if existing { Some(send_token_account_json(&mint, &recipient, 0, &token_program, 1, false)) } else { None },
+                    Some(send_token_account_json(&mint, &sender, source_amount, &token_program, source_state, source_delegated)),
+                    Some(send_token_account_json(&mint, &treasury, 0, &token_program, 1, false))
+                ]
+            }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (
+            TransactionValidator::new(payer).unwrap(),
+            transaction,
+            rpc,
+            payer,
+            sender,
+            recipient,
+            mint,
+            settlement,
+        )
+    }
+
+    fn send_ata_fixture(
+        existing: bool,
+    ) -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+        Pubkey,
+    ) {
+        send_ata_fixture_with_source(existing, 1, 1_000_000, false)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_ata_exception_accepts_only_exact_standalone_shape() {
+        let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(false);
+        let result = validator.validate_send(&transaction, &rpc, 1).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(true);
+        let result = validator.validate_send(&transaction, &rpc, 0).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_policy_uses_runtime_mints_and_transaction_recipients() {
+        let (validator, transaction, rpc, payer, _, recipient_a, mint_b, _) =
+            send_ata_fixture(false);
+        let treasury = validator.fee_payer_policy.system.send.settlement_wallet.clone();
+        let unapproved_mint_c = Pubkey::new_unique();
+
+        let mut policy = FeePayerPolicy::default();
+        policy.system.send = SendPolicy {
+            enabled: true,
+            settlement_wallet: treasury.clone(),
+            approved_mints: vec![SendMintPolicy {
+                mint: unapproved_mint_c.to_string(),
+                decimals: 6,
+            }],
+        };
+        setup_config_with_policy(policy);
+        let validator = TransactionValidator::new(payer).unwrap();
+        assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
+
+        let mut policy = FeePayerPolicy::default();
+        policy.system.send = SendPolicy {
+            enabled: true,
+            settlement_wallet: treasury,
+            approved_mints: vec![SendMintPolicy { mint: mint_b.to_string(), decimals: 6 }],
+        };
+        setup_config_with_policy(policy);
+        let validator = TransactionValidator::new(payer).unwrap();
+        assert!(validator.validate_send(&transaction, &rpc, 1).await.is_ok());
+
+        let (_, _, _, _, _, recipient_b, _, _) = send_ata_fixture(false);
+        assert_ne!(recipient_a, recipient_b);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_policy_rejects_reserved_and_off_curve_recipients() {
+        let (validator, original, rpc, payer, sender, _, _, _) = send_ata_fixture(false);
+        let treasury =
+            Pubkey::from_str(&validator.fee_payer_policy.system.send.settlement_wallet).unwrap();
+        let off_curve = loop {
+            let candidate = Pubkey::new_unique();
+            if !candidate.is_on_curve() {
+                break candidate;
+            }
+        };
+        for recipient in [payer, sender, treasury, off_curve] {
+            let mut transaction = original.clone();
+            transaction.all_instructions[0].accounts[2].pubkey = recipient;
+            assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_ata_exception_rejects_identity_account_and_transfer_mutations() {
+        let (validator, original, rpc, _, _, _, _, _) = send_ata_fixture(false);
+        for mutation in 0..12 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.all_instructions[0].accounts[0].pubkey = Pubkey::new_unique(),
+                1 => transaction.all_instructions[0].accounts[1].pubkey = Pubkey::new_unique(),
+                2 => transaction.all_instructions[0].accounts[2].pubkey = Pubkey::new_unique(),
+                3 => transaction.all_instructions[0].accounts[3].pubkey = Pubkey::new_unique(),
+                4 => {
+                    transaction.all_instructions[0].accounts[5].pubkey =
+                        spl_token_2022_interface::id()
+                }
+                5 => transaction.all_instructions[1].accounts[0].pubkey = Pubkey::new_unique(),
+                6 => transaction.all_instructions[1].accounts[1].pubkey = Pubkey::new_unique(),
+                7 => transaction.all_instructions[1].accounts[2].pubkey = Pubkey::new_unique(),
+                8 => transaction.all_instructions[1].accounts[3].pubkey = Pubkey::new_unique(),
+                9 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                10 => transaction.all_instructions[3].accounts[2].pubkey = Pubkey::new_unique(),
+                _ => transaction.all_instructions[1].data[9] = 9,
+            }
+            assert!(
+                validator.validate_send(&transaction, &rpc, 1).await.is_err(),
+                "mutation {mutation} must fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_ata_exception_rejects_creation_shape_swap_and_existing_destination() {
+        let (validator, original, rpc, payer, _, _, _, _) = send_ata_fixture(false);
+        for mutation in 0..8 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.inner_instruction_contexts[0].stack_height = Some(3),
+                1 => transaction.inner_instruction_contexts[0].outer_instruction_index = 1,
+                2 => {
+                    transaction.inner_instruction_contexts[0].instruction = create_account_with_seed(
+                        &payer,
+                        &transaction.inner_instruction_contexts[0].instruction.accounts[1].pubkey,
+                        &payer,
+                        "seed",
+                        2_039_280,
+                        165,
+                        &spl_token_interface::id(),
+                    )
+                }
+                3 => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_279,
+                            space: 165,
+                            owner: spl_token_interface::id(),
+                        })
+                        .unwrap()
+                }
+                4 => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_280,
+                            space: 164,
+                            owner: spl_token_interface::id(),
+                        })
+                        .unwrap()
+                }
+                5 => {
+                    transaction.inner_instruction_contexts[0].instruction.data =
+                        bincode::serialize(&SystemInstruction::CreateAccount {
+                            lamports: 2_039_280,
+                            space: 165,
+                            owner: Pubkey::new_unique(),
+                        })
+                        .unwrap()
+                }
+                6 => transaction
+                    .inner_instruction_contexts
+                    .push(transaction.inner_instruction_contexts[0].clone()),
+                _ => {
+                    transaction.all_instructions[1].program_id =
+                        Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap()
+                }
+            }
+            assert!(
+                validator.validate_send(&transaction, &rpc, 1).await.is_err(),
+                "mutation {mutation} must fail"
+            );
+        }
+        let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(true);
+        assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_ata_exception_rejects_extra_or_non_checked_transfers_and_signers() {
+        let (validator, original, rpc, _, sender, _, _, _) = send_ata_fixture(false);
+        let mut zero = original.clone();
+        zero.all_instructions[1].data[1..9].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(validator.validate_send(&zero, &rpc, 1).await.is_err());
+
+        let mut unchecked = original.clone();
+        unchecked.all_instructions[1] = spl_token_interface::instruction::transfer(
+            &spl_token_interface::id(),
+            &unchecked.all_instructions[1].accounts[0].pubkey,
+            &unchecked.all_instructions[1].accounts[2].pubkey,
+            &sender,
+            &[],
+            500_000,
+        )
+        .unwrap();
+        assert!(validator.validate_send(&unchecked, &rpc, 1).await.is_err());
+
+        let mut inner_transfer = original.clone();
+        inner_transfer.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: inner_transfer.all_instructions[1].clone(),
+            outer_instruction_index: 1,
+            stack_height: Some(2),
+        });
+        assert!(validator.validate_send(&inner_transfer, &rpc, 1).await.is_err());
+
+        let mut extra_signer = original.clone();
+        if let VersionedMessage::Legacy(message) = &mut extra_signer.transaction.message {
+            message.header.num_required_signatures = 3;
+        }
+        assert!(validator.validate_send(&extra_signer, &rpc, 1).await.is_err());
+
+        for system_instruction in [
+            transfer(&original.all_instructions[0].accounts[0].pubkey, &Pubkey::new_unique(), 1),
+            solana_system_interface::instruction::allocate(
+                &original.all_instructions[0].accounts[0].pubkey,
+                1,
+            ),
+            assign(&original.all_instructions[0].accounts[0].pubkey, &Pubkey::new_unique()),
+        ] {
+            let mut transaction = original.clone();
+            transaction.inner_instruction_contexts.push(InnerInstructionContext {
+                instruction: system_instruction,
+                outer_instruction_index: 0,
+                stack_height: Some(2),
+            });
+            assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_ata_exception_rejects_unhealthy_or_underfunded_source() {
+        for (state, amount, delegated) in
+            [(2, 1_000_000, false), (1, 1_000_000, true), (1, 502_599, false)]
+        {
+            let (validator, transaction, rpc, _, _, _, _, _) =
+                send_ata_fixture_with_source(false, state, amount, delegated);
+            assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
+        }
     }
 
     fn setup_spl_config_with_policy(policy: FeePayerPolicy) {

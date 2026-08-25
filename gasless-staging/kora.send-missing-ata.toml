@@ -1,0 +1,125 @@
+[kora]
+rate_limit = 10
+payment_address = "EEFxZ3mtdPXNKkBQkbuAw1HBPvQvU2HVKWvRVbuciSsb"
+
+[kora.auth]
+
+[kora.enabled_methods]
+liveness = true
+estimate_transaction_fee = false
+get_supported_tokens = false
+sign_transaction = true
+sign_and_send_transaction = false
+transfer_transaction = false
+get_blockhash = true
+get_config = true
+get_payer_signer = true
+
+[validation]
+max_allowed_lamports = 3000000
+max_signatures = 2
+price_source = "Jupiter"
+allowed_programs = [
+  "11111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+  "ComputeBudget111111111111111111111111111111",
+]
+allowed_tokens = ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+allowed_spl_paid_tokens = []
+disallowed_accounts = []
+
+[validation.fee_payer_policy]
+
+[validation.fee_payer_policy.system]
+allow_transfer = false
+allow_assign = false
+allow_create_account = false
+allow_allocate = false
+
+[validation.fee_payer_policy.system.canonical_ata_creation]
+enabled = false
+allowed_output_mints = []
+
+[validation.fee_payer_policy.system.send]
+enabled = true
+settlement_wallet = "EEFxZ3mtdPXNKkBQkbuAw1HBPvQvU2HVKWvRVbuciSsb"
+approved_mints = [
+  { mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals = 6 },
+]
+
+[validation.fee_payer_policy.system.nonce]
+allow_initialize = false
+allow_advance = false
+allow_authorize = false
+allow_withdraw = false
+
+[validation.fee_payer_policy.spl_token]
+allow_transfer = false
+allow_burn = false
+allow_close_account = false
+allow_approve = false
+allow_revoke = false
+allow_set_authority = false
+allow_mint_to = false
+allow_initialize_mint = false
+allow_initialize_account = false
+allow_initialize_multisig = false
+allow_freeze_account = false
+allow_thaw_account = false
+
+[validation.fee_payer_policy.token_2022]
+allow_transfer = false
+allow_burn = false
+allow_close_account = false
+allow_approve = false
+allow_revoke = false
+allow_set_authority = false
+allow_mint_to = false
+allow_initialize_mint = false
+allow_initialize_account = false
+allow_initialize_multisig = false
+allow_freeze_account = false
+allow_thaw_account = false
+
+[validation.price]
+type = "free"
+
+[validation.token_2022]
+blocked_mint_extensions = [
+  "confidential_transfer_mint",
+  "confidential_mint_burn",
+  "transfer_fee_config",
+  "mint_close_authority",
+  "interest_bearing_config",
+  "non_transferable",
+  "permanent_delegate",
+  "transfer_hook",
+  "pausable",
+]
+blocked_account_extensions = [
+  "confidential_transfer_account",
+  "non_transferable_account",
+  "transfer_hook_account",
+  "pausable_account",
+  "memo_transfer",
+  "cpi_guard",
+  "immutable_owner",
+  "default_account_state",
+]
+
+[metrics]
+enabled = false
+endpoint = "/metrics"
+port = 10000
+scrape_interval = 60
+
+[metrics.fee_payer_balance]
+enabled = true
+expiry_seconds = 30
+
+[kora.usage_limit]
+enabled = false
+cache_url = "redis://127.0.0.1:6379"
+max_transactions = 1
+fallback_if_unavailable = false

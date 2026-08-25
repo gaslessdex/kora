@@ -159,6 +159,9 @@ pub struct SystemInstructionPolicy {
     /// GASLESS-only exception for one canonical legacy SPL output ATA created by the fee payer.
     #[serde(default)]
     pub canonical_ata_creation: CanonicalAtaCreationPolicy,
+    /// GASLESS-only policy for exact standalone SEND transactions.
+    #[serde(default)]
+    pub send: SendPolicy,
     /// Nested policy for nonce account operations
     #[serde(default)]
     pub nonce: NonceInstructionPolicy,
@@ -169,6 +172,21 @@ pub struct CanonicalAtaCreationPolicy {
     pub enabled: bool,
     #[serde(default)]
     pub allowed_output_mints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct SendPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub settlement_wallet: String,
+    #[serde(default)]
+    pub approved_mints: Vec<SendMintPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct SendMintPolicy {
+    pub mint: String,
+    pub decimals: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

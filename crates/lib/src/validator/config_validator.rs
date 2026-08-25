@@ -16,6 +16,7 @@ use crate::{
     KoraError,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_program_pack::Pack;
 use solana_sdk::{account::Account, pubkey::Pubkey};
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use spl_token_2022_interface::{
@@ -23,7 +24,10 @@ use spl_token_2022_interface::{
     state::Mint as Token2022MintState,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_interface::ID as SPL_TOKEN_PROGRAM_ID;
+use spl_token_interface::{
+    state::{Account as SplTokenAccount, AccountState, Mint as SplTokenMint},
+    ID as SPL_TOKEN_PROGRAM_ID,
+};
 
 pub struct ConfigValidator {}
 
@@ -381,6 +385,46 @@ impl ConfigValidator {
             }
         }
 
+        let send = &config.validation.fee_payer_policy.system.send;
+        if send.enabled {
+            if config.validation.fee_payer_policy.system.allow_create_account {
+                errors.push("send requires global allow_create_account=false".to_string());
+            }
+            if Pubkey::from_str(&send.settlement_wallet).is_err() {
+                errors.push("Invalid SEND settlement_wallet".to_string());
+            }
+            if send.approved_mints.is_empty() {
+                errors.push("SEND requires at least one approved mint".to_string());
+            }
+            let mut seen_mints = std::collections::HashSet::new();
+            for approved in &send.approved_mints {
+                if Pubkey::from_str(&approved.mint).is_err() {
+                    errors.push(format!("Invalid SEND mint {}", approved.mint));
+                }
+                if !seen_mints.insert(&approved.mint) {
+                    errors.push(format!("Duplicate SEND mint {}", approved.mint));
+                }
+                if !config.validation.allowed_tokens.contains(&approved.mint) {
+                    errors.push(format!("SEND mint {} is not in allowed_tokens", approved.mint));
+                }
+                if approved.decimals == 0 || approved.decimals > 9 {
+                    errors.push(format!(
+                        "SEND mint {} decimals must be between 1 and 9",
+                        approved.mint
+                    ));
+                }
+            }
+            for program in [
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+                spl_associated_token_account_interface::program::id().to_string(),
+            ] {
+                if !config.validation.allowed_programs.contains(&program) {
+                    errors.push(format!("send requires allowed program {program}"));
+                }
+            }
+        }
+
         // Validate Token2022 extensions
         if let Err(e) = validate_token2022_extensions(&config.validation.token_2022) {
             errors.push(format!("Token2022 extension validation failed: {e}"));
@@ -526,6 +570,55 @@ impl ConfigValidator {
                         validate_account(rpc_client, &token_pubkey, Some(AccountType::Mint)).await
                     {
                         errors.push(format!("Token {token_str} validation failed: {e}"));
+                    }
+                }
+            }
+
+            let send = &config.validation.fee_payer_policy.system.send;
+            if send.enabled {
+                if let Ok(settlement_wallet) = Pubkey::from_str(&send.settlement_wallet) {
+                    for approved in &send.approved_mints {
+                        let Ok(mint) = Pubkey::from_str(&approved.mint) else {
+                            continue;
+                        };
+                        match rpc_client.get_account(&mint).await {
+                            Ok(account) => match SplTokenMint::unpack(&account.data) {
+                                Ok(state)
+                                    if account.owner == SPL_TOKEN_PROGRAM_ID
+                                        && state.is_initialized
+                                        && state.decimals == approved.decimals => {}
+                                _ => errors.push(format!(
+                                    "SEND mint {} is not a healthy legacy SPL mint with configured decimals",
+                                    approved.mint
+                                )),
+                            },
+                            Err(e) => errors.push(format!(
+                                "SEND mint {} validation failed: {e}",
+                                approved.mint
+                            )),
+                        }
+
+                        let settlement = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                            &settlement_wallet,
+                            &mint,
+                            &SPL_TOKEN_PROGRAM_ID,
+                        );
+                        match rpc_client.get_account(&settlement).await {
+                            Ok(account) => match SplTokenAccount::unpack(&account.data) {
+                                Ok(state)
+                                    if account.owner == SPL_TOKEN_PROGRAM_ID
+                                        && state.mint == mint
+                                        && state.owner == settlement_wallet
+                                        && state.state == AccountState::Initialized
+                                        && state.delegate.is_none() => {}
+                                _ => errors.push(format!(
+                                    "SEND treasury ATA {settlement} is not a healthy canonical legacy SPL account"
+                                )),
+                            },
+                            Err(e) => errors.push(format!(
+                                "SEND treasury ATA {settlement} validation failed: {e}"
+                            )),
+                        }
                     }
                 }
             }
@@ -1467,6 +1560,7 @@ mod tests {
                 fee_payer_policy: FeePayerPolicy {
                     system: SystemInstructionPolicy {
                         canonical_ata_creation: Default::default(),
+                        send: Default::default(),
                         allow_transfer: true,
                         allow_assign: true,
                         allow_create_account: true,
