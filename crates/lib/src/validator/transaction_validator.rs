@@ -200,6 +200,11 @@ impl TransactionValidator {
         let outer = &transaction_resolved.all_instructions[..outer_instruction_count];
         let has_outer_jupiter =
             outer.iter().any(|instruction| instruction.program_id == jupiter_program);
+        let has_clean_shape = !has_outer_jupiter
+            && outer.iter().any(|instruction| {
+                instruction.program_id == spl_token_interface::id()
+                    && matches!(instruction.data.first(), Some(8 | 9))
+            });
         if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
             if has_outer_jupiter {
                 self.validate_canonical_ata_creation(
@@ -211,6 +216,11 @@ impl TransactionValidator {
             } else {
                 self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
             }
+        } else if has_clean_shape
+            && (self.fee_payer_policy.system.clean.claim_enabled
+                || self.fee_payer_policy.system.clean.burn_enabled)
+        {
+            self.validate_clean(transaction_resolved, rpc_client).await?;
         } else if self.fee_payer_policy.system.send.enabled
             && !has_outer_jupiter
             && outer.iter().any(|instruction| instruction.program_id == spl_token_interface::id())
@@ -311,6 +321,230 @@ impl TransactionValidator {
             self.fee_payer_policy.token_2022.allow_thaw_account,
             "SPL Token ThawAccount", "Token2022 Token ThawAccount");
 
+        Ok(())
+    }
+
+    async fn validate_clean(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+    ) -> Result<(), KoraError> {
+        let policy = &self.fee_payer_policy.system.clean;
+        let token_program = spl_token_interface::id();
+        let compute_program = solana_compute_budget_interface::id();
+        let settlement_wallet =
+            Pubkey::from_str(&policy.settlement_wallet).map_err(|_| KoraError::ConfigError)?;
+        let message = match &transaction.transaction.message {
+            solana_message::VersionedMessage::V0(message)
+                if message.address_table_lookups.is_empty() =>
+            {
+                message
+            }
+            _ => {
+                return Err(KoraError::InvalidTransaction(
+                    "CLEAN Claim/Burn requires a v0 message without lookup tables".to_string(),
+                ))
+            }
+        };
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if transaction.transaction.message.header().num_required_signatures != 2
+            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
+            || signer_keys.first() != Some(&self.fee_payer_pubkey)
+            || signer_keys.get(1).is_none()
+        {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN requires exactly the configured payer and user signers".to_string(),
+            ));
+        }
+        let wallet = signer_keys[1];
+        if wallet == self.fee_payer_pubkey || wallet == settlement_wallet {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN identities must be distinct".to_string(),
+            ));
+        }
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = &transaction.all_instructions[..outer_count];
+        if outer.len() < 4
+            || outer[0].program_id != compute_program
+            || outer[0].data.as_slice() != [3, 216, 184, 5, 0, 0, 0, 0, 0]
+            || outer[1].program_id != compute_program
+            || outer[1].data.len() != 5
+            || outer[1].data[0] != 2
+            || outer[2..].iter().any(|instruction| instruction.program_id == compute_program)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN compute-budget prefix is invalid".to_string(),
+            ));
+        }
+        let compute_limit =
+            u32::from_le_bytes(outer[1].data[1..5].try_into().map_err(|_| KoraError::ConfigError)?);
+        let transfer = outer.last().ok_or_else(|| {
+            KoraError::InvalidTransaction("CLEAN settlement is missing".to_string())
+        })?;
+        let settlement_lamports = match bincode::deserialize::<SystemInstruction>(&transfer.data) {
+            Ok(SystemInstruction::Transfer { lamports }) => lamports,
+            _ => {
+                return Err(KoraError::InvalidTransaction(
+                    "CLEAN settlement must be one System transfer".to_string(),
+                ))
+            }
+        };
+        if transfer.program_id != SYSTEM_PROGRAM_ID
+            || transfer.accounts.len() != 2
+            || transfer.accounts[0].pubkey != wallet
+            || transfer.accounts[1].pubkey != settlement_wallet
+        {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN settlement accounts are invalid".to_string(),
+            ));
+        }
+        let token_instructions = &outer[2..outer.len() - 1];
+        let is_burn =
+            token_instructions.first().and_then(|instruction| instruction.data.first()) == Some(&8);
+        if is_burn {
+            if !policy.burn_enabled || compute_limit != 100_000 || token_instructions.len() != 2 {
+                return Err(KoraError::InvalidTransaction(
+                    "CLEAN Burn shape is disabled or invalid".to_string(),
+                ));
+            }
+        } else if !policy.claim_enabled
+            || compute_limit != 100_000
+            || token_instructions.is_empty()
+            || token_instructions.len() > usize::from(policy.maximum_claim_accounts)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN Claim shape is disabled or invalid".to_string(),
+            ));
+        }
+        let close_start = usize::from(is_burn);
+        if token_instructions[close_start..].iter().any(|instruction| {
+            instruction.program_id != token_program
+                || !matches!(
+                    spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data),
+                    Ok(spl_token_interface::instruction::TokenInstruction::CloseAccount)
+                )
+                || instruction.accounts.len() != 3
+                || instruction.accounts[1].pubkey != wallet
+                || instruction.accounts[2].pubkey != wallet
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN close-account fields are invalid".to_string(),
+            ));
+        }
+        let source_keys = token_instructions[close_start..]
+            .iter()
+            .map(|instruction| instruction.accounts[0].pubkey)
+            .collect::<Vec<_>>();
+        if source_keys.iter().collect::<std::collections::HashSet<_>>().len() != source_keys.len() {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN token accounts must be unique".to_string(),
+            ));
+        }
+        let expected_static_keys = source_keys.len() + if is_burn { 7 } else { 6 };
+        if message.account_keys.len() != expected_static_keys {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN contains unrelated accounts".to_string(),
+            ));
+        }
+        let mut addresses = source_keys.clone();
+        if is_burn {
+            addresses.push(
+                token_instructions[0]
+                    .accounts
+                    .get(1)
+                    .ok_or_else(|| {
+                        KoraError::InvalidTransaction("CLEAN Burn mint is missing".to_string())
+                    })?
+                    .pubkey,
+            );
+        }
+        let accounts = rpc_client.get_multiple_accounts(&addresses).await?;
+        let mut reclaimed = 0_u64;
+        for (index, account) in accounts.iter().take(source_keys.len()).enumerate() {
+            let account = account.as_ref().ok_or_else(|| {
+                KoraError::InvalidTransaction("CLEAN token account is missing".to_string())
+            })?;
+            let data = &account.data;
+            let expected_amount = u64::from_le_bytes(
+                data.get(64..72)
+                    .ok_or_else(|| {
+                        KoraError::InvalidTransaction(
+                            "CLEAN token account is malformed".to_string(),
+                        )
+                    })?
+                    .try_into()
+                    .map_err(|_| KoraError::ConfigError)?,
+            );
+            let close_tag = data.get(129..133).ok_or_else(|| {
+                KoraError::InvalidTransaction("CLEAN token account is malformed".to_string())
+            })?;
+            let close_valid = close_tag == [0, 0, 0, 0];
+            if account.owner != token_program
+                || data.len() != 165
+                || data.get(32..64) != Some(wallet.as_ref())
+                || data.get(72..76) != Some(&[0, 0, 0, 0])
+                || data.get(108) != Some(&1)
+                || data.get(109..113) != Some(&[0, 0, 0, 0])
+                || data.get(121..129) != Some(&[0, 0, 0, 0, 0, 0, 0, 0])
+                || !close_valid
+                || (!is_burn && expected_amount != 0)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "CLEAN token account is not eligible".to_string(),
+                ));
+            }
+            reclaimed = reclaimed.checked_add(account.lamports).ok_or(KoraError::ConfigError)?;
+            if is_burn && index == 0 {
+                let burn = &token_instructions[0];
+                let amount =
+                    match spl_token_interface::instruction::TokenInstruction::unpack(&burn.data) {
+                        Ok(spl_token_interface::instruction::TokenInstruction::Burn { amount }) => {
+                            amount
+                        }
+                        _ => {
+                            return Err(KoraError::InvalidTransaction(
+                                "CLEAN Burn must burn the full balance".to_string(),
+                            ))
+                        }
+                    };
+                if burn.program_id != token_program
+                    || burn.accounts.len() != 3
+                    || burn.accounts[0].pubkey != source_keys[0]
+                    || burn.accounts[2].pubkey != wallet
+                    || amount != expected_amount
+                    || amount == 0
+                {
+                    return Err(KoraError::InvalidTransaction(
+                        "CLEAN Burn fields do not match current state".to_string(),
+                    ));
+                }
+                let mint =
+                    accounts.last().and_then(|account| account.as_ref()).ok_or_else(|| {
+                        KoraError::InvalidTransaction("CLEAN Burn mint is missing".to_string())
+                    })?;
+                if mint.owner != token_program
+                    || mint.data.len() != 82
+                    || mint.data[44] == 0
+                    || mint.data[45] != 1
+                    || burn.accounts[1].pubkey != addresses[source_keys.len()]
+                {
+                    return Err(KoraError::InvalidTransaction(
+                        "CLEAN Burn mint is not an eligible fungible mint".to_string(),
+                    ));
+                }
+            }
+        }
+        let network_fee = rpc_client.get_fee_for_message(message).await?;
+        let service_fee =
+            reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
+                / 10_000;
+        if settlement_lamports
+            != service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
+        {
+            return Err(KoraError::InvalidTransaction(
+                "CLEAN settlement does not match rent, fee, and network cost".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -906,7 +1140,9 @@ impl TransactionValidator {
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::{CanonicalAtaCreationPolicy, FeePayerPolicy, SendMintPolicy, SendPolicy},
+        config::{
+            CanonicalAtaCreationPolicy, CleanPolicy, FeePayerPolicy, SendMintPolicy, SendPolicy,
+        },
         state::update_config,
         tests::{config_mock::ConfigMockBuilder, rpc_mock::RpcMockBuilder},
         transaction::{InnerInstructionContext, TransactionUtil},
@@ -918,7 +1154,10 @@ mod tests {
     use serde_json::json;
     use solana_client::rpc_request::RpcRequest;
     use solana_message::{Message, VersionedMessage};
-    use solana_sdk::instruction::{AccountMeta, Instruction};
+    use solana_sdk::{
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+    };
     use solana_system_interface::{
         instruction::{
             assign, create_account, create_account_with_seed, transfer, transfer_with_seed,
@@ -1011,6 +1250,167 @@ mod tests {
         mocks.insert(RpcRequest::GetMultipleAccounts, json!({ "context": { "slot": 1 }, "value": if existing { vec![Some(json!({ "data": [base64::engine::general_purpose::STANDARD.encode(vec![0_u8; 165]), "base64"], "executable": false, "lamports": rent, "owner": token_program.to_string(), "rentEpoch": 0 }))] } else { vec![None::<serde_json::Value>] } }));
         let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
         (TransactionValidator::new(payer).unwrap(), transaction, rpc, payer, wallet, mint)
+    }
+
+    fn clean_fixture(
+        burn: bool,
+        claim_enabled: bool,
+        burn_enabled: bool,
+    ) -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Pubkey,
+    ) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let token_account = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let amount = if burn { 123_456_u64 } else { 0 };
+        let mut policy = FeePayerPolicy::default();
+        policy.system.clean = CleanPolicy {
+            claim_enabled,
+            burn_enabled,
+            settlement_wallet: treasury.to_string(),
+            fee_bps: 300,
+            maximum_claim_accounts: 10,
+        };
+        setup_config_with_policy(policy);
+        let mut instructions = vec![
+            solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_price(
+                375_000,
+            ),
+            solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
+                100_000,
+            ),
+        ];
+        if burn {
+            instructions.push(
+                spl_token_interface::instruction::burn(
+                    &token_program,
+                    &token_account,
+                    &mint,
+                    &wallet,
+                    &[],
+                    amount,
+                )
+                .unwrap(),
+            );
+        }
+        instructions.push(
+            spl_token_interface::instruction::close_account(
+                &token_program,
+                &token_account,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap(),
+        );
+        instructions.push(transfer(&wallet, &treasury, 61_178 + 42_500));
+        let message = solana_message::v0::Message::try_compile(
+            &payer,
+            &instructions,
+            &[],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        let transaction = TransactionUtil::new_unsigned_versioned_transaction_resolved(
+            VersionedMessage::V0(message),
+        )
+        .unwrap();
+        let mut token_data = vec![0_u8; 165];
+        token_data[0..32].copy_from_slice(mint.as_ref());
+        token_data[32..64].copy_from_slice(wallet.as_ref());
+        token_data[64..72].copy_from_slice(&amount.to_le_bytes());
+        token_data[108] = 1;
+        let token_json = json!({ "data": [base64::engine::general_purpose::STANDARD.encode(token_data), "base64"], "executable": false, "lamports": 2_039_280, "owner": token_program.to_string(), "rentEpoch": 0 });
+        let mut values = vec![Some(token_json)];
+        if burn {
+            let mut mint_data = vec![0_u8; 82];
+            mint_data[44] = 6;
+            mint_data[45] = 1;
+            values.push(Some(json!({ "data": [base64::engine::general_purpose::STANDARD.encode(mint_data), "base64"], "executable": false, "lamports": 1_461_600, "owner": token_program.to_string(), "rentEpoch": 0 })));
+        }
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": values }),
+        );
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": 42_500 }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet, treasury)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clean_claim_and_burn_accept_only_exact_opt_in_shapes() {
+        for burn in [false, true] {
+            let (validator, transaction, rpc, _, _) = clean_fixture(burn, !burn, burn);
+            assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clean_policy_rejects_compute_settlement_account_and_instruction_mutations() {
+        let (validator, original, rpc, _, _) = clean_fixture(false, true, false);
+        for mutation in 0..12 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.all_instructions[0].data[1] ^= 1,
+                1 => transaction.all_instructions[1].data[1] ^= 1,
+                2 => transaction.all_instructions.swap(0, 1),
+                3 => {
+                    transaction.all_instructions.last_mut().unwrap().accounts[1].pubkey =
+                        Pubkey::new_unique()
+                }
+                4 => {
+                    transaction.all_instructions.last_mut().unwrap().data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 103_677 })
+                            .unwrap()
+                }
+                5 => {
+                    transaction.all_instructions.insert(2, transaction.all_instructions[2].clone())
+                }
+                6 => transaction.all_instructions[2].accounts[1].pubkey = Pubkey::new_unique(),
+                7 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                8 => {
+                    transaction.all_instructions.last_mut().unwrap().accounts[0].pubkey =
+                        validator.fee_payer_pubkey
+                }
+                9 => transaction.all_instructions.insert(
+                    transaction.all_instructions.len() - 1,
+                    transaction.all_instructions.last().unwrap().clone(),
+                ),
+                10 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.account_keys.push(Pubkey::new_unique())
+                    }
+                    _ => unreachable!(),
+                },
+                _ => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => message.address_table_lookups.push(
+                        solana_message::v0::MessageAddressTableLookup {
+                            account_key: Pubkey::new_unique(),
+                            writable_indexes: vec![],
+                            readonly_indexes: vec![],
+                        },
+                    ),
+                    _ => unreachable!(),
+                },
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "mutation {mutation} must fail"
+            );
+        }
     }
 
     #[tokio::test]

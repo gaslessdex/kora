@@ -576,6 +576,7 @@ impl FeePayerPolicyBuilder {
             config: FeePayerPolicy {
                 system: SystemInstructionPolicy {
                     canonical_ata_creation: Default::default(),
+                    clean: Default::default(),
                     send: Default::default(),
                     allow_transfer: false,
                     allow_assign: false,
