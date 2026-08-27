@@ -162,6 +162,9 @@ pub struct SystemInstructionPolicy {
     /// GASLESS-only policy for exact standalone SEND transactions.
     #[serde(default)]
     pub send: SendPolicy,
+    /// GASLESS-only policies for exact standalone CLEAN Claim/Burn transactions.
+    #[serde(default)]
+    pub clean: CleanPolicy,
     /// Nested policy for nonce account operations
     #[serde(default)]
     pub nonce: NonceInstructionPolicy,
@@ -187,6 +190,25 @@ pub struct SendPolicy {
 pub struct SendMintPolicy {
     pub mint: String,
     pub decimals: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct CleanPolicy {
+    pub claim_enabled: bool,
+    pub burn_enabled: bool,
+    #[serde(default)]
+    pub settlement_wallet: String,
+    #[serde(default = "default_clean_fee_bps")]
+    pub fee_bps: u16,
+    #[serde(default = "default_clean_claim_accounts")]
+    pub maximum_claim_accounts: u8,
+}
+
+fn default_clean_fee_bps() -> u16 {
+    300
+}
+fn default_clean_claim_accounts() -> u8 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

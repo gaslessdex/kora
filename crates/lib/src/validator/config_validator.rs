@@ -425,6 +425,31 @@ impl ConfigValidator {
             }
         }
 
+        let clean = &config.validation.fee_payer_policy.system.clean;
+        if clean.claim_enabled || clean.burn_enabled {
+            if config.validation.fee_payer_policy.system.allow_create_account
+                || config.validation.fee_payer_policy.system.allow_transfer
+                || config.validation.fee_payer_policy.spl_token.allow_burn
+                || config.validation.fee_payer_policy.spl_token.allow_close_account
+            {
+                errors.push("CLEAN requires global System transfer/create and SPL burn/close permissions to remain false".to_string());
+            }
+            if Pubkey::from_str(&clean.settlement_wallet).is_err() {
+                errors.push("Invalid CLEAN settlement_wallet".to_string());
+            }
+            if clean.fee_bps != 300 {
+                errors.push("CLEAN V1 fee_bps must be exactly 300".to_string());
+            }
+            if clean.maximum_claim_accounts == 0 || clean.maximum_claim_accounts > 10 {
+                errors.push("CLEAN maximum_claim_accounts must be between 1 and 10".to_string());
+            }
+            for program in [SYSTEM_PROGRAM_ID.to_string(), SPL_TOKEN_PROGRAM_ID.to_string()] {
+                if !config.validation.allowed_programs.contains(&program) {
+                    errors.push(format!("CLEAN requires allowed program {program}"));
+                }
+            }
+        }
+
         // Validate Token2022 extensions
         if let Err(e) = validate_token2022_extensions(&config.validation.token_2022) {
             errors.push(format!("Token2022 extension validation failed: {e}"));
@@ -1560,6 +1585,7 @@ mod tests {
                 fee_payer_policy: FeePayerPolicy {
                     system: SystemInstructionPolicy {
                         canonical_ata_creation: Default::default(),
+                        clean: Default::default(),
                         send: Default::default(),
                         allow_transfer: true,
                         allow_assign: true,
