@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID};
 use std::str::FromStr;
@@ -19,6 +20,8 @@ use crate::fee::price::PriceModel;
 
 const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const SEND_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 375_000;
 
 pub struct TransactionValidator {
     fee_payer_pubkey: Pubkey,
@@ -558,9 +561,22 @@ impl TransactionValidator {
             .ok_or_else(|| {
                 KoraError::InvalidTransaction("SEND instructions are missing".to_string())
             })?;
-        if outer[..send_index].iter().any(|instruction| instruction.program_id != compute_program) {
+        let expected_compute_data = [
+            ComputeBudgetInstruction::set_compute_unit_price(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS)
+                .data,
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT).data,
+        ];
+        if send_index != expected_compute_data.len()
+            || outer[..send_index].iter().zip(expected_compute_data.iter()).any(
+                |(instruction, expected_data)| {
+                    instruction.program_id != compute_program
+                        || !instruction.accounts.is_empty()
+                        || instruction.data != *expected_data
+                },
+            )
+        {
             return Err(KoraError::InvalidTransaction(
-                "SEND only permits a compute-budget prefix".to_string(),
+                "SEND requires the exact bounded compute-budget prefix".to_string(),
             ));
         }
         let creates_recipient_ata = outer[send_index].program_id == ata_program;
@@ -1229,9 +1245,15 @@ mod tests {
             6,
         )
         .unwrap();
-        let mut instructions = vec![recipient_transfer, reimbursement, service_fee];
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS),
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT),
+            recipient_transfer,
+            reimbursement,
+            service_fee,
+        ];
         if !existing {
-            instructions.insert(0, ata);
+            instructions.insert(2, ata);
         }
         let message = VersionedMessage::Legacy(Message::new(&instructions, Some(&payer)));
         let mut transaction =
@@ -1241,7 +1263,7 @@ mod tests {
             transaction.all_instructions.push(create.clone());
             transaction.inner_instruction_contexts.push(InnerInstructionContext {
                 instruction: create,
-                outer_instruction_index: 0,
+                outer_instruction_index: 2,
                 stack_height: Some(2),
             });
         }
@@ -1292,6 +1314,22 @@ mod tests {
         let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(false);
         let result = validator.validate_send(&transaction, &rpc, 1).await;
         assert!(result.is_ok(), "{result:?}");
+
+        let mut wrong_price = transaction.clone();
+        wrong_price.all_instructions[0].data = ComputeBudgetInstruction::set_compute_unit_price(
+            SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS + 1,
+        )
+        .data;
+        assert!(validator.validate_send(&wrong_price, &rpc, 1).await.is_err());
+
+        let mut wrong_limit = transaction.clone();
+        wrong_limit.all_instructions[1].data =
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT + 1).data;
+        assert!(validator.validate_send(&wrong_limit, &rpc, 1).await.is_err());
+
+        let mut wrong_order = transaction.clone();
+        wrong_order.all_instructions.swap(0, 1);
+        assert!(validator.validate_send(&wrong_order, &rpc, 1).await.is_err());
 
         let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(true);
         let result = validator.validate_send(&transaction, &rpc, 0).await;
@@ -1347,7 +1385,7 @@ mod tests {
         };
         for recipient in [payer, sender, treasury, off_curve] {
             let mut transaction = original.clone();
-            transaction.all_instructions[0].accounts[2].pubkey = recipient;
+            transaction.all_instructions[2].accounts[2].pubkey = recipient;
             assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
         }
     }
@@ -1359,21 +1397,21 @@ mod tests {
         for mutation in 0..12 {
             let mut transaction = original.clone();
             match mutation {
-                0 => transaction.all_instructions[0].accounts[0].pubkey = Pubkey::new_unique(),
-                1 => transaction.all_instructions[0].accounts[1].pubkey = Pubkey::new_unique(),
-                2 => transaction.all_instructions[0].accounts[2].pubkey = Pubkey::new_unique(),
-                3 => transaction.all_instructions[0].accounts[3].pubkey = Pubkey::new_unique(),
+                0 => transaction.all_instructions[2].accounts[0].pubkey = Pubkey::new_unique(),
+                1 => transaction.all_instructions[2].accounts[1].pubkey = Pubkey::new_unique(),
+                2 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                3 => transaction.all_instructions[2].accounts[3].pubkey = Pubkey::new_unique(),
                 4 => {
-                    transaction.all_instructions[0].accounts[5].pubkey =
+                    transaction.all_instructions[2].accounts[5].pubkey =
                         spl_token_2022_interface::id()
                 }
-                5 => transaction.all_instructions[1].accounts[0].pubkey = Pubkey::new_unique(),
-                6 => transaction.all_instructions[1].accounts[1].pubkey = Pubkey::new_unique(),
-                7 => transaction.all_instructions[1].accounts[2].pubkey = Pubkey::new_unique(),
-                8 => transaction.all_instructions[1].accounts[3].pubkey = Pubkey::new_unique(),
-                9 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
-                10 => transaction.all_instructions[3].accounts[2].pubkey = Pubkey::new_unique(),
-                _ => transaction.all_instructions[1].data[9] = 9,
+                5 => transaction.all_instructions[3].accounts[0].pubkey = Pubkey::new_unique(),
+                6 => transaction.all_instructions[3].accounts[1].pubkey = Pubkey::new_unique(),
+                7 => transaction.all_instructions[3].accounts[2].pubkey = Pubkey::new_unique(),
+                8 => transaction.all_instructions[3].accounts[3].pubkey = Pubkey::new_unique(),
+                9 => transaction.all_instructions[4].accounts[2].pubkey = Pubkey::new_unique(),
+                10 => transaction.all_instructions[5].accounts[2].pubkey = Pubkey::new_unique(),
+                _ => transaction.all_instructions[3].data[9] = 9,
             }
             assert!(
                 validator.validate_send(&transaction, &rpc, 1).await.is_err(),
@@ -1433,7 +1471,7 @@ mod tests {
                     .inner_instruction_contexts
                     .push(transaction.inner_instruction_contexts[0].clone()),
                 _ => {
-                    transaction.all_instructions[1].program_id =
+                    transaction.all_instructions[3].program_id =
                         Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap()
                 }
             }
@@ -1451,14 +1489,14 @@ mod tests {
     async fn gasless_send_ata_exception_rejects_extra_or_non_checked_transfers_and_signers() {
         let (validator, original, rpc, _, sender, _, _, _) = send_ata_fixture(false);
         let mut zero = original.clone();
-        zero.all_instructions[1].data[1..9].copy_from_slice(&0_u64.to_le_bytes());
+        zero.all_instructions[3].data[1..9].copy_from_slice(&0_u64.to_le_bytes());
         assert!(validator.validate_send(&zero, &rpc, 1).await.is_err());
 
         let mut unchecked = original.clone();
-        unchecked.all_instructions[1] = spl_token_interface::instruction::transfer(
+        unchecked.all_instructions[3] = spl_token_interface::instruction::transfer(
             &spl_token_interface::id(),
-            &unchecked.all_instructions[1].accounts[0].pubkey,
-            &unchecked.all_instructions[1].accounts[2].pubkey,
+            &unchecked.all_instructions[3].accounts[0].pubkey,
+            &unchecked.all_instructions[3].accounts[2].pubkey,
             &sender,
             &[],
             500_000,
@@ -1468,8 +1506,8 @@ mod tests {
 
         let mut inner_transfer = original.clone();
         inner_transfer.inner_instruction_contexts.push(InnerInstructionContext {
-            instruction: inner_transfer.all_instructions[1].clone(),
-            outer_instruction_index: 1,
+            instruction: inner_transfer.all_instructions[3].clone(),
+            outer_instruction_index: 3,
             stack_height: Some(2),
         });
         assert!(validator.validate_send(&inner_transfer, &rpc, 1).await.is_err());
@@ -1481,17 +1519,17 @@ mod tests {
         assert!(validator.validate_send(&extra_signer, &rpc, 1).await.is_err());
 
         for system_instruction in [
-            transfer(&original.all_instructions[0].accounts[0].pubkey, &Pubkey::new_unique(), 1),
+            transfer(&original.all_instructions[2].accounts[0].pubkey, &Pubkey::new_unique(), 1),
             solana_system_interface::instruction::allocate(
-                &original.all_instructions[0].accounts[0].pubkey,
+                &original.all_instructions[2].accounts[0].pubkey,
                 1,
             ),
-            assign(&original.all_instructions[0].accounts[0].pubkey, &Pubkey::new_unique()),
+            assign(&original.all_instructions[2].accounts[0].pubkey, &Pubkey::new_unique()),
         ] {
             let mut transaction = original.clone();
             transaction.inner_instruction_contexts.push(InnerInstructionContext {
                 instruction: system_instruction,
-                outer_instruction_index: 0,
+                outer_instruction_index: 2,
                 stack_height: Some(2),
             });
             assert!(validator.validate_send(&transaction, &rpc, 1).await.is_err());
