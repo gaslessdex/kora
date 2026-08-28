@@ -206,7 +206,7 @@ impl TransactionValidator {
         let has_clean_shape = !has_outer_jupiter
             && outer.iter().any(|instruction| {
                 instruction.program_id == spl_token_interface::id()
-                    && matches!(instruction.data.first(), Some(8 | 9))
+                    && matches!(instruction.data.first(), Some(9 | 15))
             });
         if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
             if has_outer_jupiter {
@@ -402,8 +402,8 @@ impl TransactionValidator {
             ));
         }
         let token_instructions = &outer[2..outer.len() - 1];
-        let is_burn =
-            token_instructions.first().and_then(|instruction| instruction.data.first()) == Some(&8);
+        let is_burn = token_instructions.first().and_then(|instruction| instruction.data.first())
+            == Some(&15);
         if is_burn {
             if !policy.burn_enabled || compute_limit != 100_000 || token_instructions.len() != 2 {
                 return Err(KoraError::InvalidTransaction(
@@ -499,14 +499,15 @@ impl TransactionValidator {
             reclaimed = reclaimed.checked_add(account.lamports).ok_or(KoraError::ConfigError)?;
             if is_burn && index == 0 {
                 let burn = &token_instructions[0];
-                let amount =
+                let (amount, decimals) =
                     match spl_token_interface::instruction::TokenInstruction::unpack(&burn.data) {
-                        Ok(spl_token_interface::instruction::TokenInstruction::Burn { amount }) => {
-                            amount
-                        }
+                        Ok(spl_token_interface::instruction::TokenInstruction::BurnChecked {
+                            amount,
+                            decimals,
+                        }) => (amount, decimals),
                         _ => {
                             return Err(KoraError::InvalidTransaction(
-                                "CLEAN Burn must burn the full balance".to_string(),
+                                "CLEAN Burn must use BurnChecked for the full balance".to_string(),
                             ))
                         }
                     };
@@ -529,6 +530,7 @@ impl TransactionValidator {
                     || mint.data.len() != 82
                     || mint.data[44] == 0
                     || mint.data[45] != 1
+                    || decimals != mint.data[44]
                     || burn.accounts[1].pubkey != addresses[source_keys.len()]
                 {
                     return Err(KoraError::InvalidTransaction(
@@ -1323,13 +1325,14 @@ mod tests {
         ];
         if burn {
             instructions.push(
-                spl_token_interface::instruction::burn(
+                spl_token_interface::instruction::burn_checked(
                     &token_program,
                     &token_accounts[0],
                     &mint,
                     &wallet,
                     &[],
                     amount,
+                    6,
                 )
                 .unwrap(),
             );
@@ -1487,6 +1490,69 @@ mod tests {
                 "mutation {mutation} must fail"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clean_burn_rejects_full_hosted_adversarial_matrix() {
+        let (validator, original, rpc, wallet, treasury) = clean_fixture(true, false, true, 1);
+        assert!(validator.validate_clean(&original, &rpc).await.is_ok());
+        for mutation in 0..23 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.all_instructions[2].data[1] -= 1, // partial burn
+                1 => transaction.all_instructions[2].data[1] += 1, // amount +1
+                2 => transaction.all_instructions[2].accounts[0].pubkey = Pubkey::new_unique(),
+                3 => transaction.all_instructions[2].accounts[1].pubkey = Pubkey::new_unique(),
+                4 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                5 => transaction.all_instructions[3].accounts[1].pubkey = Pubkey::new_unique(),
+                6 => transaction.all_instructions[3].data.clear(),
+                7 => {
+                    transaction.all_instructions.insert(3, transaction.all_instructions[3].clone());
+                }
+                8 => transaction.all_instructions[4].accounts[1].pubkey = Pubkey::new_unique(),
+                9 => {
+                    transaction.all_instructions[4].data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 1 }).unwrap()
+                }
+                10 => {
+                    transaction.all_instructions[4].accounts[0].pubkey = validator.fee_payer_pubkey
+                }
+                11 => transaction.all_instructions[0].data[1] ^= 1,
+                12 => transaction.all_instructions[1].data[1] ^= 1,
+                13 => transaction.all_instructions.swap(0, 1),
+                14 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.header.num_required_signatures = 3;
+                        message.account_keys.insert(2, Pubkey::new_unique());
+                    }
+                    _ => unreachable!(),
+                },
+                15 => transaction.all_instructions[2].program_id = spl_token_2022_interface::id(),
+                16 => transaction.all_instructions[2].data[0] = 3, // Transfer
+                17 => transaction.all_instructions[2].data[0] = 4, // Approve
+                18 => transaction.all_instructions[2].data[0] = 6, // SetAuthority
+                19 => transaction.all_instructions[2].data[0] = 7, // MintTo
+                20 => transaction.all_instructions[2].program_id = Pubkey::new_unique(),
+                21 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => message.address_table_lookups.push(
+                        solana_message::v0::MessageAddressTableLookup {
+                            account_key: Pubkey::new_unique(),
+                            writable_indexes: vec![],
+                            readonly_indexes: vec![],
+                        },
+                    ),
+                    _ => unreachable!(),
+                },
+                _ => transaction.all_instructions[2].data[9] ^= 1, // BurnChecked decimals
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "Burn adversarial mutation {mutation} must fail"
+            );
+        }
+        assert_ne!(wallet, validator.fee_payer_pubkey);
+        assert_ne!(treasury, validator.fee_payer_pubkey);
     }
 
     #[tokio::test]
