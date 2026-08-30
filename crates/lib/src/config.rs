@@ -240,7 +240,7 @@ pub struct RecoverPolicy {
     #[serde(default)]
     pub allowed_lookup_tables: Vec<String>,
     #[serde(default)]
-    pub route_accounts: Vec<String>,
+    pub allowed_jupiter_auxiliary_accounts: Vec<String>,
     #[serde(default)]
     pub authorization_public_key: String,
     #[serde(default)]

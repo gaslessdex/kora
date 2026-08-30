@@ -510,17 +510,17 @@ impl ConfigValidator {
                 || recover.minimum_user_payout_lamports == 0
                 || recover.approved_pool_accounts.is_empty()
                 || recover.allowed_lookup_tables.is_empty()
-                || recover.route_accounts.is_empty()
+                || recover.allowed_jupiter_auxiliary_accounts.is_empty()
             {
                 errors.push(
-                    "Recover requires non-empty catastrophe output, minimum user payout, pool, LUT, and route bindings"
+                    "Recover requires non-empty catastrophe output, minimum user payout, pool, LUT, and Jupiter auxiliary bindings"
                         .to_string(),
                 );
             }
             for (name, values) in [
                 ("pool", &recover.approved_pool_accounts),
                 ("lookup table", &recover.allowed_lookup_tables),
-                ("route account", &recover.route_accounts),
+                ("Jupiter auxiliary account", &recover.allowed_jupiter_auxiliary_accounts),
             ] {
                 if let Err(e) = TokenUtil::check_valid_tokens(values) {
                     errors.push(format!("Invalid Recover {name}: {e}"));
