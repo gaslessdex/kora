@@ -711,9 +711,9 @@ impl TransactionValidator {
             .and_then(|value| value.checked_add(9_999))
             .ok_or(KoraError::ConfigError)?
             / 10_000;
-        if minimum_output < policy.minimum_output_lamports {
+        if minimum_output < policy.catastrophe_output_lamports {
             return Err(KoraError::InvalidTransaction(
-                "Recover Value minimum output is below policy".to_string(),
+                "Recover Value minimum output is below the catastrophe bound".to_string(),
             ));
         }
         let close_source = &outer[jupiter_index + 1];
@@ -870,12 +870,19 @@ impl TransactionValidator {
             .and_then(|value| value.checked_add(network_fee))
             .and_then(|value| value.checked_add(setup_rent))
             .ok_or(KoraError::ConfigError)?;
+        let minimum_user_payout = minimum_output
+            .checked_add(source_account.lamports)
+            .and_then(|value| value.checked_add(setup_rent))
+            .and_then(|value| value.checked_sub(expected_settlement))
+            .ok_or(KoraError::ConfigError)?;
         if settlement_lamports != expected_settlement
             || network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
                 > self.max_allowed_lamports
+            || minimum_user_payout < policy.minimum_user_payout_lamports
         {
             return Err(KoraError::InvalidTransaction(
-                "Recover Value settlement or payer exposure is invalid".to_string(),
+                "Recover Value settlement, payer exposure, or minimum user payout is invalid"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -1808,6 +1815,21 @@ mod tests {
         wrapped_mutation: Option<usize>,
     ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>, usize)
     {
+        recover_fixture_with_output(
+            existing_wrapped,
+            source_mutation,
+            wrapped_mutation,
+            1_000_000_000,
+        )
+    }
+
+    fn recover_fixture_with_output(
+        existing_wrapped: bool,
+        source_mutation: Option<usize>,
+        wrapped_mutation: Option<usize>,
+        quoted_output: u64,
+    ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>, usize)
+    {
         let payer = Pubkey::new_unique();
         let wallet = Pubkey::new_unique();
         let treasury = Pubkey::new_unique();
@@ -1821,8 +1843,7 @@ mod tests {
         let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program);
         let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program);
         let input_amount = 1_779_926_u64;
-        let quoted_output = 1_000_000_000_u64;
-        let minimum_output = 995_000_000_u64;
+        let minimum_output = quoted_output * 9_950 / 10_000;
         let network_fee = 42_500_u64;
         let source_rent = 2_039_280_u64;
         let setup_rent = 2_039_280_u64;
@@ -1930,7 +1951,8 @@ mod tests {
             slippage_bps: 50,
             compute_unit_limit: 100_000,
             compute_unit_price_micro_lamports: 375_000,
-            minimum_output_lamports: minimum_output,
+            catastrophe_output_lamports: 1_000_000,
+            minimum_user_payout_lamports: 1_000_000,
             approved_pool_accounts: vec![pool.to_string()],
             allowed_lookup_tables: vec![lookup_table.to_string()],
             route_accounts: route_accounts
@@ -2038,6 +2060,39 @@ mod tests {
             assert!(
                 validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
                 "unsafe wrapped SOL state mutation {mutation} must fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_independent_live_outputs_without_policy_changes() {
+        for quoted_output in [1_000_000_000, 900_000_000] {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture_with_output(false, None, None, quoted_output);
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok(),
+                "legitimate quote output {quoted_output} must pass the same policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_rejects_weakened_or_missing_jupiter_output_binding() {
+        let (validator, original, rpc, payer_creations) = recover_fixture(false, None, None);
+        for mutation in 0..4 {
+            let mut transaction = original.clone();
+            let route = &mut transaction.all_instructions[3];
+            match mutation {
+                0 => route.data[16..24].copy_from_slice(&900_000_000_u64.to_le_bytes()),
+                1 => route.data[16..24].copy_from_slice(&0_u64.to_le_bytes()),
+                2 => route.data.truncate(23),
+                _ => route.data[0] ^= 1,
+            }
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
+                "minimum-output mutation {mutation} must fail"
             );
         }
     }

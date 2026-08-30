@@ -492,13 +492,14 @@ impl ConfigValidator {
             {
                 errors.push("Recover V1 compute policy must be exactly 100000 CU at 375000 micro-lamports/CU".to_string());
             }
-            if recover.minimum_output_lamports == 0
+            if recover.catastrophe_output_lamports == 0
+                || recover.minimum_user_payout_lamports == 0
                 || recover.approved_pool_accounts.is_empty()
                 || recover.allowed_lookup_tables.is_empty()
                 || recover.route_accounts.is_empty()
             {
                 errors.push(
-                    "Recover requires non-empty minimum output, pool, LUT, and route bindings"
+                    "Recover requires non-empty catastrophe output, minimum user payout, pool, LUT, and route bindings"
                         .to_string(),
                 );
             }

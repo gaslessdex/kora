@@ -232,7 +232,9 @@ pub struct RecoverPolicy {
     #[serde(default = "default_recover_compute_unit_price")]
     pub compute_unit_price_micro_lamports: u64,
     #[serde(default)]
-    pub minimum_output_lamports: u64,
+    pub catastrophe_output_lamports: u64,
+    #[serde(default)]
+    pub minimum_user_payout_lamports: u64,
     #[serde(default)]
     pub approved_pool_accounts: Vec<String>,
     #[serde(default)]

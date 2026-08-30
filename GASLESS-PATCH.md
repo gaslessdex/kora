@@ -43,4 +43,21 @@ fee_bps = 300
 maximum_claim_accounts = 10
 ```
 
-Claim/Burn validation is shape-specific: v0, exactly payer and user signers, exact 375000/100000 compute prefix, current ordinary legacy SPL state, user close destination, exact full-balance Burn where applicable, and exact 3% rent fee plus message network fee. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover is intentionally excluded because payer-funded temporary-wSOL provenance needs a separate narrow policy.
+Claim/Burn validation is shape-specific: v0, exactly payer and user signers, exact 375000/100000 compute prefix, current ordinary legacy SPL state, user close destination, exact full-balance Burn where applicable, and exact 3% rent fee plus message network fee. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
+
+## Recover Value policy
+
+Recover is disabled by default. When explicitly configured, Kora decodes the Jupiter v6
+`SharedAccountsRoute` instruction and derives its effective minimum output from the instruction's
+quoted output and the required 50-bps slippage. The exact route accounts, Raydium CLMM pool and
+direct CPI provenance, full authoritative source balance, canonical wSOL lifecycle, compute
+budget, settlement, fees, reimbursement, payer, and user remain independently bound.
+
+The configuration does not contain a spot-price snapshot. `catastrophe_output_lamports` is a
+deliberately broad secondary bound, set to the product's 1,000,000-lamport minimum-outcome scale,
+that rejects effectively worthless swap output without tracking normal market movement.
+`minimum_user_payout_lamports` independently requires the transaction's guaranteed output plus
+recovered rent, less the exact service fees and sponsored network cost, to preserve the configured
+minimum user outcome. GASLESS remains authoritative for fresh quote TTL, exact input/output mints,
+50-bps slippage, the 100-bps price-impact ceiling, and exact-message binding. A changed economic
+message requires a new server quote and user signature.
