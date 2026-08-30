@@ -1,6 +1,9 @@
 use crate::{
-    rpc_server::middleware_utils::default_sig_verify,
-    state::get_request_signer_with_signer_key,
+    rpc_server::{
+        method::recover_authorization::{validate_recover_authorization, RecoverAuthorization},
+        middleware_utils::default_sig_verify,
+    },
+    state::{get_config, get_request_signer_with_signer_key},
     transaction::{TransactionUtil, VersionedTransactionOps, VersionedTransactionResolved},
     usage_limit::UsageTracker,
     KoraError,
@@ -20,6 +23,8 @@ pub struct SignTransactionRequest {
     /// Whether to verify signatures during simulation (defaults to true)
     #[serde(default = "default_sig_verify")]
     pub sig_verify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recover_authorization: Option<RecoverAuthorization>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -46,6 +51,12 @@ pub async fn sign_transaction(
         request.sig_verify,
     )
     .await?;
+
+    resolved_transaction.recover_authorization_claims = validate_recover_authorization(
+        &resolved_transaction,
+        &get_config()?.validation.fee_payer_policy.system.recover,
+        request.recover_authorization.as_ref(),
+    )?;
 
     let (signed_transaction, _) =
         resolved_transaction.sign_transaction(&signer, rpc_client).await?;
@@ -80,6 +91,7 @@ mod tests {
             transaction: "invalid_base64!@#$".to_string(),
             signer_key: None,
             sig_verify: true,
+            recover_authorization: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;
@@ -100,6 +112,7 @@ mod tests {
             transaction: create_mock_encoded_transaction(),
             signer_key: Some("invalid_pubkey".to_string()),
             sig_verify: true,
+            recover_authorization: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;

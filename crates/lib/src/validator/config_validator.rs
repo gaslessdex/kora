@@ -473,6 +473,20 @@ impl ConfigValidator {
                     errors.push(format!("Invalid Recover {name}"));
                 }
             }
+            if Pubkey::from_str(&recover.authorization_public_key).is_err() {
+                errors.push("Invalid Recover authorization_public_key".to_string());
+            }
+            if recover.authorization_network != "mainnet-beta" {
+                errors.push("Recover authorization_network must be mainnet-beta".to_string());
+            }
+            if recover.authorization_max_lifetime_seconds == 0
+                || recover.authorization_max_lifetime_seconds > 300
+            {
+                errors.push(
+                    "Recover authorization_max_lifetime_seconds must be between 1 and 300"
+                        .to_string(),
+                );
+            }
             if !config.validation.allowed_tokens.contains(&recover.input_mint) {
                 errors.push("Recover input_mint is not in allowed_tokens".to_string());
             }

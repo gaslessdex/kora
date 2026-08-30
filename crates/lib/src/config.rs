@@ -241,6 +241,12 @@ pub struct RecoverPolicy {
     pub allowed_lookup_tables: Vec<String>,
     #[serde(default)]
     pub route_accounts: Vec<String>,
+    #[serde(default)]
+    pub authorization_public_key: String,
+    #[serde(default)]
+    pub authorization_network: String,
+    #[serde(default = "default_recover_authorization_max_lifetime_seconds")]
+    pub authorization_max_lifetime_seconds: u64,
 }
 
 fn default_recover_swap_fee_bps() -> u16 {
@@ -254,6 +260,9 @@ fn default_recover_compute_unit_limit() -> u32 {
 }
 fn default_recover_compute_unit_price() -> u64 {
     375_000
+}
+fn default_recover_authorization_max_lifetime_seconds() -> u64 {
+    90
 }
 
 fn default_clean_fee_bps() -> u16 {

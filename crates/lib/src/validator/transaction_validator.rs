@@ -875,10 +875,34 @@ impl TransactionValidator {
             .and_then(|value| value.checked_add(setup_rent))
             .and_then(|value| value.checked_sub(expected_settlement))
             .ok_or(KoraError::ConfigError)?;
+        let authorized_amount = |value: &str| {
+            value.parse::<u64>().map_err(|_| {
+                KoraError::InvalidTransaction("Recover authorization amount is invalid".to_string())
+            })
+        };
+        let authorization_mismatch = if let Some(authorization) =
+            transaction.recover_authorization_claims.as_ref()
+        {
+            authorized_amount(&authorization.input_amount_raw)? != input_amount
+                || authorized_amount(&authorization.expected_output_lamports)? != quoted_output
+                || authorized_amount(&authorization.minimum_output_lamports)? != minimum_output
+                || authorized_amount(&authorization.minimum_user_payout_lamports)?
+                    != minimum_user_payout
+                || authorized_amount(&authorization.swap_fee_lamports)? != swap_fee
+                || authorized_amount(&authorization.rent_fee_lamports)? != rent_fee
+                || authorized_amount(&authorization.network_reimbursement_lamports)? != network_fee
+                || authorized_amount(&authorization.setup_rent_reimbursement_lamports)?
+                    != setup_rent
+                || authorized_amount(&authorization.sponsored_cost_lamports)?
+                    != network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
+        } else {
+            false
+        };
         if settlement_lamports != expected_settlement
             || network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
                 > self.max_allowed_lamports
             || minimum_user_payout < policy.minimum_user_payout_lamports
+            || authorization_mismatch
         {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value settlement, payer exposure, or minimum user payout is invalid"
@@ -1572,7 +1596,7 @@ mod tests {
             config_mock::{mock_state, ConfigMockBuilder},
             rpc_mock::RpcMockBuilder,
         },
-        transaction::{InnerInstructionContext, TransactionUtil},
+        transaction::{InnerInstructionContext, RecoverAuthorizationClaims, TransactionUtil},
     };
     use base64::Engine;
     use serial_test::serial;
@@ -1959,6 +1983,9 @@ mod tests {
                 .iter()
                 .map(|account| account.pubkey.to_string())
                 .collect(),
+            authorization_public_key: Pubkey::new_unique().to_string(),
+            authorization_network: "mainnet-beta".to_string(),
+            authorization_max_lifetime_seconds: 90,
         };
         let config = ConfigMockBuilder::new()
             .with_price_source(PriceSource::Mock)
@@ -2073,6 +2100,65 @@ mod tests {
             assert!(
                 validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok(),
                 "legitimate quote output {quoted_output} must pass the same policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_authorization_economics_must_match_each_rpc_verified_value() {
+        let (validator, mut transaction, rpc, payer_creations) =
+            recover_fixture_with_output(false, None, None, 1_000_000_000);
+        let minimum = 995_000_000_u64;
+        let swap_fee = minimum * 30 / 10_000;
+        let rent_fee = 2_039_280_u64 * 300 / 10_000;
+        let network = 42_500_u64;
+        let setup = 2_039_280_u64;
+        let settlement = swap_fee + rent_fee + network + setup;
+        let claims = RecoverAuthorizationClaims {
+            schema_version: "recover-authorization-v1".to_string(),
+            action: "CLEAN_RECOVER".to_string(),
+            network: "mainnet-beta".to_string(),
+            pilot_wallet: validator.fee_payer_policy.system.recover.user_wallet.clone(),
+            source_token_account: validator.fee_payer_policy.system.recover.source_account.clone(),
+            input_mint: validator.fee_payer_policy.system.recover.input_mint.clone(),
+            input_amount_raw: "1779926".to_string(),
+            output_mint: "So11111111111111111111111111111111111111112".to_string(),
+            expected_output_lamports: "1000000000".to_string(),
+            minimum_output_lamports: minimum.to_string(),
+            minimum_user_payout_lamports: (minimum + 2_039_280 + setup - settlement).to_string(),
+            swap_fee_lamports: swap_fee.to_string(),
+            rent_fee_lamports: rent_fee.to_string(),
+            network_reimbursement_lamports: network.to_string(),
+            setup_rent_reimbursement_lamports: setup.to_string(),
+            sponsored_cost_lamports: (network + setup).to_string(),
+            treasury: validator.fee_payer_policy.system.recover.settlement_wallet.clone(),
+            message_hash: "verified-before-structural-policy".to_string(),
+            quote_id: "quote".to_string(),
+            intent_id: "intent".to_string(),
+            nonce: "nonce".to_string(),
+            issued_at_unix_seconds: 1,
+            expires_at_unix_seconds: 2,
+        };
+        transaction.recover_authorization_claims = Some(claims.clone());
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+        for field in 0..9 {
+            let mut mutated = transaction.clone();
+            let claims = mutated.recover_authorization_claims.as_mut().unwrap();
+            match field {
+                0 => claims.input_amount_raw = "1779925".to_string(),
+                1 => claims.expected_output_lamports = "999999999".to_string(),
+                2 => claims.minimum_output_lamports = "994999999".to_string(),
+                3 => claims.minimum_user_payout_lamports = "1".to_string(),
+                4 => claims.swap_fee_lamports = (swap_fee + 1).to_string(),
+                5 => claims.rent_fee_lamports = (rent_fee + 1).to_string(),
+                6 => claims.network_reimbursement_lamports = (network + 1).to_string(),
+                7 => claims.setup_rent_reimbursement_lamports = (setup + 1).to_string(),
+                _ => claims.sponsored_cost_lamports = (network + setup + 1).to_string(),
+            }
+            assert!(
+                validator.validate_recover(&mutated, &rpc, payer_creations).await.is_err(),
+                "authorization economics mutation {field} must fail"
             );
         }
     }

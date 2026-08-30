@@ -1,3 +1,4 @@
+use super::recover_authorization::RecoverAuthorizationClaims;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
@@ -28,6 +29,7 @@ use solana_address_lookup_table_interface::state::AddressLookupTable;
 #[derive(Clone)]
 pub struct VersionedTransactionResolved {
     pub transaction: VersionedTransaction,
+    pub recover_authorization_claims: Option<RecoverAuthorizationClaims>,
 
     // Includes lookup table addresses
     pub all_account_keys: Vec<Pubkey>,
@@ -87,6 +89,7 @@ impl VersionedTransactionResolved {
     ) -> Result<Self, KoraError> {
         let mut resolved = Self {
             transaction: transaction.clone(),
+            recover_authorization_claims: None,
             all_account_keys: vec![],
             all_instructions: vec![],
             inner_instruction_contexts: vec![],
@@ -136,6 +139,7 @@ impl VersionedTransactionResolved {
     ) -> Result<Self, KoraError> {
         Ok(Self {
             transaction: transaction.clone(),
+            recover_authorization_claims: None,
             all_account_keys: transaction.message.static_account_keys().to_vec(),
             all_instructions: IxUtils::uncompile_instructions(
                 transaction.message.instructions(),
