@@ -450,6 +450,81 @@ impl ConfigValidator {
             }
         }
 
+        let recover = &config.validation.fee_payer_policy.system.recover;
+        if recover.enabled {
+            if config.validation.fee_payer_policy.system.allow_create_account
+                || config.validation.fee_payer_policy.system.allow_transfer
+                || config.validation.fee_payer_policy.spl_token.allow_close_account
+            {
+                errors.push(
+                    "Recover requires global System transfer/create and SPL close permissions to remain false"
+                        .to_string(),
+                );
+            }
+            let identities = [
+                ("user_wallet", &recover.user_wallet),
+                ("settlement_wallet", &recover.settlement_wallet),
+                ("input_mint", &recover.input_mint),
+                ("source_account", &recover.source_account),
+                ("wrapped_sol_account", &recover.wrapped_sol_account),
+            ];
+            for (name, value) in identities {
+                if Pubkey::from_str(value).is_err() {
+                    errors.push(format!("Invalid Recover {name}"));
+                }
+            }
+            if !config.validation.allowed_tokens.contains(&recover.input_mint) {
+                errors.push("Recover input_mint is not in allowed_tokens".to_string());
+            }
+            if recover.decimals == 0 || recover.decimals > 9 {
+                errors.push("Recover decimals must be between 1 and 9".to_string());
+            }
+            if recover.swap_fee_bps != 30
+                || recover.rent_fee_bps != 300
+                || recover.slippage_bps != 50
+            {
+                errors.push(
+                    "Recover V1 fee and slippage policy must be exactly 30/300/50 bps".to_string(),
+                );
+            }
+            if recover.compute_unit_limit != 100_000
+                || recover.compute_unit_price_micro_lamports != 375_000
+            {
+                errors.push("Recover V1 compute policy must be exactly 100000 CU at 375000 micro-lamports/CU".to_string());
+            }
+            if recover.minimum_output_lamports == 0
+                || recover.approved_pool_accounts.is_empty()
+                || recover.allowed_lookup_tables.is_empty()
+                || recover.route_accounts.is_empty()
+            {
+                errors.push(
+                    "Recover requires non-empty minimum output, pool, LUT, and route bindings"
+                        .to_string(),
+                );
+            }
+            for (name, values) in [
+                ("pool", &recover.approved_pool_accounts),
+                ("lookup table", &recover.allowed_lookup_tables),
+                ("route account", &recover.route_accounts),
+            ] {
+                if let Err(e) = TokenUtil::check_valid_tokens(values) {
+                    errors.push(format!("Invalid Recover {name}: {e}"));
+                }
+            }
+            for program in [
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+                spl_associated_token_account_interface::program::id().to_string(),
+                solana_compute_budget_interface::id().to_string(),
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+                "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
+            ] {
+                if !config.validation.allowed_programs.contains(&program) {
+                    errors.push(format!("Recover requires allowed program {program}"));
+                }
+            }
+        }
+
         // Validate Token2022 extensions
         if let Err(e) = validate_token2022_extensions(&config.validation.token_2022) {
             errors.push(format!("Token2022 extension validation failed: {e}"));
@@ -1586,6 +1661,7 @@ mod tests {
                     system: SystemInstructionPolicy {
                         canonical_ata_creation: Default::default(),
                         clean: Default::default(),
+                        recover: Default::default(),
                         send: Default::default(),
                         allow_transfer: true,
                         allow_assign: true,

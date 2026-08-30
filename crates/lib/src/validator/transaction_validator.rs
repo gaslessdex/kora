@@ -14,7 +14,7 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID};
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr};
 
 use crate::fee::price::PriceModel;
 
@@ -208,7 +208,17 @@ impl TransactionValidator {
                 instruction.program_id == spl_token_interface::id()
                     && matches!(instruction.data.first(), Some(9 | 15))
             });
-        if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
+        let recover_close_count = outer
+            .iter()
+            .filter(|instruction| {
+                instruction.program_id == spl_token_interface::id()
+                    && matches!(instruction.data.first(), Some(9))
+            })
+            .count();
+        let has_recover_shape = has_outer_jupiter && recover_close_count == 2;
+        if has_recover_shape {
+            self.validate_recover(transaction_resolved, rpc_client, payer_creations).await?;
+        } else if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
             if has_outer_jupiter {
                 self.validate_canonical_ata_creation(
                     transaction_resolved,
@@ -551,6 +561,394 @@ impl TransactionValidator {
             ));
         }
         Ok(())
+    }
+
+    async fn validate_recover(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+        payer_creations: usize,
+    ) -> Result<(), KoraError> {
+        let policy = &self.fee_payer_policy.system.recover;
+        if !policy.enabled || policy.swap_fee_bps > 10_000 || policy.rent_fee_bps > 10_000 {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value is disabled or invalid".to_string(),
+            ));
+        }
+        let parse = |value: &str| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError);
+        let wallet = parse(&policy.user_wallet)?;
+        let treasury = parse(&policy.settlement_wallet)?;
+        let mint = parse(&policy.input_mint)?;
+        let source = parse(&policy.source_account)?;
+        let wrapped = parse(&policy.wrapped_sol_account)?;
+        let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .map_err(|_| KoraError::ConfigError)?;
+        let token_program = spl_token_interface::id();
+        let ata_program = spl_associated_token_account_interface::program::id();
+        let compute_program = solana_compute_budget_interface::id();
+        let jupiter_program =
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let raydium_program =
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
+            return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
+        }
+        let message = match &transaction.transaction.message {
+            solana_message::VersionedMessage::V0(message) => message,
+            _ => {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value requires a v0 message".to_string(),
+                ))
+            }
+        };
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if transaction.transaction.message.header().num_required_signatures != 2
+            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
+            || signer_keys.first() != Some(&self.fee_payer_pubkey)
+            || signer_keys.get(1) != Some(&wallet)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value requires exactly payer and configured user signers".to_string(),
+            ));
+        }
+        let configured_luts = policy
+            .allowed_lookup_tables
+            .iter()
+            .map(|value| parse(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let actual_luts = message
+            .address_table_lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect::<Vec<_>>();
+        if actual_luts != configured_luts {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value lookup tables are not approved".to_string(),
+            ));
+        }
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+            KoraError::InvalidTransaction("Recover Value instructions are unresolved".to_string())
+        })?;
+        let expected_compute = [
+            ComputeBudgetInstruction::set_compute_unit_price(
+                policy.compute_unit_price_micro_lamports,
+            )
+            .data,
+            ComputeBudgetInstruction::set_compute_unit_limit(policy.compute_unit_limit).data,
+        ];
+        if outer.len() < 6
+            || outer[..2].iter().zip(expected_compute.iter()).any(|(instruction, expected)| {
+                instruction.program_id != compute_program
+                    || !instruction.accounts.is_empty()
+                    || instruction.data != *expected
+            })
+            || outer[2..].iter().any(|instruction| instruction.program_id == compute_program)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value compute prefix is invalid".to_string(),
+            ));
+        }
+        let setup = outer.get(2).is_some_and(|instruction| instruction.program_id == ata_program);
+        let jupiter_index = 2 + usize::from(setup);
+        if outer.len() != jupiter_index + 4
+            || outer[jupiter_index].program_id != jupiter_program
+            || outer[jupiter_index + 1].program_id != token_program
+            || outer[jupiter_index + 2].program_id != token_program
+            || outer[jupiter_index + 3].program_id != SYSTEM_PROGRAM_ID
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value outer instruction shape is invalid".to_string(),
+            ));
+        }
+        let route_accounts = policy
+            .route_accounts
+            .iter()
+            .map(|value| parse(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let actual_route_accounts =
+            outer[jupiter_index].accounts.iter().map(|account| account.pubkey).collect::<Vec<_>>();
+        if route_accounts.is_empty() || actual_route_accounts != route_accounts {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value Jupiter accounts are not the approved route".to_string(),
+            ));
+        }
+        let approved_pools = policy
+            .approved_pool_accounts
+            .iter()
+            .map(|value| parse(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        if approved_pools.is_empty()
+            || !approved_pools.iter().any(|pool| actual_route_accounts.contains(pool))
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value pool is not approved".to_string(),
+            ));
+        }
+        let route_data = &outer[jupiter_index].data;
+        if route_data.len() != 39 || route_data[..8] != [187, 100, 250, 204, 49, 196, 175, 20] {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value Jupiter instruction is not the approved route form".to_string(),
+            ));
+        }
+        let input_amount =
+            u64::from_le_bytes(route_data[8..16].try_into().map_err(|_| KoraError::ConfigError)?);
+        let quoted_output =
+            u64::from_le_bytes(route_data[16..24].try_into().map_err(|_| KoraError::ConfigError)?);
+        let slippage =
+            u16::from_le_bytes(route_data[24..26].try_into().map_err(|_| KoraError::ConfigError)?);
+        if input_amount == 0
+            || quoted_output == 0
+            || slippage != policy.slippage_bps
+            || route_data[26] != 0
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value amount, slippage, or platform fee is invalid".to_string(),
+            ));
+        }
+        let minimum_output = quoted_output
+            .checked_mul(u64::from(10_000 - slippage))
+            .and_then(|value| value.checked_add(9_999))
+            .ok_or(KoraError::ConfigError)?
+            / 10_000;
+        if minimum_output < policy.minimum_output_lamports {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value minimum output is below policy".to_string(),
+            ));
+        }
+        let close_source = &outer[jupiter_index + 1];
+        let close_wrapped = &outer[jupiter_index + 2];
+        for (instruction, expected_source) in [(close_source, source), (close_wrapped, wrapped)] {
+            if !matches!(
+                spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data),
+                Ok(spl_token_interface::instruction::TokenInstruction::CloseAccount)
+            ) || instruction.accounts.len() != 3
+                || instruction.accounts[0].pubkey != expected_source
+                || instruction.accounts[1].pubkey != wallet
+                || instruction.accounts[2].pubkey != wallet
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value cleanup is invalid".to_string(),
+                ));
+            }
+        }
+        let settlement = &outer[jupiter_index + 3];
+        let settlement_lamports = match bincode::deserialize::<SystemInstruction>(&settlement.data)
+        {
+            Ok(SystemInstruction::Transfer { lamports }) => lamports,
+            _ => {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value settlement is invalid".to_string(),
+                ))
+            }
+        };
+        if settlement.accounts.len() != 2
+            || settlement.accounts[0].pubkey != wallet
+            || settlement.accounts[1].pubkey != treasury
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value settlement accounts are invalid".to_string(),
+            ));
+        }
+        let accounts = rpc_client.get_multiple_accounts(&[source, mint, wrapped]).await?;
+        let source_account = accounts[0].as_ref().ok_or_else(|| {
+            KoraError::InvalidTransaction("Recover Value source is missing".to_string())
+        })?;
+        let source_data = &source_account.data;
+        if source_account.owner != token_program
+            || source_data.len() != 165
+            || source_data[0..32] != mint.to_bytes()
+            || source_data[32..64] != wallet.to_bytes()
+            || source_data[72..76] != [0, 0, 0, 0]
+            || source_data[108] != 1
+            || source_data[109..113] != [0, 0, 0, 0]
+            || source_data[121..129] != [0, 0, 0, 0, 0, 0, 0, 0]
+            || source_data[129..133] != [0, 0, 0, 0]
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value source state is ineligible".to_string(),
+            ));
+        }
+        let authoritative_amount =
+            u64::from_le_bytes(source_data[64..72].try_into().map_err(|_| KoraError::ConfigError)?);
+        if authoritative_amount == 0 || input_amount != authoritative_amount {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value must route the full current balance".to_string(),
+            ));
+        }
+        let mint_account = accounts[1].as_ref().ok_or_else(|| {
+            KoraError::InvalidTransaction("Recover Value mint is missing".to_string())
+        })?;
+        if mint_account.owner != token_program
+            || mint_account.data.len() != 82
+            || mint_account.data[44] != policy.decimals
+            || mint_account.data[45] != 1
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value mint identity is invalid".to_string(),
+            ));
+        }
+        let setup_rent = if let Some(wrapped_account) = accounts[2].as_ref() {
+            let data = &wrapped_account.data;
+            if setup
+                || payer_creations != 0
+                || wrapped_account.owner != token_program
+                || data.len() != 165
+                || data[0..32] != native_mint.to_bytes()
+                || data[32..64] != wallet.to_bytes()
+                || data[64..72] != [0, 0, 0, 0, 0, 0, 0, 0]
+                || data[72..76] != [0, 0, 0, 0]
+                || data[108] != 1
+                || data[109..113] != [1, 0, 0, 0]
+                || data[121..129] != [0, 0, 0, 0, 0, 0, 0, 0]
+                || data[129..133] != [0, 0, 0, 0]
+                || u64::from_le_bytes(
+                    data[113..121].try_into().map_err(|_| KoraError::ConfigError)?,
+                ) != wrapped_account.lamports
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value existing wrapped SOL state is invalid".to_string(),
+                ));
+            }
+            0
+        } else {
+            if !setup || payer_creations != 1 {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value canonical wrapped SOL setup is missing".to_string(),
+                ));
+            }
+            self.validate_recover_ata_creation(
+                transaction,
+                rpc_client,
+                jupiter_index,
+                wallet,
+                wrapped,
+                native_mint,
+            )
+            .await?
+        };
+        let raydium_contexts = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| context.instruction.program_id == raydium_program)
+            .collect::<Vec<_>>();
+        if raydium_contexts.is_empty()
+            || raydium_contexts.iter().any(|context| {
+                context.outer_instruction_index as usize != jupiter_index
+                    || context.stack_height != Some(2)
+            })
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value requires direct Jupiter to Raydium CLMM CPI".to_string(),
+            ));
+        }
+        let referenced = outer
+            .iter()
+            .flat_map(|instruction| {
+                std::iter::once(instruction.program_id)
+                    .chain(instruction.accounts.iter().map(|account| account.pubkey))
+            })
+            .chain(std::iter::once(self.fee_payer_pubkey))
+            .collect::<HashSet<_>>();
+        if transaction.all_account_keys.iter().copied().collect::<HashSet<_>>() != referenced {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value contains unrelated accounts".to_string(),
+            ));
+        }
+        let network_fee = rpc_client.get_fee_for_message(message).await?;
+        let swap_fee = minimum_output
+            .checked_mul(u64::from(policy.swap_fee_bps))
+            .ok_or(KoraError::ConfigError)?
+            / 10_000;
+        let rent_fee = source_account
+            .lamports
+            .checked_mul(u64::from(policy.rent_fee_bps))
+            .ok_or(KoraError::ConfigError)?
+            / 10_000;
+        let expected_settlement = swap_fee
+            .checked_add(rent_fee)
+            .and_then(|value| value.checked_add(network_fee))
+            .and_then(|value| value.checked_add(setup_rent))
+            .ok_or(KoraError::ConfigError)?;
+        if settlement_lamports != expected_settlement
+            || network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
+                > self.max_allowed_lamports
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value settlement or payer exposure is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_recover_ata_creation(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+        jupiter_index: usize,
+        wallet: Pubkey,
+        destination: Pubkey,
+        native_mint: Pubkey,
+    ) -> Result<u64, KoraError> {
+        let token_program = spl_token_interface::id();
+        let ata_program = spl_associated_token_account_interface::program::id();
+        let outer = &transaction.all_instructions[2];
+        if outer.program_id != ata_program
+            || outer.data.as_slice() != [1]
+            || outer.accounts.len() != 6
+            || outer.accounts[0].pubkey != self.fee_payer_pubkey
+            || outer.accounts[1].pubkey != destination
+            || outer.accounts[2].pubkey != wallet
+            || outer.accounts[3].pubkey != native_mint
+            || outer.accounts[4].pubkey != SYSTEM_PROGRAM_ID
+            || outer.accounts[5].pubkey != token_program
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value ATA creation is not canonical".to_string(),
+            ));
+        }
+        let candidates = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| {
+                context.instruction.program_id == SYSTEM_PROGRAM_ID
+                    && context.instruction.accounts.first().map(|account| account.pubkey)
+                        == Some(self.fee_payer_pubkey)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1
+            || candidates[0].outer_instruction_index != 2
+            || candidates[0].stack_height != Some(2)
+            || jupiter_index != 3
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value payer-funded creation provenance is invalid".to_string(),
+            ));
+        }
+        let create = &candidates[0].instruction;
+        let (lamports, space, owner) = match bincode::deserialize::<SystemInstruction>(&create.data)
+        {
+            Ok(SystemInstruction::CreateAccount { lamports, space, owner }) => {
+                (lamports, space, owner)
+            }
+            _ => {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value permits only canonical ATA CreateAccount".to_string(),
+                ))
+            }
+        };
+        let rent = rpc_client.get_minimum_balance_for_rent_exemption(165).await?;
+        if create.accounts.len() != 2
+            || create.accounts[1].pubkey != destination
+            || owner != token_program
+            || space != 165
+            || lamports != rent
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value ATA rent or fields are invalid".to_string(),
+            ));
+        }
+        Ok(rent)
     }
 
     async fn validate_canonical_ata_creation(
@@ -1159,10 +1557,14 @@ impl TransactionValidator {
 mod tests {
     use crate::{
         config::{
-            CanonicalAtaCreationPolicy, CleanPolicy, FeePayerPolicy, SendMintPolicy, SendPolicy,
+            CanonicalAtaCreationPolicy, CleanPolicy, FeePayerPolicy, RecoverPolicy, SendMintPolicy,
+            SendPolicy,
         },
         state::update_config,
-        tests::{config_mock::ConfigMockBuilder, rpc_mock::RpcMockBuilder},
+        tests::{
+            config_mock::{mock_state, ConfigMockBuilder},
+            rpc_mock::RpcMockBuilder,
+        },
         transaction::{InnerInstructionContext, TransactionUtil},
     };
     use base64::Engine;
@@ -1398,6 +1800,316 @@ mod tests {
         );
         let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
         (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet, treasury)
+    }
+
+    fn recover_fixture(
+        existing_wrapped: bool,
+        source_mutation: Option<usize>,
+        wrapped_mutation: Option<usize>,
+    ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>, usize)
+    {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let lookup_table = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let jupiter_program = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
+        let raydium_program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program);
+        let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program);
+        let input_amount = 1_779_926_u64;
+        let quoted_output = 1_000_000_000_u64;
+        let minimum_output = 995_000_000_u64;
+        let network_fee = 42_500_u64;
+        let source_rent = 2_039_280_u64;
+        let setup_rent = 2_039_280_u64;
+        let settlement = minimum_output * 30 / 10_000
+            + source_rent * 300 / 10_000
+            + network_fee
+            + if existing_wrapped { 0 } else { setup_rent };
+
+        let route_accounts = vec![
+            AccountMeta::new(source, false),
+            AccountMeta::new(wrapped, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(native_mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(raydium_program, false),
+            AccountMeta::new(wallet, true),
+            AccountMeta::new_readonly(token_program, false),
+        ];
+        let mut route_data = vec![187, 100, 250, 204, 49, 196, 175, 20];
+        route_data.extend_from_slice(&input_amount.to_le_bytes());
+        route_data.extend_from_slice(&quoted_output.to_le_bytes());
+        route_data.extend_from_slice(&50_u16.to_le_bytes());
+        route_data.extend_from_slice(&[0_u8; 13]);
+        let route =
+            Instruction::new_with_bytes(jupiter_program, &route_data, route_accounts.clone());
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(375_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(100_000),
+        ];
+        if !existing_wrapped {
+            instructions.push(
+                spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+                    &payer,
+                    &wallet,
+                    &native_mint,
+                    &token_program,
+                ),
+            );
+        }
+        let jupiter_index = instructions.len();
+        instructions.extend([
+            route,
+            spl_token_interface::instruction::close_account(
+                &token_program,
+                &source,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap(),
+            spl_token_interface::instruction::close_account(
+                &token_program,
+                &wrapped,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap(),
+            transfer(&wallet, &treasury, settlement),
+        ]);
+        let mut message = solana_message::v0::Message::try_compile(
+            &payer,
+            &instructions,
+            &[],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        message.address_table_lookups.push(solana_message::v0::MessageAddressTableLookup {
+            account_key: lookup_table,
+            writable_indexes: vec![],
+            readonly_indexes: vec![],
+        });
+        let mut transaction = TransactionUtil::new_unsigned_versioned_transaction_resolved(
+            VersionedMessage::V0(message),
+        )
+        .unwrap();
+        if !existing_wrapped {
+            let create = create_account(&payer, &wrapped, setup_rent, 165, &token_program);
+            transaction.all_instructions.push(create.clone());
+            transaction.inner_instruction_contexts.push(InnerInstructionContext {
+                instruction: create,
+                outer_instruction_index: 2,
+                stack_height: Some(2),
+            });
+        }
+        let raydium = Instruction::new_with_bytes(raydium_program, &[], vec![]);
+        transaction.all_instructions.push(raydium.clone());
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: raydium,
+            outer_instruction_index: jupiter_index as u8,
+            stack_height: Some(2),
+        });
+
+        let mut policy = FeePayerPolicy::default();
+        policy.system.recover = RecoverPolicy {
+            enabled: true,
+            user_wallet: wallet.to_string(),
+            settlement_wallet: treasury.to_string(),
+            input_mint: mint.to_string(),
+            source_account: source.to_string(),
+            wrapped_sol_account: wrapped.to_string(),
+            decimals: 6,
+            swap_fee_bps: 30,
+            rent_fee_bps: 300,
+            slippage_bps: 50,
+            compute_unit_limit: 100_000,
+            compute_unit_price_micro_lamports: 375_000,
+            minimum_output_lamports: minimum_output,
+            approved_pool_accounts: vec![pool.to_string()],
+            allowed_lookup_tables: vec![lookup_table.to_string()],
+            route_accounts: route_accounts
+                .iter()
+                .map(|account| account.pubkey.to_string())
+                .collect(),
+        };
+        let config = ConfigMockBuilder::new()
+            .with_price_source(PriceSource::Mock)
+            .with_allowed_programs(vec![
+                SYSTEM_PROGRAM_ID.to_string(),
+                token_program.to_string(),
+                jupiter_program.to_string(),
+                raydium_program.to_string(),
+                spl_associated_token_account_interface::program::id().to_string(),
+                solana_compute_budget_interface::id().to_string(),
+            ])
+            .with_max_allowed_lamports(2_100_000)
+            .with_fee_payer_policy(policy)
+            .build();
+        update_config(config).unwrap();
+
+        let mut source_data = vec![0_u8; 165];
+        source_data[0..32].copy_from_slice(mint.as_ref());
+        source_data[32..64].copy_from_slice(wallet.as_ref());
+        source_data[64..72].copy_from_slice(&input_amount.to_le_bytes());
+        source_data[108] = 1;
+        let mut source_owner = token_program;
+        match source_mutation {
+            Some(0) => source_data[64..72].copy_from_slice(&(input_amount - 1).to_le_bytes()),
+            Some(1) => source_data[0..32].copy_from_slice(Pubkey::new_unique().as_ref()),
+            Some(2) => source_data[32..64].copy_from_slice(Pubkey::new_unique().as_ref()),
+            Some(3) => source_data[72..76].copy_from_slice(&1_u32.to_le_bytes()),
+            Some(4) => source_data[108] = 2,
+            Some(5) => source_data[109..113].copy_from_slice(&1_u32.to_le_bytes()),
+            Some(6) => source_data[129..133].copy_from_slice(&1_u32.to_le_bytes()),
+            Some(7) => source_owner = spl_token_2022_interface::id(),
+            _ => {}
+        }
+        let source_json = Some(
+            json!({ "data": [base64::engine::general_purpose::STANDARD.encode(source_data), "base64"], "executable": false, "lamports": source_rent, "owner": source_owner.to_string(), "rentEpoch": 0 }),
+        );
+        let mut mint_data = vec![0_u8; 82];
+        mint_data[44] = if source_mutation == Some(8) { 5 } else { 6 };
+        mint_data[45] = 1;
+        let mint_json = Some(
+            json!({ "data": [base64::engine::general_purpose::STANDARD.encode(mint_data), "base64"], "executable": false, "lamports": 1_461_600, "owner": token_program.to_string(), "rentEpoch": 0 }),
+        );
+        let wrapped_json = if existing_wrapped {
+            let mut data = vec![0_u8; 165];
+            data[0..32].copy_from_slice(native_mint.as_ref());
+            data[32..64].copy_from_slice(wallet.as_ref());
+            data[108] = 1;
+            data[109..113].copy_from_slice(&1_u32.to_le_bytes());
+            data[113..121].copy_from_slice(&setup_rent.to_le_bytes());
+            let mut owner = token_program;
+            match wrapped_mutation {
+                Some(0) => data[64..72].copy_from_slice(&1_u64.to_le_bytes()),
+                Some(1) => data[0..32].copy_from_slice(Pubkey::new_unique().as_ref()),
+                Some(2) => data[32..64].copy_from_slice(Pubkey::new_unique().as_ref()),
+                Some(3) => data[72..76].copy_from_slice(&1_u32.to_le_bytes()),
+                Some(4) => data[108] = 2,
+                Some(5) => data[109..113].copy_from_slice(&0_u32.to_le_bytes()),
+                Some(6) => data[129..133].copy_from_slice(&1_u32.to_le_bytes()),
+                Some(7) => owner = spl_token_2022_interface::id(),
+                Some(8) => data[113..121].copy_from_slice(&(setup_rent - 1).to_le_bytes()),
+                _ => {}
+            }
+            Some(
+                json!({ "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"], "executable": false, "lamports": setup_rent, "owner": owner.to_string(), "rentEpoch": 0 }),
+            )
+        } else {
+            None
+        };
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": [source_json, mint_json, wrapped_json] }),
+        );
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": network_fee }),
+        );
+        mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(setup_rent));
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (
+            TransactionValidator::new(payer).unwrap(),
+            transaction,
+            rpc,
+            if existing_wrapped { 0 } else { 1 },
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_only_missing_or_exact_safe_existing_wrapped_sol() {
+        for existing in [false, true] {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture(existing, None, None);
+            assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+        }
+        for mutation in 0..=8 {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture(true, None, Some(mutation));
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
+                "unsafe wrapped SOL state mutation {mutation} must fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_rejects_source_state_and_route_settlement_mutations() {
+        for mutation in 0..=8 {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture(false, Some(mutation), None);
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
+                "source state mutation {mutation} must fail"
+            );
+        }
+        let (validator, original, rpc, payer_creations) = recover_fixture(false, None, None);
+        for mutation in 0..20 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction.all_instructions[0].data[1] ^= 1,
+                1 => transaction.all_instructions[1].data[1] ^= 1,
+                2 => transaction.all_instructions.swap(0, 1),
+                3 => transaction.all_instructions[3].data[8] ^= 1,
+                4 => transaction.all_instructions[3].data[24] = 51,
+                5 => transaction.all_instructions[3].data[26] = 1,
+                6 => transaction.all_instructions[3].program_id = Pubkey::new_unique(),
+                7 => transaction.all_instructions[3].accounts[0].pubkey = Pubkey::new_unique(),
+                8 => transaction.all_instructions[4].accounts[0].pubkey = Pubkey::new_unique(),
+                9 => transaction.all_instructions[4].accounts[1].pubkey = Pubkey::new_unique(),
+                10 => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
+                11 => transaction.all_instructions[5].accounts[1].pubkey = Pubkey::new_unique(),
+                12 => transaction.all_instructions[6].accounts[1].pubkey = Pubkey::new_unique(),
+                13 => {
+                    transaction.all_instructions[6].data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 1 }).unwrap()
+                }
+                14 => transaction
+                    .all_instructions
+                    .insert(3, transfer(&validator.fee_payer_pubkey, &Pubkey::new_unique(), 1)),
+                15 => transaction.all_instructions[4].data[0] = 4,
+                16 => {
+                    transaction
+                        .inner_instruction_contexts
+                        .last_mut()
+                        .unwrap()
+                        .instruction
+                        .program_id = Pubkey::new_unique()
+                }
+                17 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.address_table_lookups[0].account_key = Pubkey::new_unique()
+                    }
+                    _ => unreachable!(),
+                },
+                18 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.header.num_required_signatures = 3;
+                        message.account_keys.insert(2, Pubkey::new_unique());
+                    }
+                    _ => unreachable!(),
+                },
+                _ => transaction.all_instructions.push(Instruction::new_with_bytes(
+                    Pubkey::new_unique(),
+                    &[],
+                    vec![],
+                )),
+            }
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
+                "Recover adversarial mutation {mutation} must fail"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2113,6 +2825,7 @@ mod tests {
             .with_max_allowed_lamports(1_000_000)
             .with_fee_payer_policy(policy)
             .build();
+        let _guard = mock_state::setup_config_mock(config.clone());
         update_config(config).unwrap();
     }
 

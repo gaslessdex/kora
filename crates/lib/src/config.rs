@@ -165,6 +165,9 @@ pub struct SystemInstructionPolicy {
     /// GASLESS-only policies for exact standalone CLEAN Claim/Burn transactions.
     #[serde(default)]
     pub clean: CleanPolicy,
+    /// GASLESS-only policy for one exact full-balance Recover Value route.
+    #[serde(default)]
+    pub recover: RecoverPolicy,
     /// Nested policy for nonce account operations
     #[serde(default)]
     pub nonce: NonceInstructionPolicy,
@@ -202,6 +205,53 @@ pub struct CleanPolicy {
     pub fee_bps: u16,
     #[serde(default = "default_clean_claim_accounts")]
     pub maximum_claim_accounts: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct RecoverPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub user_wallet: String,
+    #[serde(default)]
+    pub settlement_wallet: String,
+    #[serde(default)]
+    pub input_mint: String,
+    #[serde(default)]
+    pub source_account: String,
+    #[serde(default)]
+    pub wrapped_sol_account: String,
+    pub decimals: u8,
+    #[serde(default = "default_recover_swap_fee_bps")]
+    pub swap_fee_bps: u16,
+    #[serde(default = "default_clean_fee_bps")]
+    pub rent_fee_bps: u16,
+    #[serde(default = "default_recover_slippage_bps")]
+    pub slippage_bps: u16,
+    #[serde(default = "default_recover_compute_unit_limit")]
+    pub compute_unit_limit: u32,
+    #[serde(default = "default_recover_compute_unit_price")]
+    pub compute_unit_price_micro_lamports: u64,
+    #[serde(default)]
+    pub minimum_output_lamports: u64,
+    #[serde(default)]
+    pub approved_pool_accounts: Vec<String>,
+    #[serde(default)]
+    pub allowed_lookup_tables: Vec<String>,
+    #[serde(default)]
+    pub route_accounts: Vec<String>,
+}
+
+fn default_recover_swap_fee_bps() -> u16 {
+    30
+}
+fn default_recover_slippage_bps() -> u16 {
+    50
+}
+fn default_recover_compute_unit_limit() -> u32 {
+    100_000
+}
+fn default_recover_compute_unit_price() -> u64 {
+    375_000
 }
 
 fn default_clean_fee_bps() -> u16 {
