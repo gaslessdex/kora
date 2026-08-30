@@ -210,6 +210,10 @@ pub struct CleanPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct RecoverPolicy {
     pub enabled: bool,
+    #[serde(default = "default_recover_route_policy")]
+    pub route_policy: String,
+    #[serde(default = "default_recover_dex_family")]
+    pub approved_dex_family: String,
     #[serde(default)]
     pub user_wallet: String,
     #[serde(default)]
@@ -236,6 +240,10 @@ pub struct RecoverPolicy {
     #[serde(default)]
     pub minimum_user_payout_lamports: u64,
     #[serde(default)]
+    pub approved_pool_accounts: Vec<String>,
+    #[serde(default)]
+    pub allowed_lookup_tables: Vec<String>,
+    #[serde(default)]
     pub allowed_jupiter_auxiliary_accounts: Vec<String>,
     #[serde(default)]
     pub authorization_public_key: String,
@@ -243,6 +251,14 @@ pub struct RecoverPolicy {
     pub authorization_network: String,
     #[serde(default = "default_recover_authorization_max_lifetime_seconds")]
     pub authorization_max_lifetime_seconds: u64,
+}
+
+fn default_recover_route_policy() -> String {
+    "exact_snapshot".to_string()
+}
+
+fn default_recover_dex_family() -> String {
+    "RAYDIUM_CLMM".to_string()
 }
 
 fn default_recover_swap_fee_bps() -> u16 {

@@ -506,6 +506,42 @@ impl ConfigValidator {
             {
                 errors.push("Recover V1 compute policy must be exactly 100000 CU at 375000 micro-lamports/CU".to_string());
             }
+            if recover.approved_dex_family != "RAYDIUM_CLMM" {
+                errors.push("Recover approved_dex_family must be RAYDIUM_CLMM".to_string());
+            }
+            match recover.route_policy.as_str() {
+                "exact_snapshot" => {
+                    if recover.approved_pool_accounts.is_empty()
+                        || recover.allowed_lookup_tables.is_empty()
+                    {
+                        errors.push(
+                            "Recover exact_snapshot requires non-empty pool and LUT bindings"
+                                .to_string(),
+                        );
+                    }
+                    for (name, values) in [
+                        ("pool", &recover.approved_pool_accounts),
+                        ("lookup table", &recover.allowed_lookup_tables),
+                    ] {
+                        if let Err(e) = TokenUtil::check_valid_tokens(values) {
+                            errors.push(format!("Invalid Recover {name}: {e}"));
+                        }
+                    }
+                }
+                "semantic_family" => {
+                    if !recover.approved_pool_accounts.is_empty()
+                        || !recover.allowed_lookup_tables.is_empty()
+                    {
+                        errors.push(
+                            "Recover semantic_family must not configure exact pool or LUT bindings"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => errors.push(
+                    "Recover route_policy must be exact_snapshot or semantic_family".to_string(),
+                ),
+            }
             if recover.catastrophe_output_lamports == 0
                 || recover.minimum_user_payout_lamports == 0
                 || recover.allowed_jupiter_auxiliary_accounts.is_empty()
@@ -845,9 +881,9 @@ mod tests {
     use crate::{
         config::{
             AuthConfig, CacheConfig, Config, EnabledMethods, FeePayerPolicy, KoraConfig,
-            MetricsConfig, NonceInstructionPolicy, SplTokenConfig, SplTokenInstructionPolicy,
-            SystemInstructionPolicy, Token2022InstructionPolicy, UsageLimitConfig,
-            ValidationConfig,
+            MetricsConfig, NonceInstructionPolicy, RecoverPolicy, SplTokenConfig,
+            SplTokenInstructionPolicy, SystemInstructionPolicy, Token2022InstructionPolicy,
+            UsageLimitConfig, ValidationConfig,
         },
         constant::DEFAULT_MAX_REQUEST_BODY_SIZE,
         fee::price::PriceConfig,
@@ -867,6 +903,171 @@ mod tests {
     use spl_token_2022_interface::extension::ExtensionType;
 
     use super::*;
+
+    fn recover_config(route_policy: &str) -> Config {
+        let input_mint = Pubkey::new_unique();
+        let mut policy = FeePayerPolicy::default();
+        policy.system.recover = RecoverPolicy {
+            enabled: true,
+            route_policy: route_policy.to_string(),
+            approved_dex_family: "RAYDIUM_CLMM".to_string(),
+            user_wallet: Pubkey::new_unique().to_string(),
+            settlement_wallet: Pubkey::new_unique().to_string(),
+            input_mint: input_mint.to_string(),
+            source_account: Pubkey::new_unique().to_string(),
+            wrapped_sol_account: Pubkey::new_unique().to_string(),
+            decimals: 6,
+            swap_fee_bps: 30,
+            rent_fee_bps: 300,
+            slippage_bps: 50,
+            compute_unit_limit: 100_000,
+            compute_unit_price_micro_lamports: 375_000,
+            catastrophe_output_lamports: 1_000_000,
+            minimum_user_payout_lamports: 1_000_000,
+            approved_pool_accounts: if route_policy == "exact_snapshot" {
+                vec![Pubkey::new_unique().to_string()]
+            } else {
+                vec![]
+            },
+            allowed_lookup_tables: if route_policy == "exact_snapshot" {
+                vec![Pubkey::new_unique().to_string()]
+            } else {
+                vec![]
+            },
+            allowed_jupiter_auxiliary_accounts: vec![Pubkey::new_unique().to_string()],
+            authorization_public_key: Pubkey::new_unique().to_string(),
+            authorization_network: "mainnet-beta".to_string(),
+            authorization_max_lifetime_seconds: 90,
+        };
+        let mut config = ConfigMockBuilder::new()
+            .with_allowed_tokens(vec![input_mint.to_string()])
+            .with_allowed_spl_paid_tokens(SplTokenConfig::Allowlist(vec![]))
+            .with_allowed_programs(vec![
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+                spl_associated_token_account_interface::program::id().to_string(),
+                solana_compute_budget_interface::id().to_string(),
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+                "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
+            ])
+            .with_fee_payer_policy(policy)
+            .build();
+        config.validation.price = PriceConfig { model: PriceModel::Free };
+        config
+    }
+
+    async fn recover_config_errors(config: Config) -> Vec<String> {
+        update_config(config).unwrap();
+        let rpc_client = RpcClient::new("http://localhost:8899".to_string());
+        ConfigValidator::validate_with_result(&rpc_client, true).await.err().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_semantic_family_and_legacy_exact_configs_validate() {
+        for mode in ["semantic_family", "exact_snapshot"] {
+            let errors = recover_config_errors(recover_config(mode)).await;
+            assert!(errors.is_empty(), "{mode} config errors: {errors:?}");
+        }
+
+        let legacy = recover_config("exact_snapshot");
+        let mut serialized =
+            toml::to_string(&legacy.validation.fee_payer_policy.system.recover).unwrap();
+        serialized = serialized
+            .lines()
+            .filter(|line| {
+                !line.starts_with("route_policy") && !line.starts_with("approved_dex_family")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy_policy: RecoverPolicy = toml::from_str(&serialized).unwrap();
+        assert_eq!(legacy_policy.route_policy, "exact_snapshot");
+        assert_eq!(legacy_policy.approved_dex_family, "RAYDIUM_CLMM");
+        let mut legacy_config = recover_config("exact_snapshot");
+        legacy_config.validation.allowed_tokens = vec![legacy_policy.input_mint.clone()];
+        legacy_config.validation.fee_payer_policy.system.recover = legacy_policy;
+        let errors = recover_config_errors(legacy_config).await;
+        assert!(errors.is_empty(), "legacy config errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_semantic_family_rejects_missing_or_malformed_invariants() {
+        type ConfigMutation = fn(&mut Config);
+        let cases: Vec<(&str, ConfigMutation)> = vec![
+            ("catastrophe output", |config| {
+                config.validation.fee_payer_policy.system.recover.catastrophe_output_lamports = 0;
+            }),
+            ("minimum user payout", |config| {
+                config.validation.fee_payer_policy.system.recover.minimum_user_payout_lamports = 0;
+            }),
+            ("authorization_public_key", |config| {
+                config.validation.fee_payer_policy.system.recover.authorization_public_key =
+                    String::new();
+            }),
+            ("approved_dex_family", |config| {
+                config.validation.fee_payer_policy.system.recover.approved_dex_family =
+                    "UNKNOWN_DEX".to_string();
+            }),
+            ("Raydium program", |config| {
+                config
+                    .validation
+                    .allowed_programs
+                    .retain(|program| program != "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
+            }),
+            ("Jupiter program", |config| {
+                config
+                    .validation
+                    .allowed_programs
+                    .retain(|program| program != "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+            }),
+            ("authorization_network", |config| {
+                config.validation.fee_payer_policy.system.recover.authorization_network =
+                    "devnet".to_string();
+            }),
+            ("authorization_max_lifetime_seconds", |config| {
+                config
+                    .validation
+                    .fee_payer_policy
+                    .system
+                    .recover
+                    .authorization_max_lifetime_seconds = 0;
+            }),
+            ("Jupiter auxiliary", |config| {
+                config
+                    .validation
+                    .fee_payer_policy
+                    .system
+                    .recover
+                    .allowed_jupiter_auxiliary_accounts
+                    .clear();
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let mut config = recover_config("semantic_family");
+            mutate(&mut config);
+            let errors = recover_config_errors(config).await;
+            assert!(!errors.is_empty(), "{name} must fail closed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_route_modes_do_not_blur_identity_policy() {
+        let mut semantic = recover_config("semantic_family");
+        semantic.validation.fee_payer_policy.system.recover.approved_pool_accounts =
+            vec![Pubkey::new_unique().to_string()];
+        assert!(!recover_config_errors(semantic).await.is_empty());
+
+        let mut exact = recover_config("exact_snapshot");
+        exact.validation.fee_payer_policy.system.recover.allowed_lookup_tables.clear();
+        assert!(!recover_config_errors(exact).await.is_empty());
+
+        let mut unknown = recover_config("semantic_family");
+        unknown.validation.fee_payer_policy.system.recover.route_policy = "arbitrary".to_string();
+        assert!(!recover_config_errors(unknown).await.is_empty());
+    }
 
     #[tokio::test]
     #[serial]

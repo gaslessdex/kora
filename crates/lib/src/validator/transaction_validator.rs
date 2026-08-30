@@ -619,6 +619,25 @@ impl TransactionValidator {
                 "Recover Value requires exactly payer and configured user signers".to_string(),
             ));
         }
+        if policy.route_policy == "exact_snapshot" {
+            let configured_luts = policy
+                .allowed_lookup_tables
+                .iter()
+                .map(|value| parse(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let actual_luts = message
+                .address_table_lookups
+                .iter()
+                .map(|lookup| lookup.account_key)
+                .collect::<Vec<_>>();
+            if actual_luts != configured_luts {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value lookup tables are not approved".to_string(),
+                ));
+            }
+        } else if policy.route_policy != "semantic_family" {
+            return Err(KoraError::ConfigError);
+        }
         let outer_count = transaction.transaction.message.instructions().len();
         let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value instructions are unresolved".to_string())
@@ -733,6 +752,16 @@ impl TransactionValidator {
             ));
         }
         let raydium = &raydium_contexts[0].instruction;
+        let pool_is_approved = if policy.route_policy == "exact_snapshot" {
+            let approved_pools = policy
+                .approved_pool_accounts
+                .iter()
+                .map(|value| parse(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            raydium.accounts.get(2).is_some_and(|account| approved_pools.contains(&account.pubkey))
+        } else {
+            true
+        };
         if raydium.accounts.len() != 13
             || raydium.data.len() != 41
             || raydium.data[..8] != RAYDIUM_SWAP_V2_DISCRIMINATOR
@@ -741,6 +770,7 @@ impl TransactionValidator {
             || raydium.accounts[3].pubkey != source
             || raydium.accounts[4].pubkey != wrapped
             || raydium.accounts[8].pubkey != token_program
+            || !pool_is_approved
         {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value Raydium CLMM instruction shape is invalid".to_string(),
@@ -2261,6 +2291,8 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.recover = RecoverPolicy {
             enabled: true,
+            route_policy: "semantic_family".to_string(),
+            approved_dex_family: "RAYDIUM_CLMM".to_string(),
             user_wallet: wallet.to_string(),
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
@@ -2274,6 +2306,8 @@ mod tests {
             compute_unit_price_micro_lamports: 375_000,
             catastrophe_output_lamports: 1_000_000,
             minimum_user_payout_lamports: 1_000_000,
+            approved_pool_accounts: vec![],
+            allowed_lookup_tables: vec![],
             allowed_jupiter_auxiliary_accounts: vec![Pubkey::find_program_address(
                 &[b"__event_authority"],
                 &jupiter_program,
@@ -2538,6 +2572,31 @@ mod tests {
             assert_eq!(stable_policy.get_or_insert_with(|| snapshot.clone()), &snapshot);
             assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_exact_snapshot_preserves_pool_and_lut_pinning() {
+        let (mut validator, transaction, rpc, payer_creations) = recover_fixture(false, None, None);
+        let lookup_table = match &transaction.transaction.message {
+            VersionedMessage::V0(message) => message.address_table_lookups[0].account_key,
+            _ => panic!("Recover fixture must use a v0 message"),
+        };
+        let pool =
+            transaction.inner_instruction_contexts.last().unwrap().instruction.accounts[2].pubkey;
+        validator.fee_payer_policy.system.recover.route_policy = "exact_snapshot".to_string();
+        validator.fee_payer_policy.system.recover.approved_pool_accounts = vec![pool.to_string()];
+        validator.fee_payer_policy.system.recover.allowed_lookup_tables =
+            vec![lookup_table.to_string()];
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+
+        let (mut validator, transaction, rpc, payer_creations) = recover_fixture(false, None, None);
+        validator.fee_payer_policy.system.recover.route_policy = "exact_snapshot".to_string();
+        validator.fee_payer_policy.system.recover.approved_pool_accounts =
+            vec![Pubkey::new_unique().to_string()];
+        validator.fee_payer_policy.system.recover.allowed_lookup_tables =
+            vec![Pubkey::new_unique().to_string()];
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
     }
 
     #[tokio::test]
