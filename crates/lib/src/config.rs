@@ -236,10 +236,6 @@ pub struct RecoverPolicy {
     #[serde(default)]
     pub minimum_user_payout_lamports: u64,
     #[serde(default)]
-    pub approved_pool_accounts: Vec<String>,
-    #[serde(default)]
-    pub allowed_lookup_tables: Vec<String>,
-    #[serde(default)]
     pub allowed_jupiter_auxiliary_accounts: Vec<String>,
     #[serde(default)]
     pub authorization_public_key: String,

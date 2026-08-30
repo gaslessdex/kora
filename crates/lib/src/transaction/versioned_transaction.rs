@@ -382,9 +382,18 @@ impl LookupTableUtil {
         // Maybe we can use caching here, there's a chance the lookup tables get updated though, so tbd
         for lookup in lookup_table_lookups {
             let lookup_table_account =
-                CacheUtil::get_account(rpc_client, &lookup.account_key, false).await.map_err(
+                CacheUtil::get_account(rpc_client, &lookup.account_key, true).await.map_err(
                     |e| KoraError::RpcError(format!("Failed to fetch lookup table: {e}")),
                 )?;
+
+            if lookup_table_account.owner != solana_address_lookup_table_interface::program::id()
+                || lookup_table_account.executable
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lookup table account is not owned by the Address Lookup Table program"
+                        .to_string(),
+                ));
+            }
 
             // Parse the lookup table account data to get the actual addresses
             let address_lookup_table = AddressLookupTable::deserialize(&lookup_table_account.data)
@@ -393,6 +402,11 @@ impl LookupTableUtil {
                         "Failed to deserialize lookup table: {e}"
                     ))
                 })?;
+            if address_lookup_table.meta.deactivation_slot != u64::MAX {
+                return Err(KoraError::InvalidTransaction(
+                    "Lookup table is deactivating or deactivated".to_string(),
+                ));
+            }
 
             // Resolve writable addresses
             for &index in &lookup.writable_indexes {
@@ -1063,7 +1077,7 @@ mod tests {
                 data: serialized_data,
                 executable: false,
                 lamports: 0,
-                owner: Pubkey::new_unique(),
+                owner: solana_address_lookup_table_interface::program::id(),
                 rent_epoch: 0,
             })
             .build();
@@ -1081,6 +1095,64 @@ mod tests {
         assert_eq!(resolved_addresses[0], address1);
         assert_eq!(resolved_addresses[1], address3);
         assert_eq!(resolved_addresses[2], address2);
+    }
+
+    #[tokio::test]
+    async fn test_rejects_lookup_table_with_wrong_owner() {
+        let config = setup_test_config();
+        let _m = setup_config_mock(config);
+        let lookup_table = AddressLookupTable {
+            meta: LookupTableMeta::default(),
+            addresses: vec![Pubkey::new_unique()].into(),
+        };
+        let rpc_client = RpcMockBuilder::new()
+            .with_account_info(&Account {
+                data: lookup_table.serialize_for_tests().unwrap(),
+                executable: false,
+                lamports: 0,
+                owner: Pubkey::new_unique(),
+                rent_epoch: 0,
+            })
+            .build();
+        let lookups = vec![solana_message::v0::MessageAddressTableLookup {
+            account_key: Pubkey::new_unique(),
+            writable_indexes: vec![0],
+            readonly_indexes: vec![],
+        }];
+
+        let result = LookupTableUtil::resolve_lookup_table_addresses(&rpc_client, &lookups).await;
+        assert!(
+            matches!(result, Err(KoraError::InvalidTransaction(message)) if message.contains("not owned"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejects_deactivating_lookup_table() {
+        let config = setup_test_config();
+        let _m = setup_config_mock(config);
+        let lookup_table = AddressLookupTable {
+            meta: LookupTableMeta { deactivation_slot: 1, ..LookupTableMeta::default() },
+            addresses: vec![Pubkey::new_unique()].into(),
+        };
+        let rpc_client = RpcMockBuilder::new()
+            .with_account_info(&Account {
+                data: lookup_table.serialize_for_tests().unwrap(),
+                executable: false,
+                lamports: 0,
+                owner: solana_address_lookup_table_interface::program::id(),
+                rent_epoch: 0,
+            })
+            .build();
+        let lookups = vec![solana_message::v0::MessageAddressTableLookup {
+            account_key: Pubkey::new_unique(),
+            writable_indexes: vec![0],
+            readonly_indexes: vec![],
+        }];
+
+        let result = LookupTableUtil::resolve_lookup_table_addresses(&rpc_client, &lookups).await;
+        assert!(
+            matches!(result, Err(KoraError::InvalidTransaction(message)) if message.contains("deactivating"))
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1208,7 @@ mod tests {
                 data: serialized_data,
                 executable: false,
                 lamports: 0,
-                owner: Pubkey::new_unique(),
+                owner: solana_address_lookup_table_interface::program::id(),
                 rent_epoch: 0,
             })
             .build();
@@ -1182,7 +1254,7 @@ mod tests {
                 data: serialized_data,
                 executable: false,
                 lamports: 0,
-                owner: Pubkey::new_unique(),
+                owner: solana_address_lookup_table_interface::program::id(),
                 rent_epoch: 0,
             })
             .build();

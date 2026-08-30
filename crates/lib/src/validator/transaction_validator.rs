@@ -619,21 +619,6 @@ impl TransactionValidator {
                 "Recover Value requires exactly payer and configured user signers".to_string(),
             ));
         }
-        let configured_luts = policy
-            .allowed_lookup_tables
-            .iter()
-            .map(|value| parse(value))
-            .collect::<Result<Vec<_>, _>>()?;
-        let actual_luts = message
-            .address_table_lookups
-            .iter()
-            .map(|lookup| lookup.account_key)
-            .collect::<Vec<_>>();
-        if actual_luts != configured_luts {
-            return Err(KoraError::InvalidTransaction(
-                "Recover Value lookup tables are not approved".to_string(),
-            ));
-        }
         let outer_count = transaction.transaction.message.instructions().len();
         let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value instructions are unresolved".to_string())
@@ -667,16 +652,6 @@ impl TransactionValidator {
         {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value outer instruction shape is invalid".to_string(),
-            ));
-        }
-        let approved_pools = policy
-            .approved_pool_accounts
-            .iter()
-            .map(|value| parse(value))
-            .collect::<Result<Vec<_>, _>>()?;
-        if approved_pools.is_empty() {
-            return Err(KoraError::InvalidTransaction(
-                "Recover Value pool is not approved".to_string(),
             ));
         }
         let route_data = &outer[jupiter_index].data;
@@ -766,7 +741,6 @@ impl TransactionValidator {
             || raydium.accounts[3].pubkey != source
             || raydium.accounts[4].pubkey != wrapped
             || raydium.accounts[8].pubkey != token_program
-            || !approved_pools.contains(&raydium.accounts[2].pubkey)
         {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value Raydium CLMM instruction shape is invalid".to_string(),
@@ -816,7 +790,7 @@ impl TransactionValidator {
                 "Recover Value Raydium CLMM account state is incomplete".to_string(),
             ));
         }
-        self.validate_recover_raydium_clmm(
+        self.validate_recover_route(
             raydium,
             &accounts[3..],
             raydium_program,
@@ -970,6 +944,30 @@ impl TransactionValidator {
         Ok(())
     }
 
+    fn validate_recover_route(
+        &self,
+        instruction: &Instruction,
+        accounts: &[Option<Account>],
+        raydium_program: Pubkey,
+        token_program: Pubkey,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+    ) -> Result<(), KoraError> {
+        if instruction.program_id != raydium_program {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value route DEX family is not approved".to_string(),
+            ));
+        }
+        self.validate_recover_raydium_clmm(
+            instruction,
+            accounts,
+            raydium_program,
+            token_program,
+            input_mint,
+            output_mint,
+        )
+    }
+
     fn validate_recover_raydium_clmm(
         &self,
         instruction: &Instruction,
@@ -993,9 +991,41 @@ impl TransactionValidator {
         let input_vault = accounts[2];
         let output_vault = accounts[3];
         let observation = accounts[4];
+        let config_index = amm
+            .data
+            .get(9..11)
+            .and_then(|value| value.try_into().ok())
+            .map(u16::from_le_bytes)
+            .ok_or_else(invalid)?;
+        let (expected_config, config_bump) = Pubkey::find_program_address(
+            &[b"amm_config", &config_index.to_be_bytes()],
+            &raydium_program,
+        );
+        let protocol_fee_rate = u32::from_le_bytes(
+            amm.data.get(43..47).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+        );
+        let trade_fee_rate = u32::from_le_bytes(
+            amm.data.get(47..51).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+        );
+        let config_tick_spacing = u16::from_le_bytes(
+            amm.data.get(51..53).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+        );
+        let fund_fee_rate = u32::from_le_bytes(
+            amm.data.get(53..57).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+        );
+        let pool_tick_spacing = u16::from_le_bytes(
+            pool.data.get(235..237).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+        );
         if amm.owner != raydium_program
             || amm.data.len() != 117
             || amm.data[..8] != RAYDIUM_AMM_CONFIG_DISCRIMINATOR
+            || instruction.accounts[1].pubkey != expected_config
+            || amm.data[8] != config_bump
+            || trade_fee_rate >= 1_000_000
+            || protocol_fee_rate.checked_add(fund_fee_rate).is_none_or(|fee| fee > 1_000_000)
+            || config_tick_spacing == 0
+            || config_tick_spacing > 1_000
+            || config_tick_spacing != pool_tick_spacing
             || pool.owner != raydium_program
             || pool.data.len() != 1544
             || pool.data[..8] != RAYDIUM_POOL_DISCRIMINATOR
@@ -1007,6 +1037,7 @@ impl TransactionValidator {
             || pool.data[201..233] != instruction.accounts[7].pubkey.to_bytes()
             || pool.data[233] != 9
             || pool.data[234] != self.fee_payer_policy.system.recover.decimals
+            || pool.data[389] & (1 << 4) != 0
             || observation.owner != raydium_program
             || observation.data.len() != 4483
             || observation.data[..8] != RAYDIUM_OBSERVATION_DISCRIMINATOR
@@ -1025,8 +1056,7 @@ impl TransactionValidator {
                 return Err(invalid());
             }
         }
-        let tick_spacing =
-            u16::from_le_bytes(pool.data[235..237].try_into().map_err(|_| invalid())?);
+        let tick_spacing = pool_tick_spacing;
         let current_tick =
             i32::from_le_bytes(pool.data[269..273].try_into().map_err(|_| invalid())?);
         if tick_spacing == 0 {
@@ -2041,7 +2071,29 @@ mod tests {
             wrapped_mutation,
             quoted_output,
             None,
+            None,
         )
+    }
+
+    #[derive(Clone, Copy)]
+    struct RecoverFixtureIdentity {
+        payer: Pubkey,
+        wallet: Pubkey,
+        treasury: Pubkey,
+        mint: Pubkey,
+        pool: Pubkey,
+        lookup_table: Pubkey,
+    }
+
+    fn stable_recover_identity(pool: Pubkey, lookup_table: Pubkey) -> RecoverFixtureIdentity {
+        RecoverFixtureIdentity {
+            payer: Pubkey::new_from_array([1; 32]),
+            wallet: Pubkey::new_from_array([2; 32]),
+            treasury: Pubkey::new_from_array([3; 32]),
+            mint: Pubkey::new_from_array([4; 32]),
+            pool,
+            lookup_table,
+        }
     }
 
     fn recover_fixture_with_output_and_semantic_mutation(
@@ -2050,19 +2102,27 @@ mod tests {
         wrapped_mutation: Option<usize>,
         quoted_output: u64,
         semantic_mutation: Option<usize>,
+        identity_override: Option<RecoverFixtureIdentity>,
     ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>, usize)
     {
-        let payer = Pubkey::new_unique();
-        let wallet = Pubkey::new_unique();
-        let treasury = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
-        let pool = Pubkey::new_unique();
-        let lookup_table = Pubkey::new_unique();
+        let identity = identity_override.unwrap_or_else(|| RecoverFixtureIdentity {
+            payer: Pubkey::new_unique(),
+            wallet: Pubkey::new_unique(),
+            treasury: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            pool: Pubkey::new_unique(),
+            lookup_table: Pubkey::new_unique(),
+        });
+        let RecoverFixtureIdentity { payer, wallet, treasury, mint, pool, lookup_table } = identity;
         let token_program = spl_token_interface::id();
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         let jupiter_program = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
         let raydium_program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
-        let amm_config = Pubkey::new_unique();
+        let config_index = 0_u16;
+        let (amm_config, config_bump) = Pubkey::find_program_address(
+            &[b"amm_config", &config_index.to_be_bytes()],
+            &raydium_program,
+        );
         let input_vault = Pubkey::new_unique();
         let output_vault = Pubkey::new_unique();
         let observation = Pubkey::new_unique();
@@ -2214,8 +2274,6 @@ mod tests {
             compute_unit_price_micro_lamports: 375_000,
             catastrophe_output_lamports: 1_000_000,
             minimum_user_payout_lamports: 1_000_000,
-            approved_pool_accounts: vec![pool.to_string()],
-            allowed_lookup_tables: vec![lookup_table.to_string()],
             allowed_jupiter_auxiliary_accounts: vec![Pubkey::find_program_address(
                 &[b"__event_authority"],
                 &jupiter_program,
@@ -2301,6 +2359,9 @@ mod tests {
         };
         let mut amm_data = vec![0_u8; 117];
         amm_data[..8].copy_from_slice(&RAYDIUM_AMM_CONFIG_DISCRIMINATOR);
+        amm_data[8] = config_bump;
+        amm_data[9..11].copy_from_slice(&config_index.to_le_bytes());
+        amm_data[51..53].copy_from_slice(&1_u16.to_le_bytes());
         let mut pool_data = vec![0_u8; 1544];
         pool_data[..8].copy_from_slice(&RAYDIUM_POOL_DISCRIMINATOR);
         pool_data[9..41].copy_from_slice(amm_config.as_ref());
@@ -2315,6 +2376,15 @@ mod tests {
         pool_data[269..273].copy_from_slice(&1_i32.to_le_bytes());
         if semantic_mutation == Some(1) {
             pool_data[0] ^= 1;
+        }
+        if semantic_mutation == Some(6) {
+            amm_data[9..11].copy_from_slice(&1_u16.to_le_bytes());
+        }
+        if semantic_mutation == Some(7) {
+            amm_data[51..53].copy_from_slice(&2_u16.to_le_bytes());
+        }
+        if semantic_mutation == Some(8) {
+            pool_data[389] |= 1 << 4;
         }
         let vault_json = |vault_mint: Pubkey, authority: Pubkey| {
             let mut data = vec![0_u8; 165];
@@ -2406,8 +2476,74 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn recover_accepts_historical_and_current_pool_identities_by_semantics() {
+        for pool in [
+            "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
+            "FKzoAV4wZYteNV1xDDr5nQaSLrYEUWwerxvBkKVXNCB",
+        ] {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture_with_output_and_semantic_mutation(
+                    false,
+                    None,
+                    None,
+                    1_000_000_000,
+                    None,
+                    Some(stable_recover_identity(
+                        Pubkey::from_str(pool).unwrap(),
+                        Pubkey::new_from_array([11; 32]),
+                    )),
+                );
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok(),
+                "semantically valid pool {pool} must not require a config snapshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_three_route_variants_under_one_stable_policy() {
+        let variants = [
+            (
+                Pubkey::from_str("3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF").unwrap(),
+                Pubkey::new_from_array([11; 32]),
+                1_000_000_000,
+            ),
+            (
+                Pubkey::from_str("FKzoAV4wZYteNV1xDDr5nQaSLrYEUWwerxvBkKVXNCB").unwrap(),
+                Pubkey::new_from_array([12; 32]),
+                900_000_000,
+            ),
+            (Pubkey::new_from_array([21; 32]), Pubkey::new_from_array([13; 32]), 800_000_000),
+        ];
+        let mut stable_policy = None;
+        for (pool, lookup_table, quoted_output) in variants {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture_with_output_and_semantic_mutation(
+                    false,
+                    None,
+                    None,
+                    quoted_output,
+                    None,
+                    Some(stable_recover_identity(pool, lookup_table)),
+                );
+            let policy = &validator.fee_payer_policy.system.recover;
+            let snapshot = (
+                policy.user_wallet.clone(),
+                policy.input_mint.clone(),
+                policy.source_account.clone(),
+                policy.wrapped_sol_account.clone(),
+                policy.settlement_wallet.clone(),
+            );
+            assert_eq!(stable_policy.get_or_insert_with(|| snapshot.clone()), &snapshot);
+            assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn recover_rejects_malformed_or_wrong_owner_raydium_state() {
-        for mutation in 0..=5 {
+        for mutation in 0..=8 {
             let (validator, transaction, rpc, payer_creations) =
                 recover_fixture_with_output_and_semantic_mutation(
                     false,
@@ -2415,6 +2551,7 @@ mod tests {
                     None,
                     1_000_000_000,
                     Some(mutation),
+                    None,
                 );
             assert!(
                 validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err(),
