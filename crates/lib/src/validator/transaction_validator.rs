@@ -1172,7 +1172,7 @@ impl TransactionValidator {
         }
         if bitmap_count != 1
             || !(2..=3).contains(&starts.len())
-            || starts.first() != Some(&expected_current_start)
+            || starts.first().is_none_or(|start| *start < expected_current_start)
             || starts.windows(2).any(|pair| pair[1] <= pair[0])
         {
             return Err(invalid());
@@ -2456,6 +2456,9 @@ mod tests {
         pool_data[234] = 6;
         pool_data[235..237].copy_from_slice(&1_u16.to_le_bytes());
         pool_data[269..273].copy_from_slice(&1_i32.to_le_bytes());
+        if semantic_mutation == Some(11) {
+            pool_data[269..273].copy_from_slice(&(-61_i32).to_le_bytes());
+        }
         if semantic_mutation == Some(1) {
             pool_data[0] ^= 1;
         }
@@ -2671,6 +2674,17 @@ mod tests {
         transaction.inner_instruction_contexts.last_mut().unwrap().instruction.data[..8]
             .copy_from_slice(&RAYDIUM_SWAP_DISCRIMINATOR);
         assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
+
+        let (validator, transaction, rpc, payer_creations) =
+            recover_fixture_with_output_and_semantic_mutation(
+                false,
+                None,
+                None,
+                1_000_000_000,
+                Some(11),
+                None,
+            );
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
     }
 
     #[tokio::test]
