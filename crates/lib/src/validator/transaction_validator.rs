@@ -26,7 +26,6 @@ const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgr
 // account layout. Its 13-account shape is different from `swap_v2`, even though
 // both instructions encode the same four swap arguments after the discriminator.
 const RAYDIUM_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
-#[cfg(test)]
 const RAYDIUM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 const RAYDIUM_POOL_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const RAYDIUM_AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
@@ -767,10 +766,30 @@ impl TransactionValidator {
         } else {
             true
         };
-        if raydium.accounts.len() != 13
-            || raydium.data.len() != 41
-            || raydium.data[..8] != RAYDIUM_SWAP_DISCRIMINATOR
-            || raydium.accounts[0].pubkey != wallet
+        let token_2022_program = spl_token_2022_interface::id();
+        let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+            .map_err(|_| KoraError::ConfigError)?;
+        let tick_accounts_start = if raydium.data.len() == 41
+            && raydium.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
+            && (12..=13).contains(&raydium.accounts.len())
+        {
+            9
+        } else if raydium.data.len() == 41
+            && raydium.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
+            && (16..=17).contains(&raydium.accounts.len())
+            && raydium.accounts[9].pubkey == token_2022_program
+            && raydium.accounts[10].pubkey == memo_program
+            && raydium.accounts[11].pubkey == mint
+            && raydium.accounts[12].pubkey == native_mint
+        {
+            13
+        } else {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value Raydium CLMM instruction variant or account shape is invalid"
+                    .to_string(),
+            ));
+        };
+        if raydium.accounts[0].pubkey != wallet
             || raydium.accounts[2].pubkey == self.fee_payer_pubkey
             || raydium.accounts[3].pubkey != source
             || raydium.accounts[4].pubkey != wrapped
@@ -815,9 +834,10 @@ impl TransactionValidator {
         }
         let mut account_addresses = vec![source, mint, wrapped];
         account_addresses.extend(
-            [1_usize, 2, 5, 6, 7, 9, 10, 11, 12]
-                .iter()
-                .map(|index| raydium.accounts[*index].pubkey),
+            [1_usize, 2, 5, 6, 7]
+                .into_iter()
+                .chain(tick_accounts_start..raydium.accounts.len())
+                .map(|index| raydium.accounts[index].pubkey),
         );
         let accounts = rpc_client.get_multiple_accounts(&account_addresses).await?;
         if accounts.len() != account_addresses.len() {
@@ -832,6 +852,7 @@ impl TransactionValidator {
             token_program,
             mint,
             native_mint,
+            tick_accounts_start,
         )?;
         let source_account = accounts[0].as_ref().ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value source is missing".to_string())
@@ -987,6 +1008,7 @@ impl TransactionValidator {
         token_program: Pubkey,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        tick_accounts_start: usize,
     ) -> Result<(), KoraError> {
         if instruction.program_id != raydium_program {
             return Err(KoraError::InvalidTransaction(
@@ -1000,6 +1022,7 @@ impl TransactionValidator {
             token_program,
             input_mint,
             output_mint,
+            tick_accounts_start,
         )
     }
 
@@ -1011,13 +1034,14 @@ impl TransactionValidator {
         token_program: Pubkey,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        tick_accounts_start: usize,
     ) -> Result<(), KoraError> {
         let invalid = || {
             KoraError::InvalidTransaction(
                 "Recover Value Raydium CLMM account relationships are invalid".to_string(),
             )
         };
-        if accounts.len() != 9 || accounts.iter().any(Option::is_none) {
+        if !(8..=9).contains(&accounts.len()) || accounts.iter().any(Option::is_none) {
             return Err(invalid());
         }
         let accounts = accounts.iter().map(|account| account.as_ref().unwrap()).collect::<Vec<_>>();
@@ -1104,7 +1128,7 @@ impl TransactionValidator {
         let pool_key = instruction.accounts[2].pubkey;
         let mut seen = HashSet::new();
         for (offset, account) in accounts[5..].iter().enumerate() {
-            let meta = &instruction.accounts[9 + offset];
+            let meta = &instruction.accounts[tick_accounts_start + offset];
             if meta.is_signer
                 || !meta.is_writable
                 || !seen.insert(meta.pubkey)
@@ -1146,12 +1170,10 @@ impl TransactionValidator {
                 return Err(invalid());
             }
         }
-        starts.sort_unstable();
         if bitmap_count != 1
-            || starts.len() != 3
-            || starts[1] != starts[0] + interval
-            || starts[2] != starts[1] + interval
-            || !starts.contains(&expected_current_start)
+            || !(2..=3).contains(&starts.len())
+            || starts.first() != Some(&expected_current_start)
+            || starts.windows(2).any(|pair| pair[1] <= pair[0])
         {
             return Err(invalid());
         }
@@ -2186,7 +2208,7 @@ mod tests {
             + network_fee
             + if existing_wrapped { 0 } else { setup_rent };
 
-        let raydium_accounts = vec![
+        let mut raydium_accounts = vec![
             AccountMeta::new_readonly(wallet, true),
             AccountMeta::new_readonly(amm_config, false),
             AccountMeta::new(pool, false),
@@ -2201,6 +2223,23 @@ mod tests {
             AccountMeta::new(tick_arrays[1], false),
             AccountMeta::new(tick_arrays[2], false),
         ];
+        if semantic_mutation == Some(9) {
+            raydium_accounts.remove(11);
+        }
+        if semantic_mutation == Some(10) {
+            raydium_accounts.splice(
+                9..9,
+                [
+                    AccountMeta::new_readonly(spl_token_2022_interface::id(), false),
+                    AccountMeta::new_readonly(
+                        Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap(),
+                        false,
+                    ),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new_readonly(native_mint, false),
+                ],
+            );
+        }
         let mut route_accounts = vec![
             AccountMeta::new(source, false),
             AccountMeta::new(wrapped, false),
@@ -2283,7 +2322,11 @@ mod tests {
                 stack_height: Some(2),
             });
         }
-        let mut raydium_data = RAYDIUM_SWAP_DISCRIMINATOR.to_vec();
+        let mut raydium_data = if semantic_mutation == Some(10) {
+            RAYDIUM_SWAP_V2_DISCRIMINATOR.to_vec()
+        } else {
+            RAYDIUM_SWAP_DISCRIMINATOR.to_vec()
+        };
         raydium_data.resize(41, 0);
         let raydium = Instruction::new_with_bytes(raydium_program, &raydium_data, raydium_accounts);
         transaction.all_instructions.push(raydium.clone());
@@ -2448,25 +2491,43 @@ mod tests {
         let mut bitmap_data = vec![0_u8; 1832];
         bitmap_data[..8].copy_from_slice(&RAYDIUM_BITMAP_DISCRIMINATOR);
         bitmap_data[8..40].copy_from_slice(pool.as_ref());
+        let mut account_values = vec![
+            source_json,
+            mint_json,
+            wrapped_json,
+            account_json(
+                amm_data,
+                if semantic_mutation == Some(0) { token_program } else { raydium_program },
+            ),
+            account_json(pool_data, raydium_program),
+            vault_json(
+                mint,
+                if semantic_mutation == Some(5) { Pubkey::new_unique() } else { pool },
+            ),
+            vault_json(native_mint, pool),
+            account_json(observation_data, raydium_program),
+            if semantic_mutation == Some(3) {
+                let mut data = vec![0_u8; 10240];
+                data[..8].copy_from_slice(&RAYDIUM_TICK_ARRAY_DISCRIMINATOR);
+                data[8..40].copy_from_slice(pool.as_ref());
+                account_json(data, token_program)
+            } else {
+                tick_json(0)
+            },
+            account_json(
+                bitmap_data,
+                if semantic_mutation == Some(4) { token_program } else { raydium_program },
+            ),
+            tick_json(60),
+            tick_json(120),
+        ];
+        if semantic_mutation == Some(9) {
+            account_values.remove(10);
+        }
         let mut mocks = HashMap::new();
         mocks.insert(
             RpcRequest::GetMultipleAccounts,
-            json!({ "context": { "slot": 1 }, "value": [
-                source_json, mint_json, wrapped_json,
-                account_json(amm_data, if semantic_mutation == Some(0) { token_program } else { raydium_program }),
-                account_json(pool_data, raydium_program),
-                vault_json(mint, if semantic_mutation == Some(5) { Pubkey::new_unique() } else { pool }),
-                vault_json(native_mint, pool),
-                account_json(observation_data, raydium_program),
-                if semantic_mutation == Some(3) {
-                    let mut data = vec![0_u8; 10240];
-                    data[..8].copy_from_slice(&RAYDIUM_TICK_ARRAY_DISCRIMINATOR);
-                    data[8..40].copy_from_slice(pool.as_ref());
-                    account_json(data, token_program)
-                } else { tick_json(0) },
-                account_json(bitmap_data, if semantic_mutation == Some(4) { token_program } else { raydium_program }),
-                tick_json(60), tick_json(120)
-            ] }),
+            json!({ "context": { "slot": 1 }, "value": account_values }),
         );
         mocks.insert(
             RpcRequest::GetFeeForMessage,
@@ -2577,6 +2638,39 @@ mod tests {
             assert_eq!(stable_policy.get_or_insert_with(|| snapshot.clone()), &snapshot);
             assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_live_legacy_tick_gaps_and_exact_swap_v2_layout() {
+        for semantic_variant in [9, 10] {
+            let (validator, transaction, rpc, payer_creations) =
+                recover_fixture_with_output_and_semantic_mutation(
+                    false,
+                    None,
+                    None,
+                    1_000_000_000,
+                    Some(semantic_variant),
+                    None,
+                );
+            assert!(
+                validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok(),
+                "valid Raydium route variant {semantic_variant} must pass"
+            );
+        }
+
+        let (validator, mut transaction, rpc, payer_creations) =
+            recover_fixture_with_output_and_semantic_mutation(
+                false,
+                None,
+                None,
+                1_000_000_000,
+                Some(10),
+                None,
+            );
+        transaction.inner_instruction_contexts.last_mut().unwrap().instruction.data[..8]
+            .copy_from_slice(&RAYDIUM_SWAP_DISCRIMINATOR);
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
     }
 
     #[tokio::test]
