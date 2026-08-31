@@ -22,6 +22,11 @@ use crate::fee::price::PriceModel;
 
 const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+// This validator intentionally supports Raydium's legacy SPL-token-only `swap`
+// account layout. Its 13-account shape is different from `swap_v2`, even though
+// both instructions encode the same four swap arguments after the discriminator.
+const RAYDIUM_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+#[cfg(test)]
 const RAYDIUM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 const RAYDIUM_POOL_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const RAYDIUM_AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
@@ -764,7 +769,7 @@ impl TransactionValidator {
         };
         if raydium.accounts.len() != 13
             || raydium.data.len() != 41
-            || raydium.data[..8] != RAYDIUM_SWAP_V2_DISCRIMINATOR
+            || raydium.data[..8] != RAYDIUM_SWAP_DISCRIMINATOR
             || raydium.accounts[0].pubkey != wallet
             || raydium.accounts[2].pubkey == self.fee_payer_pubkey
             || raydium.accounts[3].pubkey != source
@@ -2278,7 +2283,7 @@ mod tests {
                 stack_height: Some(2),
             });
         }
-        let mut raydium_data = RAYDIUM_SWAP_V2_DISCRIMINATOR.to_vec();
+        let mut raydium_data = RAYDIUM_SWAP_DISCRIMINATOR.to_vec();
         raydium_data.resize(41, 0);
         let raydium = Instruction::new_with_bytes(raydium_program, &raydium_data, raydium_accounts);
         transaction.all_instructions.push(raydium.clone());
@@ -2634,7 +2639,7 @@ mod tests {
                 3 => raydium.accounts[9].is_writable = false,
                 4 => raydium.accounts[10].is_signer = true,
                 5 => raydium.accounts.push(AccountMeta::new(Pubkey::new_unique(), false)),
-                6 => raydium.data[0] ^= 1,
+                6 => raydium.data[..8].copy_from_slice(&RAYDIUM_SWAP_V2_DISCRIMINATOR),
                 _ => {
                     raydium.data.pop();
                 }
