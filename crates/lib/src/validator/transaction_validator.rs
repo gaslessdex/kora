@@ -1378,7 +1378,6 @@ impl TransactionValidator {
         let dex_programs = [raydium, meteora, pumpswap];
         let signer_keys = transaction.transaction.message.static_account_keys();
         if transaction.transaction.message.header().num_required_signatures != 2
-            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
             || signer_keys.first() != Some(&self.fee_payer_pubkey)
         {
             return Err(KoraError::InvalidTransaction(
@@ -1608,7 +1607,7 @@ impl TransactionValidator {
         {
             return Err(invalid());
         }
-        let writable = [0_usize, 1, 2, 3, 4, 5, 8, 9, 10, 15];
+        let writable = [0_usize, 2, 3, 4, 5, 8];
         if instruction.accounts.iter().enumerate().any(|(index, meta)| {
             meta.is_signer != (index == 10)
                 || meta.is_writable != (writable.contains(&index) || index >= 16)
@@ -5661,7 +5660,7 @@ mod tests {
         });
         let metas = vec![
             AccountMeta::new(pair, false),
-            AccountMeta::new(program, false),
+            AccountMeta::new_readonly(program, false),
             AccountMeta::new(vault_x, false),
             AccountMeta::new(vault_y, false),
             AccountMeta::new(user_x, false),
@@ -5669,8 +5668,8 @@ mod tests {
             AccountMeta::new_readonly(mint_x, false),
             AccountMeta::new_readonly(mint_y, false),
             AccountMeta::new(oracle, false),
-            AccountMeta::new(program, false),
-            AccountMeta::new(wallet, true),
+            AccountMeta::new_readonly(program, false),
+            AccountMeta::new_readonly(wallet, true),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), false),
@@ -5678,7 +5677,7 @@ mod tests {
                 Pubkey::find_program_address(&[b"__event_authority"], &program).0,
                 false,
             ),
-            AccountMeta::new(program, false),
+            AccountMeta::new_readonly(program, false),
             AccountMeta::new(bins[0], false),
             AccountMeta::new(bins[1], false),
         ];
@@ -5754,6 +5753,9 @@ mod tests {
         let mut wrong_role = instruction.clone();
         wrong_role.accounts[8].is_writable = false;
         assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
+        let mut writable_program = instruction.clone();
+        writable_program.accounts[1].is_writable = true;
+        assert!(validator.validate_meteora_dlmm(&writable_program, &rpc, wallet).await.is_err());
         let (validator, instruction, rpc) = meteora_semantic_fixture(false, true);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
