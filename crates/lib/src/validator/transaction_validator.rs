@@ -588,11 +588,8 @@ impl TransactionValidator {
             ));
         }
         let parse = |value: &str| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError);
-        let wallet = parse(&policy.user_wallet)?;
         let treasury = parse(&policy.settlement_wallet)?;
         let mint = parse(&policy.input_mint)?;
-        let source = parse(&policy.source_account)?;
-        let wrapped = parse(&policy.wrapped_sol_account)?;
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
             .map_err(|_| KoraError::ConfigError)?;
         let token_program = spl_token_interface::id();
@@ -602,9 +599,6 @@ impl TransactionValidator {
             Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         let raydium_program =
             Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
-        if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
-            return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
-        }
         let message = match &transaction.transaction.message {
             solana_message::VersionedMessage::V0(message) => message,
             _ => {
@@ -614,6 +608,21 @@ impl TransactionValidator {
             }
         };
         let signer_keys = transaction.transaction.message.static_account_keys();
+        let wallet = signer_keys.get(1).copied().ok_or_else(|| {
+            KoraError::InvalidTransaction("Recover Value user signer is missing".to_string())
+        })?;
+        let identity = policy
+            .allowed_users
+            .iter()
+            .find(|identity| identity.wallet == wallet.to_string())
+            .ok_or_else(|| {
+                KoraError::InvalidTransaction("Recover Value user is not allowed".to_string())
+            })?;
+        let source = parse(&identity.source_account)?;
+        let wrapped = parse(&identity.wrapped_sol_account)?;
+        if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
+            return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
+        }
         if transaction.transaction.message.header().num_required_signatures != 2
             || transaction.transaction.message.header().num_readonly_signed_accounts != 0
             || signer_keys.first() != Some(&self.fee_payer_pubkey)
@@ -2341,11 +2350,13 @@ mod tests {
             enabled: true,
             route_policy: "semantic_family".to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
-            user_wallet: wallet.to_string(),
+            allowed_users: vec![crate::config::RecoverUserPolicy {
+                wallet: wallet.to_string(),
+                source_account: source.to_string(),
+                wrapped_sol_account: wrapped.to_string(),
+            }],
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
-            source_account: source.to_string(),
-            wrapped_sol_account: wrapped.to_string(),
             decimals: 6,
             swap_fee_bps: 30,
             rent_fee_bps: 300,
@@ -2631,11 +2642,12 @@ mod tests {
                     Some(stable_recover_identity(pool, lookup_table)),
                 );
             let policy = &validator.fee_payer_policy.system.recover;
+            let identity = &policy.allowed_users[0];
             let snapshot = (
-                policy.user_wallet.clone(),
+                identity.wallet.clone(),
                 policy.input_mint.clone(),
-                policy.source_account.clone(),
-                policy.wrapped_sol_account.clone(),
+                identity.source_account.clone(),
+                identity.wrapped_sol_account.clone(),
                 policy.settlement_wallet.clone(),
             );
             assert_eq!(stable_policy.get_or_insert_with(|| snapshot.clone()), &snapshot);
@@ -2780,8 +2792,10 @@ mod tests {
             schema_version: "recover-authorization-v1".to_string(),
             action: "CLEAN_RECOVER".to_string(),
             network: "mainnet-beta".to_string(),
-            pilot_wallet: validator.fee_payer_policy.system.recover.user_wallet.clone(),
-            source_token_account: validator.fee_payer_policy.system.recover.source_account.clone(),
+            pilot_wallet: validator.fee_payer_policy.system.recover.allowed_users[0].wallet.clone(),
+            source_token_account: validator.fee_payer_policy.system.recover.allowed_users[0]
+                .source_account
+                .clone(),
             input_mint: validator.fee_payer_policy.system.recover.input_mint.clone(),
             input_amount_raw: "1779926".to_string(),
             output_mint: "So11111111111111111111111111111111111111112".to_string(),

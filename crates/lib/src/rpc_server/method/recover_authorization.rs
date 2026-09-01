@@ -104,8 +104,10 @@ fn validate_claims(
     if claims.schema_version != "recover-authorization-v1"
         || claims.action != "CLEAN_RECOVER"
         || claims.network != policy.authorization_network
-        || claims.pilot_wallet != policy.user_wallet
-        || claims.source_token_account != policy.source_account
+        || !policy.allowed_users.iter().any(|identity| {
+            claims.pilot_wallet == identity.wallet
+                && claims.source_token_account == identity.source_account
+        })
         || claims.input_mint != policy.input_mint
         || claims.output_mint != WRAPPED_SOL_MINT
         || claims.treasury != policy.settlement_wallet
@@ -265,11 +267,13 @@ mod tests {
             .unwrap();
         let policy = RecoverPolicy {
             enabled: true,
-            user_wallet: wallet.to_string(),
+            allowed_users: vec![crate::config::RecoverUserPolicy {
+                wallet: wallet.to_string(),
+                source_account: source.to_string(),
+                wrapped_sol_account: wrapped.to_string(),
+            }],
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
-            source_account: source.to_string(),
-            wrapped_sol_account: wrapped.to_string(),
             decimals: 6,
             authorization_public_key: authority.pubkey().to_string(),
             authorization_network: "mainnet-beta".to_string(),
@@ -286,8 +290,8 @@ mod tests {
             schema_version: "recover-authorization-v1".to_string(),
             action: "CLEAN_RECOVER".to_string(),
             network: "mainnet-beta".to_string(),
-            pilot_wallet: fixture.policy.user_wallet.clone(),
-            source_token_account: fixture.policy.source_account.clone(),
+            pilot_wallet: fixture.policy.allowed_users[0].wallet.clone(),
+            source_token_account: fixture.policy.allowed_users[0].source_account.clone(),
             input_mint: fixture.policy.input_mint.clone(),
             input_amount_raw: "500".to_string(),
             output_mint: WRAPPED_SOL_MINT.to_string(),
@@ -437,8 +441,7 @@ mod tests {
             policy: first.policy.clone(),
             transaction: second_transaction.transaction,
         };
-        second.policy.user_wallet = first.policy.user_wallet.clone();
-        second.policy.source_account = first.policy.source_account.clone();
+        second.policy.allowed_users = first.policy.allowed_users.clone();
         second.policy.input_mint = first.policy.input_mint.clone();
         second.policy.settlement_wallet = first.policy.settlement_wallet.clone();
         // Recompile using the same identities while changing only the fresh blockhash.

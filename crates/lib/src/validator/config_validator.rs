@@ -462,15 +462,49 @@ impl ConfigValidator {
                 );
             }
             let identities = [
-                ("user_wallet", &recover.user_wallet),
                 ("settlement_wallet", &recover.settlement_wallet),
                 ("input_mint", &recover.input_mint),
-                ("source_account", &recover.source_account),
-                ("wrapped_sol_account", &recover.wrapped_sol_account),
             ];
             for (name, value) in identities {
                 if Pubkey::from_str(value).is_err() {
                     errors.push(format!("Invalid Recover {name}"));
+                }
+            }
+            if recover.allowed_users.is_empty() || recover.allowed_users.len() > 10 {
+                errors.push(
+                    "Recover allowed_users must contain between 1 and 10 entries".to_string(),
+                );
+            }
+            let mint = Pubkey::from_str(&recover.input_mint).ok();
+            let token_program = spl_token_interface::id();
+            let native_mint =
+                Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+            let mut wallets = std::collections::HashSet::new();
+            let mut sources = std::collections::HashSet::new();
+            let mut wrapped_accounts = std::collections::HashSet::new();
+            for identity in &recover.allowed_users {
+                let wallet = Pubkey::from_str(&identity.wallet);
+                let source = Pubkey::from_str(&identity.source_account);
+                let wrapped = Pubkey::from_str(&identity.wrapped_sol_account);
+                if wallet.is_err() || source.is_err() || wrapped.is_err() {
+                    errors.push("Recover allowed_users contains an invalid identity".to_string());
+                    continue;
+                }
+                let wallet = wallet.unwrap();
+                let source = source.unwrap();
+                let wrapped = wrapped.unwrap();
+                if !wallets.insert(wallet)
+                    || !sources.insert(source)
+                    || !wrapped_accounts.insert(wrapped)
+                {
+                    errors.push("Recover allowed_users identities must be unique".to_string());
+                }
+                if let Some(mint) = mint {
+                    let expected_source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program);
+                    let expected_wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program);
+                    if source != expected_source || wrapped != expected_wrapped {
+                        errors.push("Recover allowed_users requires canonical source and wrapped SOL accounts".to_string());
+                    }
                 }
             }
             if Pubkey::from_str(&recover.authorization_public_key).is_err() {
@@ -881,9 +915,9 @@ mod tests {
     use crate::{
         config::{
             AuthConfig, CacheConfig, Config, EnabledMethods, FeePayerPolicy, KoraConfig,
-            MetricsConfig, NonceInstructionPolicy, RecoverPolicy, SplTokenConfig,
-            SplTokenInstructionPolicy, SystemInstructionPolicy, Token2022InstructionPolicy,
-            UsageLimitConfig, ValidationConfig,
+            MetricsConfig, NonceInstructionPolicy, RecoverPolicy, RecoverUserPolicy,
+            SplTokenConfig, SplTokenInstructionPolicy, SystemInstructionPolicy,
+            Token2022InstructionPolicy, UsageLimitConfig, ValidationConfig,
         },
         constant::DEFAULT_MAX_REQUEST_BODY_SIZE,
         fee::price::PriceConfig,
@@ -906,16 +940,23 @@ mod tests {
 
     fn recover_config(route_policy: &str) -> Config {
         let input_mint = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let source_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &spl_token_interface::id());
+        let wrapped_sol_mint =
+            Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let wrapped_sol_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &wrapped_sol_mint, &spl_token_interface::id());
         let mut policy = FeePayerPolicy::default();
         policy.system.recover = RecoverPolicy {
             enabled: true,
             route_policy: route_policy.to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
-            user_wallet: Pubkey::new_unique().to_string(),
+            allowed_users: vec![RecoverUserPolicy {
+                wallet: wallet.to_string(),
+                source_account: source_account.to_string(),
+                wrapped_sol_account: wrapped_sol_account.to_string(),
+            }],
             settlement_wallet: Pubkey::new_unique().to_string(),
             input_mint: input_mint.to_string(),
-            source_account: Pubkey::new_unique().to_string(),
-            wrapped_sol_account: Pubkey::new_unique().to_string(),
             decimals: 6,
             swap_fee_bps: 30,
             rent_fee_bps: 300,
@@ -988,6 +1029,40 @@ mod tests {
         legacy_config.validation.fee_payer_policy.system.recover = legacy_policy;
         let errors = recover_config_errors(legacy_config).await;
         assert!(errors.is_empty(), "legacy config errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_allowed_users_accepts_two_canonical_identities_and_rejects_broadening() {
+        let mut config = recover_config("semantic_family");
+        let recover = &mut config.validation.fee_payer_policy.system.recover;
+        let mint = Pubkey::from_str(&recover.input_mint).unwrap();
+        let wallet = Pubkey::new_unique();
+        let source_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &spl_token_interface::id());
+        let wrapped_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let wrapped_sol_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &wrapped_mint, &spl_token_interface::id());
+        recover.allowed_users.push(RecoverUserPolicy {
+            wallet: wallet.to_string(),
+            source_account: source_account.to_string(),
+            wrapped_sol_account: wrapped_sol_account.to_string(),
+        });
+        let errors = recover_config_errors(config.clone()).await;
+        assert!(errors.is_empty(), "two-user config errors: {errors:?}");
+
+        let mut duplicate = config.clone();
+        duplicate
+            .validation
+            .fee_payer_policy
+            .system
+            .recover
+            .allowed_users
+            .push(duplicate.validation.fee_payer_policy.system.recover.allowed_users[0].clone());
+        assert!(!recover_config_errors(duplicate).await.is_empty());
+
+        let mut noncanonical = config;
+        noncanonical.validation.fee_payer_policy.system.recover.allowed_users[1].source_account =
+            Pubkey::new_unique().to_string();
+        assert!(!recover_config_errors(noncanonical).await.is_empty());
     }
 
     #[tokio::test]
