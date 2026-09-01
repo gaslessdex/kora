@@ -27,6 +27,9 @@ const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+const PHANTOM_LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+const MAX_LIGHTHOUSE_ASSERTIONS: usize = 4;
+const MAX_LIGHTHOUSE_DATA_BYTES: usize = 256;
 // This validator intentionally supports Raydium's legacy SPL-token-only `swap`
 // account layout. Its 13-account shape is different from `swap_v2`, even though
 // both instructions encode the same four swap arguments after the discriminator.
@@ -52,6 +55,7 @@ const PUMPSWAP_GLOBAL_VOLUME_DISCRIMINATOR: [u8; 8] = [202, 42, 246, 43, 142, 19
 const PUMPSWAP_USER_VOLUME_DISCRIMINATOR: [u8; 8] = [86, 255, 112, 14, 102, 53, 154, 250];
 const SEND_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 375_000;
+const SWAP_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
 fn token_account_mint(
     account: &Account,
@@ -109,6 +113,104 @@ pub struct TransactionValidator {
 }
 
 impl TransactionValidator {
+    fn lighthouse_program() -> Result<Pubkey, KoraError> {
+        Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).map_err(|_| KoraError::ConfigError)
+    }
+
+    fn has_lighthouse(transaction: &VersionedTransactionResolved) -> Result<bool, KoraError> {
+        let lighthouse = Self::lighthouse_program()?;
+        Ok(transaction.transaction.message.static_account_keys().contains(&lighthouse))
+    }
+
+    fn validate_lighthouse_assertions(
+        &self,
+        transaction: &VersionedTransactionResolved,
+    ) -> Result<(), KoraError> {
+        let lighthouse = Self::lighthouse_program()?;
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+            KoraError::InvalidTransaction("Phantom instructions are unresolved".to_string())
+        })?;
+        if transaction.all_instructions[outer_count..]
+            .iter()
+            .any(|instruction| instruction.program_id == lighthouse)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Lighthouse is allowed only as an outer assertion".to_string(),
+            ));
+        }
+        let first = outer.iter().position(|instruction| instruction.program_id == lighthouse);
+        let assertions = first.map_or(&outer[outer.len()..], |index| &outer[index..]);
+        if assertions.len() > MAX_LIGHTHOUSE_ASSERTIONS
+            || assertions.iter().any(|instruction| instruction.program_id != lighthouse)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Lighthouse assertions must be a bounded transaction suffix".to_string(),
+            ));
+        }
+        for instruction in assertions {
+            let discriminator = instruction.data.first().copied().ok_or_else(|| {
+                KoraError::InvalidTransaction("Lighthouse assertion is malformed".to_string())
+            })?;
+            let expected_accounts = match discriminator {
+                2 | 3 | 5..=14 | 17 => 1,
+                4 => 2,
+                15 => 0,
+                16 => 3,
+                _ => {
+                    return Err(KoraError::InvalidTransaction(
+                        "Lighthouse memory or unknown instructions are forbidden".to_string(),
+                    ))
+                }
+            };
+            if instruction.accounts.len() != expected_accounts
+                || instruction.data.len() < 3
+                || instruction.data.len() > MAX_LIGHTHOUSE_DATA_BYTES
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse assertion shape is invalid".to_string(),
+                ));
+            }
+        }
+        let static_keys = transaction.transaction.message.static_account_keys();
+        let lighthouse_indexes = static_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| (*key == lighthouse).then_some(index))
+            .collect::<Vec<_>>();
+        if assertions.is_empty() != lighthouse_indexes.is_empty() || lighthouse_indexes.len() > 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Lighthouse program key does not match its assertions".to_string(),
+            ));
+        }
+        if let Some(index) = lighthouse_indexes.first() {
+            let header = transaction.transaction.message.header();
+            let readonly_start =
+                static_keys.len().saturating_sub(header.num_readonly_unsigned_accounts as usize);
+            if *index < header.num_required_signatures as usize || *index < readonly_start {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse program must be an unsigned read-only key".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn economic_outer<'a>(
+        &self,
+        transaction: &'a VersionedTransactionResolved,
+    ) -> Result<&'a [Instruction], KoraError> {
+        let lighthouse = Self::lighthouse_program()?;
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+            KoraError::InvalidTransaction("Transaction instructions are unresolved".to_string())
+        })?;
+        Ok(match outer.iter().position(|instruction| instruction.program_id == lighthouse) {
+            Some(index) => &outer[..index],
+            None => outer,
+        })
+    }
+
     pub fn new(fee_payer_pubkey: Pubkey) -> Result<Self, KoraError> {
         let config = &get_config()?.validation;
 
@@ -192,6 +294,7 @@ impl TransactionValidator {
 
         self.validate_signatures(&transaction_resolved.transaction)?;
 
+        self.validate_lighthouse_assertions(transaction_resolved)?;
         self.validate_programs(transaction_resolved)?;
         self.validate_transfer_amounts(transaction_resolved, rpc_client).await?;
         self.validate_disallowed_accounts(transaction_resolved)?;
@@ -230,8 +333,11 @@ impl TransactionValidator {
         &self,
         transaction_resolved: &VersionedTransactionResolved,
     ) -> Result<(), KoraError> {
+        let lighthouse = Self::lighthouse_program()?;
         for instruction in &transaction_resolved.all_instructions {
-            if !self.allowed_programs.contains(&instruction.program_id) {
+            if instruction.program_id != lighthouse
+                && !self.allowed_programs.contains(&instruction.program_id)
+            {
                 return Err(KoraError::InvalidTransaction(format!(
                     "Program {} is not in the allowed list",
                     instruction.program_id
@@ -450,22 +556,38 @@ impl TransactionValidator {
                 "CLEAN identities must be distinct".to_string(),
             ));
         }
-        let outer_count = transaction.transaction.message.instructions().len();
-        let outer = &transaction.all_instructions[..outer_count];
+        let outer = self.economic_outer(transaction)?;
+        let price = [3, 216, 184, 5, 0, 0, 0, 0, 0];
+        let price_limit = outer.get(0).is_some_and(|ix| {
+            ix.program_id == compute_program && ix.accounts.is_empty() && ix.data == price
+        }) && outer.get(1).is_some_and(|ix| {
+            ix.program_id == compute_program
+                && ix.accounts.is_empty()
+                && ix.data.len() == 5
+                && ix.data[0] == 2
+        });
+        let limit_price = outer.get(0).is_some_and(|ix| {
+            ix.program_id == compute_program
+                && ix.accounts.is_empty()
+                && ix.data.len() == 5
+                && ix.data[0] == 2
+        }) && outer.get(1).is_some_and(|ix| {
+            ix.program_id == compute_program && ix.accounts.is_empty() && ix.data == price
+        });
+        let phantom_augmented = Self::has_lighthouse(transaction)?;
         if outer.len() < 4
-            || outer[0].program_id != compute_program
-            || outer[0].data.as_slice() != [3, 216, 184, 5, 0, 0, 0, 0, 0]
-            || outer[1].program_id != compute_program
-            || outer[1].data.len() != 5
-            || outer[1].data[0] != 2
+            || (!price_limit && !(phantom_augmented && limit_price))
             || outer[2..].iter().any(|instruction| instruction.program_id == compute_program)
         {
             return Err(KoraError::InvalidTransaction(
                 "CLEAN compute-budget prefix is invalid".to_string(),
             ));
         }
-        let compute_limit =
-            u32::from_le_bytes(outer[1].data[1..5].try_into().map_err(|_| KoraError::ConfigError)?);
+        let limit_instruction =
+            if outer[0].data.first() == Some(&2) { &outer[0] } else { &outer[1] };
+        let compute_limit = u32::from_le_bytes(
+            limit_instruction.data[1..5].try_into().map_err(|_| KoraError::ConfigError)?,
+        );
         let transfer = outer.last().ok_or_else(|| {
             KoraError::InvalidTransaction("CLEAN settlement is missing".to_string())
         })?;
@@ -528,7 +650,10 @@ impl TransactionValidator {
                 "CLEAN token accounts must be unique".to_string(),
             ));
         }
-        let expected_static_keys = source_keys.len() + if is_burn { 7 } else { 6 };
+        let lighthouse = Self::lighthouse_program()?;
+        let expected_static_keys = source_keys.len()
+            + if is_burn { 7 } else { 6 }
+            + usize::from(message.account_keys.contains(&lighthouse));
         if message.account_keys.len() != expected_static_keys {
             return Err(KoraError::InvalidTransaction(
                 "CLEAN contains unrelated accounts".to_string(),
@@ -714,23 +839,27 @@ impl TransactionValidator {
         } else if policy.route_policy != "semantic_family" {
             return Err(KoraError::ConfigError);
         }
-        let outer_count = transaction.transaction.message.instructions().len();
-        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
-            KoraError::InvalidTransaction("Recover Value instructions are unresolved".to_string())
-        })?;
-        let expected_compute = [
+        let outer = self.economic_outer(transaction)?;
+        let expected_compute_price_limit = [
             ComputeBudgetInstruction::set_compute_unit_price(
                 policy.compute_unit_price_micro_lamports,
             )
             .data,
             ComputeBudgetInstruction::set_compute_unit_limit(policy.compute_unit_limit).data,
         ];
-        if outer.len() < 6
-            || outer[..2].iter().zip(expected_compute.iter()).any(|(instruction, expected)| {
-                instruction.program_id != compute_program
-                    || !instruction.accounts.is_empty()
-                    || instruction.data != *expected
+        let expected_compute_limit_price =
+            [expected_compute_price_limit[1].clone(), expected_compute_price_limit[0].clone()];
+        let compute_matches = |expected: &[Vec<u8>; 2]| {
+            outer[..2].iter().zip(expected.iter()).all(|(instruction, data)| {
+                instruction.program_id == compute_program
+                    && instruction.accounts.is_empty()
+                    && instruction.data == *data
             })
+        };
+        let phantom_augmented = Self::has_lighthouse(transaction)?;
+        if outer.len() < 6
+            || (!compute_matches(&expected_compute_price_limit)
+                && !(phantom_augmented && compute_matches(&expected_compute_limit_price)))
             || outer[2..].iter().any(|instruction| instruction.program_id == compute_program)
         {
             return Err(KoraError::InvalidTransaction(
@@ -1387,10 +1516,32 @@ impl TransactionValidator {
             ));
         }
         let wallet = signer_keys[1];
-        let outer_count = transaction.transaction.message.instructions().len();
-        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
-            KoraError::InvalidTransaction("Swap instructions are unresolved".to_string())
-        })?;
+        let outer = self.economic_outer(transaction)?;
+        let compute_program = solana_compute_budget_interface::id();
+        let expected_limit =
+            ComputeBudgetInstruction::set_compute_unit_limit(SWAP_COMPUTE_UNIT_LIMIT).data;
+        let compute_valid =
+            outer.get(0).is_some_and(|instruction| {
+                instruction.program_id == compute_program
+                    && instruction.accounts.is_empty()
+                    && instruction.data == expected_limit
+            }) && outer.get(1).is_some_and(|instruction| {
+                instruction.program_id == compute_program
+                    && instruction.accounts.is_empty()
+                    && instruction.data.len() == 9
+                    && instruction.data[0] == 3
+                    && u64::from_le_bytes(instruction.data[1..9].try_into().unwrap_or([0; 8])) > 0
+                    && u128::from(SWAP_COMPUTE_UNIT_LIMIT)
+                        * u128::from(u64::from_le_bytes(
+                            instruction.data[1..9].try_into().unwrap_or([0; 8]),
+                        ))
+                        <= u128::from(self.max_allowed_lamports) * 1_000_000
+            }) && outer[2..].iter().all(|instruction| instruction.program_id != compute_program);
+        if !compute_valid {
+            return Err(KoraError::InvalidTransaction(
+                "Swap compute-budget prefix is invalid".to_string(),
+            ));
+        }
         let jupiter_indices = outer
             .iter()
             .enumerate()
@@ -2209,8 +2360,7 @@ impl TransactionValidator {
             ));
         }
 
-        let outer_count = transaction.transaction.message.instructions().len();
-        let outer = &transaction.all_instructions[..outer_count];
+        let outer = self.economic_outer(transaction)?;
         if transaction.all_instructions.iter().any(|instruction| {
             instruction.program_id == jupiter_program || instruction.program_id == raydium_program
         }) {
@@ -2224,19 +2374,24 @@ impl TransactionValidator {
             .ok_or_else(|| {
                 KoraError::InvalidTransaction("SEND instructions are missing".to_string())
             })?;
-        let expected_compute_data = [
+        let expected_compute_price_limit = [
             ComputeBudgetInstruction::set_compute_unit_price(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS)
                 .data,
             ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT).data,
         ];
-        if send_index != expected_compute_data.len()
-            || outer[..send_index].iter().zip(expected_compute_data.iter()).any(
-                |(instruction, expected_data)| {
-                    instruction.program_id != compute_program
-                        || !instruction.accounts.is_empty()
-                        || instruction.data != *expected_data
-                },
-            )
+        let expected_compute_limit_price =
+            [expected_compute_price_limit[1].clone(), expected_compute_price_limit[0].clone()];
+        let compute_matches = |expected: &[Vec<u8>; 2]| {
+            outer[..send_index].iter().zip(expected.iter()).all(|(instruction, data)| {
+                instruction.program_id == compute_program
+                    && instruction.accounts.is_empty()
+                    && instruction.data == *data
+            })
+        };
+        let phantom_augmented = Self::has_lighthouse(transaction)?;
+        if send_index != 2
+            || (!compute_matches(&expected_compute_price_limit)
+                && !(phantom_augmented && compute_matches(&expected_compute_limit_price)))
         {
             return Err(KoraError::InvalidTransaction(
                 "SEND requires the exact bounded compute-budget prefix".to_string(),
@@ -2645,6 +2800,44 @@ mod tests {
         }
         let config = builder.build();
         update_config(config).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn phantom_lighthouse_gate_accepts_only_bounded_assertion_suffixes() {
+        setup_default_config();
+        let payer = Pubkey::new_unique();
+        let lighthouse = Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap();
+        let economic = transfer(&payer, &Pubkey::new_unique(), 1);
+        let assertion = Instruction::new_with_bytes(
+            lighthouse,
+            &[5, 0, 0],
+            vec![AccountMeta::new_readonly(payer, false)],
+        );
+        let message = VersionedMessage::Legacy(Message::new(
+            &[economic.clone(), assertion.clone()],
+            Some(&payer),
+        ));
+        let accepted =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        let validator = TransactionValidator::new(payer).unwrap();
+        assert!(validator.validate_lighthouse_assertions(&accepted).is_ok());
+
+        let memory = Instruction::new_with_bytes(
+            lighthouse,
+            &[0, 0, 0],
+            vec![AccountMeta::new_readonly(payer, false)],
+        );
+        let message =
+            VersionedMessage::Legacy(Message::new(&[economic.clone(), memory], Some(&payer)));
+        let rejected =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        assert!(validator.validate_lighthouse_assertions(&rejected).is_err());
+
+        let message = VersionedMessage::Legacy(Message::new(&[assertion, economic], Some(&payer)));
+        let reordered =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        assert!(validator.validate_lighthouse_assertions(&reordered).is_err());
     }
 
     fn canonical_ata_fixture(
@@ -5994,13 +6187,15 @@ mod tests {
             &[1],
             route_accounts,
         );
-        let message = VersionedMessage::Legacy(Message::new(&[route], Some(&payer)));
+        let limit = ComputeBudgetInstruction::set_compute_unit_limit(SWAP_COMPUTE_UNIT_LIMIT);
+        let price = ComputeBudgetInstruction::set_compute_unit_price(1);
+        let message = VersionedMessage::Legacy(Message::new(&[limit, price, route], Some(&payer)));
         let mut transaction =
             TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
         transaction.all_instructions.push(dex.clone());
         transaction.inner_instruction_contexts.push(InnerInstructionContext {
             instruction: dex,
-            outer_instruction_index: 0,
+            outer_instruction_index: 2,
             stack_height: Some(2),
         });
         assert_eq!(transaction.transaction.message.static_account_keys()[1], wallet);
@@ -6024,7 +6219,7 @@ mod tests {
         transaction.all_instructions.push(foreign.clone());
         transaction.inner_instruction_contexts.push(InnerInstructionContext {
             instruction: foreign,
-            outer_instruction_index: 0,
+            outer_instruction_index: 2,
             stack_height: Some(2),
         });
         assert!(validator.validate_swap_route(&transaction, &rpc).await.is_err());
