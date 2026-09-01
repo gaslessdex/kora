@@ -576,6 +576,7 @@ impl FeePayerPolicyBuilder {
             config: FeePayerPolicy {
                 system: SystemInstructionPolicy {
                     canonical_ata_creation: Default::default(),
+                    swap: Default::default(),
                     clean: Default::default(),
                     recover: Default::default(),
                     send: Default::default(),

@@ -425,6 +425,50 @@ impl ConfigValidator {
             }
         }
 
+        let swap = &config.validation.fee_payer_policy.system.swap;
+        if swap.enabled {
+            let supported = ["RAYDIUM_CLMM", "METEORA_DLMM", "PUMPSWAP"];
+            let unique =
+                swap.approved_dex_families.iter().collect::<std::collections::HashSet<_>>();
+            if swap.approved_dex_families.is_empty()
+                || unique.len() != swap.approved_dex_families.len()
+                || swap
+                    .approved_dex_families
+                    .iter()
+                    .any(|family| !supported.contains(&family.as_str()))
+            {
+                errors.push("Swap approved_dex_families must be a unique non-empty subset of RAYDIUM_CLMM, METEORA_DLMM, and PUMPSWAP".to_string());
+            }
+            if config.validation.fee_payer_policy.system.allow_create_account
+                || config.validation.fee_payer_policy.system.allow_transfer
+            {
+                errors.push(
+                    "Swap requires global System transfer/create permissions to remain false"
+                        .to_string(),
+                );
+            }
+            let family_programs = [
+                ("RAYDIUM_CLMM", "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"),
+                ("METEORA_DLMM", "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
+                ("PUMPSWAP", "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"),
+            ];
+            for program in [
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            ] {
+                if !config.validation.allowed_programs.iter().any(|allowed| allowed == program) {
+                    errors.push(format!("Swap requires allowed program {program}"));
+                }
+            }
+            for (family, program) in family_programs {
+                if swap.approved_dex_families.iter().any(|approved| approved == family)
+                    && !config.validation.allowed_programs.iter().any(|allowed| allowed == program)
+                {
+                    errors.push(format!("Swap family {family} requires allowed program {program}"));
+                }
+            }
+        }
+
         let clean = &config.validation.fee_payer_policy.system.clean;
         if clean.claim_enabled || clean.burn_enabled {
             if config.validation.fee_payer_policy.system.allow_create_account
@@ -1142,6 +1186,59 @@ mod tests {
         let mut unknown = recover_config("semantic_family");
         unknown.validation.fee_payer_policy.system.recover.route_policy = "arbitrary".to_string();
         assert!(!recover_config_errors(unknown).await.is_empty());
+    }
+
+    fn swap_config(families: Vec<String>) -> Config {
+        let paid_mint = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string();
+        let mut policy = FeePayerPolicy::default();
+        policy.system.swap =
+            crate::config::SwapPolicy { enabled: true, approved_dex_families: families };
+        ConfigMockBuilder::new()
+            .with_allowed_programs(vec![
+                SYSTEM_PROGRAM_ID.to_string(),
+                SPL_TOKEN_PROGRAM_ID.to_string(),
+                "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
+                "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
+                "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo".to_string(),
+                "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".to_string(),
+            ])
+            .with_allowed_tokens(vec![paid_mint.clone()])
+            .with_allowed_spl_paid_tokens(SplTokenConfig::Allowlist(vec![paid_mint]))
+            .with_fee_payer_policy(policy)
+            .build()
+    }
+
+    async fn swap_config_result(config: Config) -> Result<Vec<String>, Vec<String>> {
+        update_config(config).unwrap();
+        let rpc_client = RpcClient::new_with_commitment(
+            "http://localhost:8899".to_string(),
+            CommitmentConfig::confirmed(),
+        );
+        ConfigValidator::validate_with_result(&rpc_client, true).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn swap_policy_accepts_only_unique_supported_families_with_required_programs() {
+        let families =
+            vec!["RAYDIUM_CLMM".to_string(), "METEORA_DLMM".to_string(), "PUMPSWAP".to_string()];
+        assert!(swap_config_result(swap_config(families.clone())).await.is_ok());
+
+        let mut duplicate = families.clone();
+        duplicate.push("PUMPSWAP".to_string());
+        assert!(swap_config_result(swap_config(duplicate)).await.is_err());
+        assert!(swap_config_result(swap_config(vec!["ORCA".to_string()])).await.is_err());
+
+        let mut missing_program = swap_config(families.clone());
+        missing_program
+            .validation
+            .allowed_programs
+            .retain(|program| program != "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+        assert!(swap_config_result(missing_program).await.is_err());
+
+        let mut broad_system = swap_config(families);
+        broad_system.validation.fee_payer_policy.system.allow_transfer = true;
+        assert!(swap_config_result(broad_system).await.is_err());
     }
 
     #[tokio::test]
@@ -1945,6 +2042,7 @@ mod tests {
                 fee_payer_policy: FeePayerPolicy {
                     system: SystemInstructionPolicy {
                         canonical_ata_creation: Default::default(),
+                        swap: Default::default(),
                         clean: Default::default(),
                         recover: Default::default(),
                         send: Default::default(),

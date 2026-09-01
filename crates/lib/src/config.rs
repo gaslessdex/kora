@@ -159,6 +159,9 @@ pub struct SystemInstructionPolicy {
     /// GASLESS-only exception for one canonical legacy SPL output ATA created by the fee payer.
     #[serde(default)]
     pub canonical_ata_creation: CanonicalAtaCreationPolicy,
+    /// GASLESS-only semantic policy for Jupiter-routed swaps.
+    #[serde(default)]
+    pub swap: SwapPolicy,
     /// GASLESS-only policy for exact standalone SEND transactions.
     #[serde(default)]
     pub send: SendPolicy,
@@ -178,6 +181,13 @@ pub struct CanonicalAtaCreationPolicy {
     pub enabled: bool,
     #[serde(default)]
     pub allowed_output_mints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct SwapPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub approved_dex_families: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

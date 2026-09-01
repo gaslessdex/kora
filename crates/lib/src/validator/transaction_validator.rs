@@ -22,6 +22,11 @@ use crate::fee::price::PriceModel;
 
 const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
+const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 // This validator intentionally supports Raydium's legacy SPL-token-only `swap`
 // account layout. Its 13-account shape is different from `swap_v2`, even though
 // both instructions encode the same four swap arguments after the discriminator.
@@ -32,8 +37,64 @@ const RAYDIUM_AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 
 const RAYDIUM_OBSERVATION_DISCRIMINATOR: [u8; 8] = [122, 174, 197, 53, 129, 9, 165, 132];
 const RAYDIUM_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
 const RAYDIUM_BITMAP_DISCRIMINATOR: [u8; 8] = [60, 150, 36, 219, 97, 128, 139, 153];
+const METEORA_SWAP2_DISCRIMINATOR: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136];
+const METEORA_LB_PAIR_DISCRIMINATOR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
+const METEORA_BIN_ARRAY_DISCRIMINATOR: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
+const METEORA_BITMAP_DISCRIMINATOR: [u8; 8] = [80, 111, 124, 113, 55, 237, 18, 5];
+const METEORA_ORACLE_DISCRIMINATOR: [u8; 8] = [139, 194, 131, 179, 140, 179, 229, 244];
+const PUMPSWAP_BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+const PUMPSWAP_BUY_EXACT_QUOTE_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
+const PUMPSWAP_SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const PUMPSWAP_POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
+const PUMPSWAP_GLOBAL_DISCRIMINATOR: [u8; 8] = [149, 8, 156, 202, 160, 252, 176, 217];
+const PUMPSWAP_GLOBAL_VOLUME_DISCRIMINATOR: [u8; 8] = [202, 42, 246, 43, 142, 190, 30, 255];
+const PUMPSWAP_USER_VOLUME_DISCRIMINATOR: [u8; 8] = [86, 255, 112, 14, 102, 53, 154, 250];
 const SEND_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 375_000;
+
+fn token_account_mint(
+    account: &Account,
+    token_program: Pubkey,
+    authority: Pubkey,
+) -> Option<Pubkey> {
+    if account.owner != token_program
+        || account.data.len() != 165
+        || account.data[32..64] != authority.to_bytes()
+        || account.data[108] != 1
+        || account.data[72..76] != [0, 0, 0, 0]
+        || account.data[121..129] != [0; 8]
+        || account.data[129..133] != [0, 0, 0, 0]
+    {
+        return None;
+    }
+    let mint = Pubkey::new_from_array(account.data[..32].try_into().ok()?);
+    let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").ok()?;
+    let native_tag = &account.data[109..113];
+    if (mint == native_mint
+        && (native_tag != [1, 0, 0, 0]
+            || u64::from_le_bytes(account.data[113..121].try_into().ok()?) > account.lamports))
+        || (mint != native_mint && native_tag != [0, 0, 0, 0])
+    {
+        return None;
+    }
+    Some(mint)
+}
+
+fn valid_legacy_token_account(
+    account: &Account,
+    token_program: Pubkey,
+    mint: Pubkey,
+    authority: Pubkey,
+) -> bool {
+    token_account_mint(account, token_program, authority) == Some(mint)
+}
+
+fn legacy_mint_decimals(account: &Account, token_program: Pubkey) -> Option<u8> {
+    if account.owner != token_program || account.data.len() != 82 || account.data[45] != 1 {
+        return None;
+    }
+    Some(account.data[44])
+}
 
 pub struct TransactionValidator {
     fee_payer_pubkey: Pubkey,
@@ -230,17 +291,18 @@ impl TransactionValidator {
         let has_recover_shape = has_outer_jupiter && recover_close_count == 2;
         if has_recover_shape {
             self.validate_recover(transaction_resolved, rpc_client, payer_creations).await?;
-        } else if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
-            if has_outer_jupiter {
+        } else if has_outer_jupiter {
+            self.validate_swap_route(transaction_resolved, rpc_client).await?;
+            if payer_creations > 0 {
                 self.validate_canonical_ata_creation(
                     transaction_resolved,
                     rpc_client,
                     payer_creations,
                 )
                 .await?;
-            } else {
-                self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
             }
+        } else if payer_creations > 0 && !self.fee_payer_policy.system.allow_create_account {
+            self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
         } else if has_clean_shape
             && (self.fee_payer_policy.system.clean.claim_enabled
                 || self.fee_payer_policy.system.clean.burn_enabled)
@@ -1038,18 +1100,22 @@ impl TransactionValidator {
                 "Recover Value route DEX family is not approved".to_string(),
             ));
         }
-        self.validate_recover_raydium_clmm(
+        self.validate_raydium_clmm_accounts(
             instruction,
             accounts,
             raydium_program,
             token_program,
             input_mint,
             output_mint,
+            self.fee_payer_policy.system.recover.decimals,
+            9,
             tick_accounts_start,
+            "Recover Value Raydium CLMM account relationships are invalid",
         )
     }
 
-    fn validate_recover_raydium_clmm(
+    #[allow(clippy::too_many_arguments)]
+    fn validate_raydium_clmm_accounts(
         &self,
         instruction: &Instruction,
         accounts: &[Option<Account>],
@@ -1057,13 +1123,12 @@ impl TransactionValidator {
         token_program: Pubkey,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        input_decimals: u8,
+        output_decimals: u8,
         tick_accounts_start: usize,
+        error_message: &str,
     ) -> Result<(), KoraError> {
-        let invalid = || {
-            KoraError::InvalidTransaction(
-                "Recover Value Raydium CLMM account relationships are invalid".to_string(),
-            )
-        };
+        let invalid = || KoraError::InvalidTransaction(error_message.to_string());
         if !(8..=9).contains(&accounts.len()) || accounts.iter().any(Option::is_none) {
             return Err(invalid());
         }
@@ -1098,6 +1163,29 @@ impl TransactionValidator {
         let pool_tick_spacing = u16::from_le_bytes(
             pool.data.get(235..237).and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
         );
+        let input_is_mint_0 = pool.data.get(73..105) == Some(input_mint.as_ref());
+        let output_is_mint_0 = pool.data.get(73..105) == Some(output_mint.as_ref());
+        let (mint_0, mint_1, vault_0, vault_1, decimals_0, decimals_1) = if input_is_mint_0 {
+            (
+                input_mint,
+                output_mint,
+                instruction.accounts[5].pubkey,
+                instruction.accounts[6].pubkey,
+                input_decimals,
+                output_decimals,
+            )
+        } else if output_is_mint_0 {
+            (
+                output_mint,
+                input_mint,
+                instruction.accounts[6].pubkey,
+                instruction.accounts[5].pubkey,
+                output_decimals,
+                input_decimals,
+            )
+        } else {
+            return Err(invalid());
+        };
         if amm.owner != raydium_program
             || amm.data.len() != 117
             || amm.data[..8] != RAYDIUM_AMM_CONFIG_DISCRIMINATOR
@@ -1112,13 +1200,13 @@ impl TransactionValidator {
             || pool.data.len() != 1544
             || pool.data[..8] != RAYDIUM_POOL_DISCRIMINATOR
             || pool.data[9..41] != instruction.accounts[1].pubkey.to_bytes()
-            || pool.data[73..105] != output_mint.to_bytes()
-            || pool.data[105..137] != input_mint.to_bytes()
-            || pool.data[137..169] != instruction.accounts[6].pubkey.to_bytes()
-            || pool.data[169..201] != instruction.accounts[5].pubkey.to_bytes()
+            || pool.data[73..105] != mint_0.to_bytes()
+            || pool.data[105..137] != mint_1.to_bytes()
+            || pool.data[137..169] != vault_0.to_bytes()
+            || pool.data[169..201] != vault_1.to_bytes()
             || pool.data[201..233] != instruction.accounts[7].pubkey.to_bytes()
-            || pool.data[233] != 9
-            || pool.data[234] != self.fee_payer_policy.system.recover.decimals
+            || pool.data[233] != decimals_0
+            || pool.data[234] != decimals_1
             || pool.data[389] & (1 << 4) != 0
             || observation.owner != raydium_program
             || observation.data.len() != 4483
@@ -1273,6 +1361,603 @@ impl TransactionValidator {
         Ok(rent)
     }
 
+    async fn validate_swap_route(
+        &self,
+        transaction: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+    ) -> Result<(), KoraError> {
+        let policy = &self.fee_payer_policy.system.swap;
+        if !policy.enabled {
+            return Err(KoraError::InvalidTransaction("Swap is disabled".to_string()));
+        }
+        let parse = |value: &str| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError);
+        let jupiter = parse(JUPITER_V6_PROGRAM_ID)?;
+        let raydium = parse(RAYDIUM_CLMM_PROGRAM_ID)?;
+        let meteora = parse(METEORA_DLMM_PROGRAM_ID)?;
+        let pumpswap = parse(PUMPSWAP_PROGRAM_ID)?;
+        let dex_programs = [raydium, meteora, pumpswap];
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if transaction.transaction.message.header().num_required_signatures != 2
+            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
+            || signer_keys.first() != Some(&self.fee_payer_pubkey)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Swap requires exactly the configured payer and one user signer".to_string(),
+            ));
+        }
+        let wallet = signer_keys[1];
+        let outer_count = transaction.transaction.message.instructions().len();
+        let outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+            KoraError::InvalidTransaction("Swap instructions are unresolved".to_string())
+        })?;
+        let jupiter_indices = outer
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| (instruction.program_id == jupiter).then_some(index))
+            .collect::<Vec<_>>();
+        if jupiter_indices.len() != 1
+            || outer.iter().any(|instruction| dex_programs.contains(&instruction.program_id))
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Swap requires one outer Jupiter route and no outer DEX instruction".to_string(),
+            ));
+        }
+        let jupiter_index = jupiter_indices[0];
+        let direct = transaction
+            .inner_instruction_contexts
+            .iter()
+            .filter(|context| {
+                context.outer_instruction_index as usize == jupiter_index
+                    && context.stack_height == Some(2)
+                    && dex_programs.contains(&context.instruction.program_id)
+            })
+            .collect::<Vec<_>>();
+        if direct.len() != 1 {
+            return Err(KoraError::InvalidTransaction(
+                "Swap requires exactly one direct Jupiter DEX CPI".to_string(),
+            ));
+        }
+        let dex = &direct[0].instruction;
+        let family = if dex.program_id == raydium {
+            "RAYDIUM_CLMM"
+        } else if dex.program_id == meteora {
+            "METEORA_DLMM"
+        } else {
+            "PUMPSWAP"
+        };
+        if !policy.approved_dex_families.iter().any(|approved| approved == family) {
+            return Err(KoraError::InvalidTransaction(
+                "Swap DEX family is not approved".to_string(),
+            ));
+        }
+        if transaction.inner_instruction_contexts.iter().any(|context| {
+            context.outer_instruction_index as usize == jupiter_index
+                && (context
+                    .instruction
+                    .accounts
+                    .iter()
+                    .any(|meta| meta.pubkey == self.fee_payer_pubkey)
+                    || (dex_programs.contains(&context.instruction.program_id)
+                        && context.instruction.program_id != dex.program_id)
+                    || (context.instruction.program_id == dex.program_id
+                        && !matches!(context.stack_height, Some(2 | 3))))
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "Swap route uses the sponsor or an unapproved DEX leg".to_string(),
+            ));
+        }
+        if dex.accounts.iter().any(|meta| {
+            !outer[jupiter_index].accounts.iter().any(|outer_meta| outer_meta.pubkey == meta.pubkey)
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "Swap DEX accounts are not bound to the Jupiter instruction".to_string(),
+            ));
+        }
+        match family {
+            "RAYDIUM_CLMM" => self.validate_raydium_clmm(dex, rpc_client, wallet).await,
+            "METEORA_DLMM" => self.validate_meteora_dlmm(dex, rpc_client, wallet).await,
+            "PUMPSWAP" => self.validate_pumpswap(dex, rpc_client, wallet).await,
+            _ => Err(KoraError::InvalidTransaction("Swap DEX family is not approved".to_string())),
+        }
+    }
+
+    async fn validate_raydium_clmm(
+        &self,
+        instruction: &Instruction,
+        rpc_client: &RpcClient,
+        wallet: Pubkey,
+    ) -> Result<(), KoraError> {
+        let invalid = || {
+            KoraError::InvalidTransaction("Raydium CLMM route semantics are invalid".to_string())
+        };
+        let program =
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let token_program = spl_token_interface::id();
+        let token_2022_program = spl_token_2022_interface::id();
+        let memo_program = Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let legacy = instruction.data.len() == 41
+            && instruction.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
+            && (12..=13).contains(&instruction.accounts.len());
+        let v2 = instruction.data.len() == 41
+            && instruction.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
+            && (16..=17).contains(&instruction.accounts.len());
+        if instruction.program_id != program
+            || (!legacy && !v2)
+            || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
+            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
+            || instruction.accounts[0].pubkey != wallet
+            || instruction.accounts[8].pubkey != token_program
+        {
+            return Err(invalid());
+        }
+        let tick_start = if legacy {
+            9
+        } else {
+            if instruction.accounts[9].pubkey != token_2022_program
+                || instruction.accounts[10].pubkey != memo_program
+            {
+                return Err(invalid());
+            }
+            13
+        };
+        let writable = [2_usize, 3, 4, 5, 6, 7];
+        if instruction.accounts.iter().enumerate().any(|(index, meta)| {
+            meta.is_signer != (index == 0)
+                || meta.is_writable != (writable.contains(&index) || index >= tick_start)
+        }) {
+            return Err(invalid());
+        }
+        let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
+        let states = rpc_client.get_multiple_accounts(&addresses).await?;
+        let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
+        let input_mint =
+            token_account_mint(state(3)?, token_program, wallet).ok_or_else(invalid)?;
+        let output_mint = if v2 {
+            instruction.accounts[12].pubkey
+        } else {
+            let pool = state(2)?;
+            let bytes = if pool.data.get(73..105) == Some(input_mint.as_ref()) {
+                pool.data.get(105..137)
+            } else if pool.data.get(105..137) == Some(input_mint.as_ref()) {
+                pool.data.get(73..105)
+            } else {
+                None
+            };
+            Pubkey::new_from_array(
+                bytes.and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
+            )
+        };
+        let output_state = states.get(4).and_then(Option::as_ref);
+        if input_mint == output_mint
+            || !self.allowed_tokens.contains(&input_mint)
+            || !self.allowed_tokens.contains(&output_mint)
+            || instruction.accounts[3].pubkey
+                != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                    &wallet,
+                    &input_mint,
+                    &token_program,
+                )
+            || instruction.accounts[4].pubkey
+                != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                    &wallet,
+                    &output_mint,
+                    &token_program,
+                )
+            || output_state.is_some_and(|account| {
+                token_account_mint(account, token_program, wallet) != Some(output_mint)
+            })
+            || (v2
+                && (instruction.accounts[11].pubkey != input_mint
+                    || instruction.accounts[12].pubkey != output_mint))
+        {
+            return Err(invalid());
+        }
+        let mint_states = rpc_client.get_multiple_accounts(&[input_mint, output_mint]).await?;
+        let input_decimals = mint_states
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|account| legacy_mint_decimals(account, token_program))
+            .ok_or_else(invalid)?;
+        let output_decimals = mint_states
+            .get(1)
+            .and_then(Option::as_ref)
+            .and_then(|account| legacy_mint_decimals(account, token_program))
+            .ok_or_else(invalid)?;
+        let mut semantic_accounts = vec![
+            states.get(1).cloned().flatten(),
+            states.get(2).cloned().flatten(),
+            states.get(5).cloned().flatten(),
+            states.get(6).cloned().flatten(),
+            states.get(7).cloned().flatten(),
+        ];
+        semantic_accounts.extend(states.iter().skip(tick_start).cloned());
+        self.validate_raydium_clmm_accounts(
+            instruction,
+            &semantic_accounts,
+            program,
+            token_program,
+            input_mint,
+            output_mint,
+            input_decimals,
+            output_decimals,
+            tick_start,
+            "Raydium CLMM route semantics are invalid",
+        )
+    }
+
+    async fn validate_meteora_dlmm(
+        &self,
+        instruction: &Instruction,
+        rpc_client: &RpcClient,
+        wallet: Pubkey,
+    ) -> Result<(), KoraError> {
+        let invalid = || {
+            KoraError::InvalidTransaction("Meteora DLMM route semantics are invalid".to_string())
+        };
+        let program =
+            Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let token_program = spl_token_interface::id();
+        let memo = Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        if instruction.program_id != program
+            || instruction.data.len() < 24
+            || instruction.data.len() > 256
+            || instruction.data[..8] != METEORA_SWAP2_DISCRIMINATOR
+            || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
+            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
+            || !(18..=20).contains(&instruction.accounts.len())
+        {
+            return Err(invalid());
+        }
+        let writable = [0_usize, 1, 2, 3, 4, 5, 8, 9, 10, 15];
+        if instruction.accounts.iter().enumerate().any(|(index, meta)| {
+            meta.is_signer != (index == 10)
+                || meta.is_writable != (writable.contains(&index) || index >= 16)
+        }) || instruction.accounts[1].pubkey != program
+            || instruction.accounts[9].pubkey != program
+            || instruction.accounts[10].pubkey != wallet
+            || instruction.accounts[11].pubkey != token_program
+            || instruction.accounts[12].pubkey != token_program
+            || instruction.accounts[13].pubkey != memo
+            || instruction.accounts[14].pubkey
+                != Pubkey::find_program_address(&[b"__event_authority"], &program).0
+            || instruction.accounts[15].pubkey != program
+        {
+            return Err(invalid());
+        }
+        let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
+        let states = rpc_client.get_multiple_accounts(&addresses).await?;
+        let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
+        let pair = state(0)?;
+        let mint_x = state(6)?;
+        let mint_y = state(7)?;
+        if pair.owner != program
+            || pair.data.len() != 904
+            || pair.data[..8] != METEORA_LB_PAIR_DISCRIMINATOR
+            || mint_x.owner != token_program
+            || mint_x.data.len() != 82
+            || mint_x.data[45] != 1
+            || mint_y.owner != token_program
+            || mint_y.data.len() != 82
+            || mint_y.data[45] != 1
+            || !self.allowed_tokens.contains(&instruction.accounts[6].pubkey)
+            || !self.allowed_tokens.contains(&instruction.accounts[7].pubkey)
+            || pair.data[88..120] != instruction.accounts[6].pubkey.to_bytes()
+            || pair.data[120..152] != instruction.accounts[7].pubkey.to_bytes()
+            || pair.data[152..184] != instruction.accounts[2].pubkey.to_bytes()
+            || pair.data[184..216] != instruction.accounts[3].pubkey.to_bytes()
+            || pair.data[552..584] != instruction.accounts[8].pubkey.to_bytes()
+        {
+            return Err(invalid());
+        }
+        let mut ordered_mints = [instruction.accounts[6].pubkey, instruction.accounts[7].pubkey];
+        ordered_mints.sort();
+        let base_key = &pair.data[784..816];
+        let pair_candidates = [
+            Pubkey::find_program_address(
+                &[base_key, ordered_mints[0].as_ref(), ordered_mints[1].as_ref()],
+                &program,
+            )
+            .0,
+            Pubkey::find_program_address(
+                &[ordered_mints[0].as_ref(), ordered_mints[1].as_ref(), &pair.data[80..82]],
+                &program,
+            )
+            .0,
+            Pubkey::find_program_address(
+                &[
+                    ordered_mints[0].as_ref(),
+                    ordered_mints[1].as_ref(),
+                    &pair.data[80..82],
+                    &pair.data[8..10],
+                ],
+                &program,
+            )
+            .0,
+        ];
+        if !pair_candidates.contains(&instruction.accounts[0].pubkey) {
+            return Err(invalid());
+        }
+        for (index, mint) in
+            [(2, instruction.accounts[6].pubkey), (3, instruction.accounts[7].pubkey)]
+        {
+            let vault = state(index)?;
+            if instruction.accounts[index].pubkey
+                != Pubkey::find_program_address(
+                    &[instruction.accounts[0].pubkey.as_ref(), mint.as_ref()],
+                    &program,
+                )
+                .0
+                || !valid_legacy_token_account(
+                    vault,
+                    token_program,
+                    mint,
+                    instruction.accounts[0].pubkey,
+                )
+            {
+                return Err(invalid());
+            }
+        }
+        let user_in = state(4)?;
+        let input_mint = token_account_mint(user_in, token_program, wallet).ok_or_else(invalid)?;
+        let output_mint = if input_mint == instruction.accounts[6].pubkey {
+            instruction.accounts[7].pubkey
+        } else if input_mint == instruction.accounts[7].pubkey {
+            instruction.accounts[6].pubkey
+        } else {
+            return Err(invalid());
+        };
+        let user_out = states.get(5).and_then(Option::as_ref);
+        if input_mint == output_mint
+            || !ordered_mints.contains(&input_mint)
+            || !ordered_mints.contains(&output_mint)
+            || instruction.accounts[4].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &token_program)
+            || instruction.accounts[5].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &output_mint, &token_program)
+            || user_out.is_some_and(|account| token_account_mint(account, token_program, wallet) != Some(output_mint))
+        {
+            return Err(invalid());
+        }
+        let oracle = state(8)?;
+        if instruction.accounts[8].pubkey
+            != Pubkey::find_program_address(
+                &[b"oracle", instruction.accounts[0].pubkey.as_ref()],
+                &program,
+            )
+            .0
+            || oracle.owner != program
+            || oracle.data.len() != 3232
+            || oracle.data[..8] != METEORA_ORACLE_DISCRIMINATOR
+        {
+            return Err(invalid());
+        }
+        if instruction.accounts[1].pubkey != program {
+            let bitmap = state(1)?;
+            if instruction.accounts[1].pubkey
+                != Pubkey::find_program_address(
+                    &[b"bitmap", instruction.accounts[0].pubkey.as_ref()],
+                    &program,
+                )
+                .0
+                || bitmap.owner != program
+                || bitmap.data.get(..8) != Some(METEORA_BITMAP_DISCRIMINATOR.as_slice())
+            {
+                return Err(invalid());
+            }
+        }
+        let mut bin_indexes = Vec::new();
+        for index in 16..instruction.accounts.len() {
+            let bin = state(index)?;
+            if bin.owner != program
+                || bin.data.len() != 10136
+                || bin.data[..8] != METEORA_BIN_ARRAY_DISCRIMINATOR
+                || bin.data[24..56] != instruction.accounts[0].pubkey.to_bytes()
+            {
+                return Err(invalid());
+            }
+            let bin_index = i64::from_le_bytes(bin.data[8..16].try_into().map_err(|_| invalid())?);
+            if instruction.accounts[index].pubkey
+                != Pubkey::find_program_address(
+                    &[
+                        b"bin_array",
+                        instruction.accounts[0].pubkey.as_ref(),
+                        &bin_index.to_le_bytes(),
+                    ],
+                    &program,
+                )
+                .0
+            {
+                return Err(invalid());
+            }
+            bin_indexes.push(bin_index);
+        }
+        if !(2..=4).contains(&bin_indexes.len())
+            || bin_indexes.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    async fn validate_pumpswap(
+        &self,
+        instruction: &Instruction,
+        rpc_client: &RpcClient,
+        wallet: Pubkey,
+    ) -> Result<(), KoraError> {
+        let invalid =
+            || KoraError::InvalidTransaction("PumpSwap route semantics are invalid".to_string());
+        let program = Pubkey::from_str(PUMPSWAP_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let fee_program =
+            Pubkey::from_str(PUMP_FEE_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let token_program = spl_token_interface::id();
+        let ata_program = spl_associated_token_account_interface::program::id();
+        let discriminator = instruction.data.get(..8).ok_or_else(invalid)?;
+        let is_sell = discriminator == PUMPSWAP_SELL_DISCRIMINATOR;
+        let is_buy = discriminator == PUMPSWAP_BUY_DISCRIMINATOR
+            || discriminator == PUMPSWAP_BUY_EXACT_QUOTE_DISCRIMINATOR;
+        let expected_len = if is_sell {
+            24
+        } else if is_buy {
+            26
+        } else {
+            return Err(invalid());
+        };
+        if instruction.program_id != program
+            || instruction.accounts.len() != expected_len
+            || instruction.data.len() != if is_buy { 25 } else { 24 }
+            || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
+            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
+        {
+            return Err(invalid());
+        }
+        let writable = if is_sell {
+            vec![0, 1, 5, 6, 7, 8, 10, 17, 23]
+        } else {
+            vec![0, 1, 5, 6, 7, 8, 10, 17, 20, 25]
+        };
+        if instruction.accounts.iter().enumerate().any(|(index, meta)| {
+            meta.is_signer != (index == 1) || meta.is_writable != writable.contains(&index)
+        }) || instruction.accounts[1].pubkey != wallet
+            || instruction.accounts[2].pubkey
+                != Pubkey::from_str(PUMP_GLOBAL_CONFIG).map_err(|_| KoraError::ConfigError)?
+            || instruction.accounts[11].pubkey != token_program
+            || instruction.accounts[12].pubkey != token_program
+            || instruction.accounts[13].pubkey != SYSTEM_PROGRAM_ID
+            || instruction.accounts[14].pubkey != ata_program
+            || instruction.accounts[15].pubkey
+                != Pubkey::find_program_address(&[b"__event_authority"], &program).0
+            || instruction.accounts[16].pubkey != program
+            || instruction.accounts[20 + usize::from(is_buy) * 2].pubkey != fee_program
+        {
+            return Err(invalid());
+        }
+        let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
+        let states = rpc_client.get_multiple_accounts(&addresses).await?;
+        let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
+        let pool = state(0)?;
+        let global = state(2)?;
+        let base_mint = state(3)?;
+        let quote_mint = state(4)?;
+        if pool.owner != program
+            || pool.data.len() != 300
+            || pool.data[..8] != PUMPSWAP_POOL_DISCRIMINATOR
+            || global.owner != program
+            || global.data.len() != 940
+            || global.data[..8] != PUMPSWAP_GLOBAL_DISCRIMINATOR
+            || legacy_mint_decimals(base_mint, token_program).is_none()
+            || legacy_mint_decimals(quote_mint, token_program).is_none()
+            || pool.data[43..75] != instruction.accounts[3].pubkey.to_bytes()
+            || pool.data[75..107] != instruction.accounts[4].pubkey.to_bytes()
+            || pool.data[139..171] != instruction.accounts[7].pubkey.to_bytes()
+            || pool.data[171..203] != instruction.accounts[8].pubkey.to_bytes()
+            || !self.allowed_tokens.contains(&instruction.accounts[3].pubkey)
+            || !self.allowed_tokens.contains(&instruction.accounts[4].pubkey)
+        {
+            return Err(invalid());
+        }
+        let index = &pool.data[9..11];
+        let creator = &pool.data[11..43];
+        if Pubkey::find_program_address(
+            &[
+                b"pool",
+                index,
+                creator,
+                instruction.accounts[3].pubkey.as_ref(),
+                instruction.accounts[4].pubkey.as_ref(),
+            ],
+            &program,
+        )
+        .0 != instruction.accounts[0].pubkey
+        {
+            return Err(invalid());
+        }
+        for (index, mint) in
+            [(7, instruction.accounts[3].pubkey), (8, instruction.accounts[4].pubkey)]
+        {
+            let vault = state(index)?;
+            if instruction.accounts[index].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&instruction.accounts[0].pubkey, &mint, &token_program)
+                || !valid_legacy_token_account(vault, token_program, mint, instruction.accounts[0].pubkey)
+            { return Err(invalid()); }
+        }
+        let (source_index, destination_index) = if is_sell { (5, 6) } else { (6, 5) };
+        for (index, mint) in
+            [(5, instruction.accounts[3].pubkey), (6, instruction.accounts[4].pubkey)]
+        {
+            if instruction.accounts[index].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program)
+                || (index == source_index && !valid_legacy_token_account(state(index)?, token_program, mint, wallet))
+                || (index == destination_index && states.get(index).and_then(Option::as_ref).is_some_and(|account| !valid_legacy_token_account(account, token_program, mint, wallet)))
+            { return Err(invalid()); }
+        }
+        let protocol_recipient = instruction.accounts[9].pubkey;
+        if !(0..8).any(|index| global.data[57 + index * 32..89 + index * 32] == protocol_recipient.to_bytes())
+            || instruction.accounts[10].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&protocol_recipient, &instruction.accounts[4].pubkey, &token_program)
+            || !valid_legacy_token_account(state(10)?, token_program, instruction.accounts[4].pubkey, protocol_recipient)
+        { return Err(invalid()); }
+        let creator_authority =
+            Pubkey::find_program_address(&[b"creator_vault", &pool.data[211..243]], &program).0;
+        if instruction.accounts[18].pubkey != creator_authority
+            || instruction.accounts[17].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&creator_authority, &instruction.accounts[4].pubkey, &token_program)
+            || !valid_legacy_token_account(state(17)?, token_program, instruction.accounts[4].pubkey, creator_authority)
+        { return Err(invalid()); }
+        let fee_config_index = if is_sell { 19 } else { 21 };
+        if instruction.accounts[fee_config_index].pubkey
+            != Pubkey::find_program_address(&[b"fee_config", program.as_ref()], &fee_program).0
+            || state(fee_config_index)?.owner != fee_program
+        {
+            return Err(invalid());
+        }
+        if is_buy {
+            let global_volume = state(19)?;
+            let user_volume = state(20)?;
+            if instruction.accounts[19].pubkey
+                != Pubkey::find_program_address(&[b"global_volume_accumulator"], &program).0
+                || global_volume.owner != program
+                || global_volume.data.len() != 544
+                || global_volume.data[..8] != PUMPSWAP_GLOBAL_VOLUME_DISCRIMINATOR
+                || instruction.accounts[20].pubkey
+                    != Pubkey::find_program_address(
+                        &[b"user_volume_accumulator", wallet.as_ref()],
+                        &program,
+                    )
+                    .0
+                || user_volume.owner != program
+                || user_volume.data.len() != 90
+                || user_volume.data[..8] != PUMPSWAP_USER_VOLUME_DISCRIMINATOR
+                || user_volume.data[8..40] != wallet.to_bytes()
+            {
+                return Err(invalid());
+            }
+        }
+        let trailing_start = if is_sell { 21 } else { 23 };
+        if instruction.accounts[trailing_start].pubkey
+            != Pubkey::find_program_address(
+                &[b"pool-v2", instruction.accounts[3].pubkey.as_ref()],
+                &program,
+            )
+            .0
+        {
+            return Err(invalid());
+        }
+        let current_fee_recipients = [
+            "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+            "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+            "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+            "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+            "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+            "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+            "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+            "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+        ]
+        .into_iter()
+        .map(|value| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError))
+        .collect::<Result<Vec<_>, _>>()?;
+        let fee_recipient = instruction.accounts[trailing_start + 1].pubkey;
+        if !current_fee_recipients.contains(&fee_recipient)
+            || instruction.accounts[trailing_start + 2].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&fee_recipient, &instruction.accounts[4].pubkey, &token_program)
+            || !valid_legacy_token_account(state(trailing_start + 2)?, token_program, instruction.accounts[4].pubkey, fee_recipient)
+        { return Err(invalid()); }
+        Ok(())
+    }
+
     async fn validate_canonical_ata_creation(
         &self,
         transaction: &VersionedTransactionResolved,
@@ -1311,8 +1996,11 @@ impl TransactionValidator {
 
         let jupiter_program =
             Pubkey::from_str(JUPITER_V6_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
-        let raydium_program =
-            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let approved_dex_programs = [
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?,
+            Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?,
+            Pubkey::from_str(PUMPSWAP_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?,
+        ];
         let outer_instruction_count = transaction.transaction.message.instructions().len();
         let outer_ata_indices = transaction
             .all_instructions
@@ -1337,30 +2025,30 @@ impl TransactionValidator {
                 (instruction.program_id == jupiter_program).then_some(index)
             })
             .collect::<Vec<_>>();
-        let has_outer_raydium = transaction
-            .all_instructions
-            .iter()
-            .take(outer_instruction_count)
-            .any(|instruction| instruction.program_id == raydium_program);
-        if outer_jupiter_indices.len() != 1 || has_outer_raydium {
+        if outer_jupiter_indices.len() != 1 {
             return Err(KoraError::InvalidTransaction(
                 "Canonical ATA exception requires one outer Jupiter v6 swap".to_string(),
             ));
         }
         let jupiter_index = outer_jupiter_indices[0];
-        let raydium_contexts = transaction
+        let direct_dex_contexts = transaction
             .inner_instruction_contexts
             .iter()
-            .filter(|context| context.instruction.program_id == raydium_program)
-            .collect::<Vec<_>>();
-        if raydium_contexts.is_empty()
-            || raydium_contexts.iter().any(|context| {
-                context.outer_instruction_index as usize != jupiter_index
-                    || context.stack_height != Some(2)
+            .filter(|context| {
+                approved_dex_programs.contains(&context.instruction.program_id)
+                    && context.outer_instruction_index as usize == jupiter_index
+                    && context.stack_height == Some(2)
             })
+            .collect::<Vec<_>>();
+        if direct_dex_contexts.len() != 1
+            || transaction
+                .all_instructions
+                .iter()
+                .take(outer_instruction_count)
+                .any(|instruction| approved_dex_programs.contains(&instruction.program_id))
         {
             return Err(KoraError::InvalidTransaction(
-                "Canonical ATA exception requires direct Jupiter to Raydium CLMM CPI".to_string(),
+                "Canonical ATA exception requires one direct approved Jupiter DEX CPI".to_string(),
             ));
         }
 
@@ -4913,5 +5601,375 @@ mod tests {
         let result = TransactionValidator::validate_strict_pricing_with_fee(&fee_calc);
 
         assert!(result.is_ok(), "Should pass when total equals fixed price");
+    }
+
+    fn rpc_account(data: Vec<u8>, owner: Pubkey) -> serde_json::Value {
+        json!({
+            "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"],
+            "executable": false,
+            "lamports": 2_039_280,
+            "owner": owner.to_string(),
+            "rentEpoch": 0
+        })
+    }
+
+    fn legacy_mint_data(decimals: u8) -> Vec<u8> {
+        let mut data = vec![0_u8; 82];
+        data[44] = decimals;
+        data[45] = 1;
+        data
+    }
+
+    fn legacy_token_data(mint: Pubkey, authority: Pubkey) -> Vec<u8> {
+        let mut data = vec![0_u8; 165];
+        data[..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(authority.as_ref());
+        data[64..72].copy_from_slice(&1_000_000_u64.to_le_bytes());
+        data[108] = 1;
+        data
+    }
+
+    fn meteora_semantic_fixture(
+        corrupt_pair_owner: bool,
+        missing_destination: bool,
+    ) -> (TransactionValidator, Instruction, std::sync::Arc<RpcClient>) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let mint_x = Pubkey::new_unique();
+        let mint_y = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let program = Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).unwrap();
+        let base_key = Pubkey::new_unique();
+        let mut ordered = [mint_x, mint_y];
+        ordered.sort();
+        let pair = Pubkey::find_program_address(
+            &[base_key.as_ref(), ordered[0].as_ref(), ordered[1].as_ref()],
+            &program,
+        )
+        .0;
+        let vault_x = Pubkey::find_program_address(&[pair.as_ref(), mint_x.as_ref()], &program).0;
+        let vault_y = Pubkey::find_program_address(&[pair.as_ref(), mint_y.as_ref()], &program).0;
+        let user_x = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint_x, &token_program);
+        let user_y = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint_y, &token_program);
+        let oracle = Pubkey::find_program_address(&[b"oracle", pair.as_ref()], &program).0;
+        let bins = [0_i64, 1_i64].map(|index| {
+            Pubkey::find_program_address(
+                &[b"bin_array", pair.as_ref(), &index.to_le_bytes()],
+                &program,
+            )
+            .0
+        });
+        let metas = vec![
+            AccountMeta::new(pair, false),
+            AccountMeta::new(program, false),
+            AccountMeta::new(vault_x, false),
+            AccountMeta::new(vault_y, false),
+            AccountMeta::new(user_x, false),
+            AccountMeta::new(user_y, false),
+            AccountMeta::new_readonly(mint_x, false),
+            AccountMeta::new_readonly(mint_y, false),
+            AccountMeta::new(oracle, false),
+            AccountMeta::new(program, false),
+            AccountMeta::new(wallet, true),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), false),
+            AccountMeta::new_readonly(
+                Pubkey::find_program_address(&[b"__event_authority"], &program).0,
+                false,
+            ),
+            AccountMeta::new(program, false),
+            AccountMeta::new(bins[0], false),
+            AccountMeta::new(bins[1], false),
+        ];
+        let mut data = METEORA_SWAP2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&1_000_u64.to_le_bytes());
+        data.extend_from_slice(&900_u64.to_le_bytes());
+        let instruction = Instruction::new_with_bytes(program, &data, metas);
+        let mut pair_data = vec![0_u8; 904];
+        pair_data[..8].copy_from_slice(&METEORA_LB_PAIR_DISCRIMINATOR);
+        pair_data[88..120].copy_from_slice(mint_x.as_ref());
+        pair_data[120..152].copy_from_slice(mint_y.as_ref());
+        pair_data[152..184].copy_from_slice(vault_x.as_ref());
+        pair_data[184..216].copy_from_slice(vault_y.as_ref());
+        pair_data[552..584].copy_from_slice(oracle.as_ref());
+        pair_data[784..816].copy_from_slice(base_key.as_ref());
+        let mut oracle_data = vec![0_u8; 3232];
+        oracle_data[..8].copy_from_slice(&METEORA_ORACLE_DISCRIMINATOR);
+        let bin_data = |index: i64| {
+            let mut data = vec![0_u8; 10136];
+            data[..8].copy_from_slice(&METEORA_BIN_ARRAY_DISCRIMINATOR);
+            data[8..16].copy_from_slice(&index.to_le_bytes());
+            data[24..56].copy_from_slice(pair.as_ref());
+            data
+        };
+        let filler = rpc_account(vec![], SYSTEM_PROGRAM_ID);
+        let values = vec![
+            rpc_account(pair_data, if corrupt_pair_owner { SYSTEM_PROGRAM_ID } else { program }),
+            filler.clone(),
+            rpc_account(legacy_token_data(mint_x, pair), token_program),
+            rpc_account(legacy_token_data(mint_y, pair), token_program),
+            rpc_account(legacy_token_data(mint_x, wallet), token_program),
+            if missing_destination {
+                serde_json::Value::Null
+            } else {
+                rpc_account(legacy_token_data(mint_y, wallet), token_program)
+            },
+            rpc_account(legacy_mint_data(6), token_program),
+            rpc_account(legacy_mint_data(9), token_program),
+            rpc_account(oracle_data, program),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler,
+            rpc_account(bin_data(0), program),
+            rpc_account(bin_data(1), program),
+        ];
+        let mut policy = FeePayerPolicy::default();
+        policy.system.canonical_ata_creation.allowed_output_mints =
+            vec![mint_x.to_string(), mint_y.to_string()];
+        policy.system.swap = crate::config::SwapPolicy {
+            enabled: true,
+            approved_dex_families: vec!["METEORA_DLMM".to_string()],
+        };
+        setup_config_with_policy(policy);
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": values }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), instruction, rpc)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn swap_meteora_semantics_accept_exact_shape_and_reject_role_or_state_mutation() {
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false);
+        let wallet = instruction.accounts[10].pubkey;
+        assert!(validator.validate_meteora_dlmm(&instruction, &rpc, wallet).await.is_ok());
+        let mut wrong_role = instruction.clone();
+        wrong_role.accounts[8].is_writable = false;
+        assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, true);
+        assert!(validator
+            .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
+            .await
+            .is_ok());
+        let (validator, instruction, rpc) = meteora_semantic_fixture(true, false);
+        assert!(validator
+            .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
+            .await
+            .is_err());
+    }
+
+    fn pumpswap_sell_semantic_fixture(
+        corrupt_pool_owner: bool,
+        missing_destination: bool,
+    ) -> (TransactionValidator, Instruction, std::sync::Arc<RpcClient>) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let program = Pubkey::from_str(PUMPSWAP_PROGRAM_ID).unwrap();
+        let fee_program = Pubkey::from_str(PUMP_FEE_PROGRAM_ID).unwrap();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let coin_creator = Pubkey::new_unique();
+        let index = 1_u16;
+        let pool = Pubkey::find_program_address(
+            &[
+                b"pool",
+                &index.to_le_bytes(),
+                creator.as_ref(),
+                base_mint.as_ref(),
+                quote_mint.as_ref(),
+            ],
+            &program,
+        )
+        .0;
+        let ata = |owner: Pubkey, mint: Pubkey| {
+            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&owner, &mint, &token_program)
+        };
+        let user_base = ata(wallet, base_mint);
+        let user_quote = ata(wallet, quote_mint);
+        let pool_base = ata(pool, base_mint);
+        let pool_quote = ata(pool, quote_mint);
+        let protocol = Pubkey::new_unique();
+        let protocol_ata = ata(protocol, quote_mint);
+        let creator_authority =
+            Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &program).0;
+        let creator_ata = ata(creator_authority, quote_mint);
+        let fee_config =
+            Pubkey::find_program_address(&[b"fee_config", program.as_ref()], &fee_program).0;
+        let pool_v2 = Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &program).0;
+        let current_fee_recipient =
+            Pubkey::from_str("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL").unwrap();
+        let current_fee_ata = ata(current_fee_recipient, quote_mint);
+        let metas = vec![
+            AccountMeta::new(pool, false),
+            AccountMeta::new(wallet, true),
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_GLOBAL_CONFIG).unwrap(), false),
+            AccountMeta::new_readonly(base_mint, false),
+            AccountMeta::new_readonly(quote_mint, false),
+            AccountMeta::new(user_base, false),
+            AccountMeta::new(user_quote, false),
+            AccountMeta::new(pool_base, false),
+            AccountMeta::new(pool_quote, false),
+            AccountMeta::new_readonly(protocol, false),
+            AccountMeta::new(protocol_ata, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(spl_associated_token_account_interface::program::id(), false),
+            AccountMeta::new_readonly(
+                Pubkey::find_program_address(&[b"__event_authority"], &program).0,
+                false,
+            ),
+            AccountMeta::new_readonly(program, false),
+            AccountMeta::new(creator_ata, false),
+            AccountMeta::new_readonly(creator_authority, false),
+            AccountMeta::new_readonly(fee_config, false),
+            AccountMeta::new_readonly(fee_program, false),
+            AccountMeta::new_readonly(pool_v2, false),
+            AccountMeta::new_readonly(current_fee_recipient, false),
+            AccountMeta::new(current_fee_ata, false),
+        ];
+        let mut data = PUMPSWAP_SELL_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&1_000_u64.to_le_bytes());
+        data.extend_from_slice(&900_u64.to_le_bytes());
+        let instruction = Instruction::new_with_bytes(program, &data, metas);
+        let mut pool_data = vec![0_u8; 300];
+        pool_data[..8].copy_from_slice(&PUMPSWAP_POOL_DISCRIMINATOR);
+        pool_data[9..11].copy_from_slice(&index.to_le_bytes());
+        pool_data[11..43].copy_from_slice(creator.as_ref());
+        pool_data[43..75].copy_from_slice(base_mint.as_ref());
+        pool_data[75..107].copy_from_slice(quote_mint.as_ref());
+        pool_data[139..171].copy_from_slice(pool_base.as_ref());
+        pool_data[171..203].copy_from_slice(pool_quote.as_ref());
+        pool_data[211..243].copy_from_slice(coin_creator.as_ref());
+        let mut global_data = vec![0_u8; 940];
+        global_data[..8].copy_from_slice(&PUMPSWAP_GLOBAL_DISCRIMINATOR);
+        global_data[57..89].copy_from_slice(protocol.as_ref());
+        let filler = rpc_account(vec![], SYSTEM_PROGRAM_ID);
+        let values = vec![
+            rpc_account(pool_data, if corrupt_pool_owner { SYSTEM_PROGRAM_ID } else { program }),
+            filler.clone(),
+            rpc_account(global_data, program),
+            rpc_account(legacy_mint_data(6), token_program),
+            rpc_account(legacy_mint_data(9), token_program),
+            rpc_account(legacy_token_data(base_mint, wallet), token_program),
+            if missing_destination {
+                serde_json::Value::Null
+            } else {
+                rpc_account(legacy_token_data(quote_mint, wallet), token_program)
+            },
+            rpc_account(legacy_token_data(base_mint, pool), token_program),
+            rpc_account(legacy_token_data(quote_mint, pool), token_program),
+            filler.clone(),
+            rpc_account(legacy_token_data(quote_mint, protocol), token_program),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            filler.clone(),
+            rpc_account(legacy_token_data(quote_mint, creator_authority), token_program),
+            filler.clone(),
+            rpc_account(vec![0_u8; 4073], fee_program),
+            filler.clone(),
+            filler.clone(),
+            filler,
+            rpc_account(legacy_token_data(quote_mint, current_fee_recipient), token_program),
+        ];
+        let mut policy = FeePayerPolicy::default();
+        policy.system.canonical_ata_creation.allowed_output_mints =
+            vec![base_mint.to_string(), quote_mint.to_string()];
+        policy.system.swap = crate::config::SwapPolicy {
+            enabled: true,
+            approved_dex_families: vec!["PUMPSWAP".to_string()],
+        };
+        setup_config_with_policy(policy);
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": values }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), instruction, rpc)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn swap_pumpswap_semantics_accept_exact_sell_and_reject_fee_or_state_mutation() {
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, false);
+        let wallet = instruction.accounts[1].pubkey;
+        assert!(validator.validate_pumpswap(&instruction, &rpc, wallet).await.is_ok());
+        let mut wrong_fee = instruction.clone();
+        wrong_fee.accounts[22].pubkey = Pubkey::new_unique();
+        assert!(validator.validate_pumpswap(&wrong_fee, &rpc, wallet).await.is_err());
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, true);
+        assert!(validator
+            .validate_pumpswap(&instruction, &rpc, instruction.accounts[1].pubkey)
+            .await
+            .is_ok());
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(true, false);
+        assert!(validator
+            .validate_pumpswap(&instruction, &rpc, instruction.accounts[1].pubkey)
+            .await
+            .is_err());
+    }
+
+    fn swap_route_transaction(
+        payer: Pubkey,
+        wallet: Pubkey,
+        dex: Instruction,
+    ) -> VersionedTransactionResolved {
+        let mut route_accounts = dex.accounts.clone();
+        if !route_accounts.iter().any(|meta| meta.pubkey == dex.program_id) {
+            route_accounts.push(AccountMeta::new_readonly(dex.program_id, false));
+        }
+        let route = Instruction::new_with_bytes(
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap(),
+            &[1],
+            route_accounts,
+        );
+        let message = VersionedMessage::Legacy(Message::new(&[route], Some(&payer)));
+        let mut transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        transaction.all_instructions.push(dex.clone());
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: dex,
+            outer_instruction_index: 0,
+            stack_height: Some(2),
+        });
+        assert_eq!(transaction.transaction.message.static_account_keys()[1], wallet);
+        transaction
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn swap_route_dispatch_accepts_one_approved_family_and_rejects_mixed_direct_legs() {
+        let (validator, meteora, rpc) = meteora_semantic_fixture(false, false);
+        let wallet = meteora.accounts[10].pubkey;
+        let transaction = swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora);
+        assert!(validator.validate_swap_route(&transaction, &rpc).await.is_ok());
+
+        let (validator, pumpswap, rpc) = pumpswap_sell_semantic_fixture(false, false);
+        let wallet = pumpswap.accounts[1].pubkey;
+        let mut transaction =
+            swap_route_transaction(validator.fee_payer_pubkey, wallet, pumpswap.clone());
+        let mut foreign = pumpswap;
+        foreign.program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).unwrap();
+        transaction.all_instructions.push(foreign.clone());
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: foreign,
+            outer_instruction_index: 0,
+            stack_height: Some(2),
+        });
+        assert!(validator.validate_swap_route(&transaction, &rpc).await.is_err());
     }
 }
