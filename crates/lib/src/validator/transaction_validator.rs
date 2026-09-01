@@ -829,7 +829,9 @@ impl TransactionValidator {
         allowed_jupiter_accounts.extend(raydium.accounts.iter().map(|account| account.pubkey));
         if outer[jupiter_index].accounts.iter().any(|account| {
             !allowed_jupiter_accounts.contains(&account.pubkey)
-                || (account.is_signer && account.pubkey != wallet)
+                || (account.is_signer
+                    && account.pubkey != wallet
+                    && account.pubkey != self.fee_payer_pubkey)
         }) || raydium.accounts.iter().any(|account| {
             !outer[jupiter_index]
                 .accounts
@@ -839,6 +841,18 @@ impl TransactionValidator {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value Jupiter route contains an unapproved or unrelated account"
                     .to_string(),
+            ));
+        }
+        if transaction.inner_instruction_contexts.iter().any(|context| {
+            context.outer_instruction_index as usize == jupiter_index
+                && context
+                    .instruction
+                    .accounts
+                    .iter()
+                    .any(|account| account.pubkey == self.fee_payer_pubkey)
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value route cannot use the sponsor inside a CPI".to_string(),
             ));
         }
         let mut account_addresses = vec![source, mint, wrapped];
@@ -2774,6 +2788,30 @@ mod tests {
         let arbitrary = Pubkey::new_unique();
         transaction.all_instructions[3].accounts.push(AccountMeta::new(arbitrary, false));
         transaction.all_account_keys.push(arbitrary);
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_allows_an_unused_pinned_sponsor_meta_but_rejects_sponsor_cpi_use() {
+        let (mut validator, mut transaction, rpc, payer_creations) =
+            recover_fixture(false, None, None);
+        let payer = validator.fee_payer_pubkey;
+        validator
+            .fee_payer_policy
+            .system
+            .recover
+            .allowed_jupiter_auxiliary_accounts
+            .push(payer.to_string());
+        transaction.all_instructions[3].accounts.push(AccountMeta::new(payer, true));
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+
+        let sponsor_cpi = transfer(&payer, &Pubkey::new_unique(), 1);
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: sponsor_cpi,
+            outer_instruction_index: 3,
+            stack_height: Some(2),
+        });
         assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
     }
 
