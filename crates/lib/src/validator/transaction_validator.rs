@@ -1605,7 +1605,9 @@ impl TransactionValidator {
             || ![METEORA_SWAP_DISCRIMINATOR, METEORA_SWAP2_DISCRIMINATOR]
                 .contains(&instruction.data[..8].try_into().map_err(|_| invalid())?)
             || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
-            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
+            || (instruction.data[..8] == METEORA_SWAP2_DISCRIMINATOR
+                && u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?)
+                    == 0)
             || !(17..=20).contains(&instruction.accounts.len())
         {
             return Err(invalid());
@@ -5773,7 +5775,17 @@ mod tests {
         let (validator, mut legacy_swap, rpc) = meteora_semantic_fixture(false, false, true);
         let wallet = legacy_swap.accounts[10].pubkey;
         legacy_swap.data[..8].copy_from_slice(&METEORA_SWAP_DISCRIMINATOR);
+        legacy_swap.data[16..24].fill(0);
         assert!(validator.validate_meteora_dlmm(&legacy_swap, &rpc, wallet).await.is_ok());
+        let mut zero_input = legacy_swap.clone();
+        zero_input.data[8..16].fill(0);
+        assert!(validator.validate_meteora_dlmm(&zero_input, &rpc, wallet).await.is_err());
+        let mut zero_bound_swap2 = instruction.clone();
+        zero_bound_swap2.data[16..24].fill(0);
+        assert!(validator
+            .validate_meteora_dlmm(&zero_bound_swap2, &rpc, instruction.accounts[10].pubkey)
+            .await
+            .is_err());
         let mut wrong_role = instruction.clone();
         wrong_role.accounts[8].is_writable = false;
         assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
