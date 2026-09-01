@@ -1812,7 +1812,12 @@ impl TransactionValidator {
             || !valid_length
             || instruction.data.len() != if is_buy { 25 } else { 24 }
             || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
-            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
+            // Jupiter's exact-input sell route enforces the output threshold at the
+            // outer route layer and currently passes zero to PumpSwap's inner CPI.
+            || (is_buy
+                && u64::from_le_bytes(
+                    instruction.data[16..24].try_into().map_err(|_| invalid())?,
+                ) == 0)
         {
             return Err(invalid());
         }

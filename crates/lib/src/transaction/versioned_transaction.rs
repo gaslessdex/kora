@@ -119,8 +119,11 @@ impl VersionedTransactionResolved {
         resolved.all_account_keys = all_account_keys.clone();
 
         // 2. Fetch all instructions
-        let outer_instructions =
-            IxUtils::uncompile_instructions(transaction.message.instructions(), &all_account_keys)?;
+        let outer_instructions = Self::uncompile_with_message_privileges(
+            transaction.message.instructions(),
+            &transaction.message,
+            &all_account_keys,
+        )?;
 
         let inner_instructions = resolved.fetch_inner_instructions(rpc_client, sig_verify).await?;
 
@@ -141,8 +144,9 @@ impl VersionedTransactionResolved {
             transaction: transaction.clone(),
             recover_authorization_claims: None,
             all_account_keys: transaction.message.static_account_keys().to_vec(),
-            all_instructions: IxUtils::uncompile_instructions(
+            all_instructions: Self::uncompile_with_message_privileges(
                 transaction.message.instructions(),
+                &transaction.message,
                 transaction.message.static_account_keys(),
             )?,
             inner_instruction_contexts: vec![],
@@ -206,14 +210,17 @@ impl VersionedTransactionResolved {
                             "Could not preserve simulated inner-instruction context".to_string(),
                         )
                     })?;
-                    let instruction =
-                        IxUtils::uncompile_instructions(&[compiled], &self.all_account_keys)?
-                            .pop()
-                            .ok_or_else(|| {
-                                KoraError::InvalidTransaction(
-                                    "Could not resolve simulated inner instruction".to_string(),
-                                )
-                            })?;
+                    let instruction = Self::uncompile_with_message_privileges(
+                        &[compiled],
+                        &self.transaction.message,
+                        &self.all_account_keys,
+                    )?
+                    .pop()
+                    .ok_or_else(|| {
+                        KoraError::InvalidTransaction(
+                            "Could not resolve simulated inner instruction".to_string(),
+                        )
+                    })?;
                     contexts.push(InnerInstructionContext {
                         instruction,
                         outer_instruction_index: group.index,
@@ -225,6 +232,22 @@ impl VersionedTransactionResolved {
         }
 
         Ok(vec![])
+    }
+
+    fn uncompile_with_message_privileges(
+        compiled: &[CompiledInstruction],
+        message: &VersionedMessage,
+        account_keys: &[Pubkey],
+    ) -> Result<Vec<Instruction>, KoraError> {
+        let mut instructions = IxUtils::uncompile_instructions(compiled, account_keys)?;
+        for (instruction, source) in instructions.iter_mut().zip(compiled) {
+            for (meta, index) in instruction.accounts.iter_mut().zip(&source.accounts) {
+                let index = usize::from(*index);
+                meta.is_signer = message.is_signer(index);
+                meta.is_writable = message.is_maybe_writable(index, None);
+            }
+        }
+        Ok(instructions)
     }
 
     pub fn get_or_parse_system_instructions(
@@ -669,6 +692,10 @@ mod tests {
         assert_eq!(resolved_instruction.program_id, instruction.program_id);
         assert_eq!(resolved_instruction.data, instruction.data);
         assert_eq!(resolved_instruction.accounts.len(), instruction.accounts.len());
+        assert!(resolved_instruction.accounts[0].is_signer);
+        assert!(resolved_instruction.accounts[0].is_writable);
+        assert!(!resolved_instruction.accounts[1].is_signer);
+        assert!(!resolved_instruction.accounts[1].is_writable);
 
         assert!(resolved.parsed_system_instructions.is_none());
         assert!(resolved.parsed_spl_instructions.is_none());
@@ -707,6 +734,10 @@ mod tests {
         assert_eq!(resolved.all_instructions[0].program_id, program_id);
         assert_eq!(resolved.all_instructions[0].accounts.len(), 2);
         assert_eq!(resolved.all_instructions[0].data, vec![1, 2, 3]);
+        assert!(resolved.all_instructions[0].accounts[0].is_signer);
+        assert!(resolved.all_instructions[0].accounts[0].is_writable);
+        assert!(!resolved.all_instructions[0].accounts[1].is_signer);
+        assert!(!resolved.all_instructions[0].accounts[1].is_writable);
     }
 
     #[tokio::test]
@@ -959,6 +990,8 @@ mod tests {
 
         assert_eq!(inner_instructions.len(), 1);
         assert_eq!(inner_instructions[0].instruction.data, vec![10, 20, 30]);
+        assert!(inner_instructions[0].instruction.accounts[0].is_signer);
+        assert!(inner_instructions[0].instruction.accounts[0].is_writable);
     }
 
     #[tokio::test]
