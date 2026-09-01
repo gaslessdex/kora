@@ -38,6 +38,7 @@ const RAYDIUM_OBSERVATION_DISCRIMINATOR: [u8; 8] = [122, 174, 197, 53, 129, 9, 1
 const RAYDIUM_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [192, 155, 85, 205, 49, 249, 129, 42];
 const RAYDIUM_BITMAP_DISCRIMINATOR: [u8; 8] = [60, 150, 36, 219, 97, 128, 139, 153];
 const METEORA_SWAP2_DISCRIMINATOR: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136];
+const METEORA_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 const METEORA_LB_PAIR_DISCRIMINATOR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
 const METEORA_BIN_ARRAY_DISCRIMINATOR: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
 const METEORA_BITMAP_DISCRIMINATOR: [u8; 8] = [80, 111, 124, 113, 55, 237, 18, 5];
@@ -1601,7 +1602,8 @@ impl TransactionValidator {
         if instruction.program_id != program
             || instruction.data.len() < 24
             || instruction.data.len() > 256
-            || instruction.data[..8] != METEORA_SWAP2_DISCRIMINATOR
+            || ![METEORA_SWAP_DISCRIMINATOR, METEORA_SWAP2_DISCRIMINATOR]
+                .contains(&instruction.data[..8].try_into().map_err(|_| invalid())?)
             || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
             || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
             || !(17..=20).contains(&instruction.accounts.len())
@@ -5768,6 +5770,10 @@ mod tests {
         let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, false);
         let wallet = instruction.accounts[10].pubkey;
         assert!(validator.validate_meteora_dlmm(&instruction, &rpc, wallet).await.is_ok());
+        let (validator, mut legacy_swap, rpc) = meteora_semantic_fixture(false, false, true);
+        let wallet = legacy_swap.accounts[10].pubkey;
+        legacy_swap.data[..8].copy_from_slice(&METEORA_SWAP_DISCRIMINATOR);
+        assert!(validator.validate_meteora_dlmm(&legacy_swap, &rpc, wallet).await.is_ok());
         let mut wrong_role = instruction.clone();
         wrong_role.accounts[8].is_writable = false;
         assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
