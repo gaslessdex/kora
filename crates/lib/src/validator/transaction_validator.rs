@@ -1378,6 +1378,7 @@ impl TransactionValidator {
         let dex_programs = [raydium, meteora, pumpswap];
         let signer_keys = transaction.transaction.message.static_account_keys();
         if transaction.transaction.message.header().num_required_signatures != 2
+            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
             || signer_keys.first() != Some(&self.fee_payer_pubkey)
         {
             return Err(KoraError::InvalidTransaction(
@@ -1603,23 +1604,26 @@ impl TransactionValidator {
             || instruction.data[..8] != METEORA_SWAP2_DISCRIMINATOR
             || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
             || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
-            || !(18..=20).contains(&instruction.accounts.len())
+            || !(17..=20).contains(&instruction.accounts.len())
         {
             return Err(invalid());
         }
-        let writable = [0_usize, 2, 3, 4, 5, 8];
+        let has_memo = instruction.accounts[13].pubkey == memo;
+        let event_index = if has_memo { 14 } else { 13 };
+        let program_index = event_index + 1;
+        let bins_start = program_index + 1;
+        let writable = [0_usize, 1, 2, 3, 4, 5, 8, 9, 10, program_index];
         if instruction.accounts.iter().enumerate().any(|(index, meta)| {
             meta.is_signer != (index == 10)
-                || meta.is_writable != (writable.contains(&index) || index >= 16)
+                || meta.is_writable != (writable.contains(&index) || index >= bins_start)
         }) || instruction.accounts[1].pubkey != program
             || instruction.accounts[9].pubkey != program
             || instruction.accounts[10].pubkey != wallet
             || instruction.accounts[11].pubkey != token_program
             || instruction.accounts[12].pubkey != token_program
-            || instruction.accounts[13].pubkey != memo
-            || instruction.accounts[14].pubkey
+            || instruction.accounts[event_index].pubkey
                 != Pubkey::find_program_address(&[b"__event_authority"], &program).0
-            || instruction.accounts[15].pubkey != program
+            || instruction.accounts[program_index].pubkey != program
         {
             return Err(invalid());
         }
@@ -1743,7 +1747,7 @@ impl TransactionValidator {
             }
         }
         let mut bin_indexes = Vec::new();
-        for index in 16..instruction.accounts.len() {
+        for index in bins_start..instruction.accounts.len() {
             let bin = state(index)?;
             if bin.owner != program
                 || bin.data.len() != 10136
@@ -1793,15 +1797,15 @@ impl TransactionValidator {
         let is_sell = discriminator == PUMPSWAP_SELL_DISCRIMINATOR;
         let is_buy = discriminator == PUMPSWAP_BUY_DISCRIMINATOR
             || discriminator == PUMPSWAP_BUY_EXACT_QUOTE_DISCRIMINATOR;
-        let expected_len = if is_sell {
-            24
+        let valid_length = if is_sell {
+            matches!(instruction.accounts.len(), 23 | 24)
         } else if is_buy {
-            26
+            instruction.accounts.len() == 26
         } else {
             return Err(invalid());
         };
         if instruction.program_id != program
-            || instruction.accounts.len() != expected_len
+            || !valid_length
             || instruction.data.len() != if is_buy { 25 } else { 24 }
             || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
             || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
@@ -1809,7 +1813,7 @@ impl TransactionValidator {
             return Err(invalid());
         }
         let writable = if is_sell {
-            vec![0, 1, 5, 6, 7, 8, 10, 17, 23]
+            vec![0, 1, 5, 6, 7, 8, 10, 17, instruction.accounts.len() - 1]
         } else {
             vec![0, 1, 5, 6, 7, 8, 10, 17, 20, 25]
         };
@@ -1926,14 +1930,21 @@ impl TransactionValidator {
                 return Err(invalid());
             }
         }
-        let trailing_start = if is_sell { 21 } else { 23 };
-        if instruction.accounts[trailing_start].pubkey
-            != Pubkey::find_program_address(
-                &[b"pool-v2", instruction.accounts[3].pubkey.as_ref()],
-                &program,
-            )
-            .0
-        {
+        let (pool_v2_index, fee_recipient_index) = if is_sell && instruction.accounts.len() == 23 {
+            (None, 21)
+        } else if is_sell {
+            (Some(21), 22)
+        } else {
+            (Some(23), 24)
+        };
+        if pool_v2_index.is_some_and(|index| {
+            instruction.accounts[index].pubkey
+                != Pubkey::find_program_address(
+                    &[b"pool-v2", instruction.accounts[3].pubkey.as_ref()],
+                    &program,
+                )
+                .0
+        }) {
             return Err(invalid());
         }
         let current_fee_recipients = [
@@ -1949,10 +1960,10 @@ impl TransactionValidator {
         .into_iter()
         .map(|value| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError))
         .collect::<Result<Vec<_>, _>>()?;
-        let fee_recipient = instruction.accounts[trailing_start + 1].pubkey;
+        let fee_recipient = instruction.accounts[fee_recipient_index].pubkey;
         if !current_fee_recipients.contains(&fee_recipient)
-            || instruction.accounts[trailing_start + 2].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&fee_recipient, &instruction.accounts[4].pubkey, &token_program)
-            || !valid_legacy_token_account(state(trailing_start + 2)?, token_program, instruction.accounts[4].pubkey, fee_recipient)
+            || instruction.accounts[fee_recipient_index + 1].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&fee_recipient, &instruction.accounts[4].pubkey, &token_program)
+            || !valid_legacy_token_account(state(fee_recipient_index + 1)?, token_program, instruction.accounts[4].pubkey, fee_recipient)
         { return Err(invalid()); }
         Ok(())
     }
@@ -5631,6 +5642,7 @@ mod tests {
     fn meteora_semantic_fixture(
         corrupt_pair_owner: bool,
         missing_destination: bool,
+        without_memo: bool,
     ) -> (TransactionValidator, Instruction, std::sync::Arc<RpcClient>) {
         let payer = Pubkey::new_unique();
         let wallet = Pubkey::new_unique();
@@ -5658,9 +5670,9 @@ mod tests {
             )
             .0
         });
-        let metas = vec![
+        let mut metas = vec![
             AccountMeta::new(pair, false),
-            AccountMeta::new_readonly(program, false),
+            AccountMeta::new(program, false),
             AccountMeta::new(vault_x, false),
             AccountMeta::new(vault_y, false),
             AccountMeta::new(user_x, false),
@@ -5668,8 +5680,8 @@ mod tests {
             AccountMeta::new_readonly(mint_x, false),
             AccountMeta::new_readonly(mint_y, false),
             AccountMeta::new(oracle, false),
-            AccountMeta::new_readonly(program, false),
-            AccountMeta::new_readonly(wallet, true),
+            AccountMeta::new(program, false),
+            AccountMeta::new(wallet, true),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), false),
@@ -5677,10 +5689,13 @@ mod tests {
                 Pubkey::find_program_address(&[b"__event_authority"], &program).0,
                 false,
             ),
-            AccountMeta::new_readonly(program, false),
+            AccountMeta::new(program, false),
             AccountMeta::new(bins[0], false),
             AccountMeta::new(bins[1], false),
         ];
+        if without_memo {
+            metas.remove(13);
+        }
         let mut data = METEORA_SWAP2_DISCRIMINATOR.to_vec();
         data.extend_from_slice(&1_000_u64.to_le_bytes());
         data.extend_from_slice(&900_u64.to_le_bytes());
@@ -5703,7 +5718,7 @@ mod tests {
             data
         };
         let filler = rpc_account(vec![], SYSTEM_PROGRAM_ID);
-        let values = vec![
+        let mut values = vec![
             rpc_account(pair_data, if corrupt_pair_owner { SYSTEM_PROGRAM_ID } else { program }),
             filler.clone(),
             rpc_account(legacy_token_data(mint_x, pair), token_program),
@@ -5727,6 +5742,9 @@ mod tests {
             rpc_account(bin_data(0), program),
             rpc_account(bin_data(1), program),
         ];
+        if without_memo {
+            values.remove(13);
+        }
         let mut policy = FeePayerPolicy::default();
         policy.system.canonical_ata_creation.allowed_output_mints =
             vec![mint_x.to_string(), mint_y.to_string()];
@@ -5747,21 +5765,23 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn swap_meteora_semantics_accept_exact_shape_and_reject_role_or_state_mutation() {
-        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, false);
         let wallet = instruction.accounts[10].pubkey;
         assert!(validator.validate_meteora_dlmm(&instruction, &rpc, wallet).await.is_ok());
         let mut wrong_role = instruction.clone();
         wrong_role.accounts[8].is_writable = false;
         assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
-        let mut writable_program = instruction.clone();
-        writable_program.accounts[1].is_writable = true;
-        assert!(validator.validate_meteora_dlmm(&writable_program, &rpc, wallet).await.is_err());
-        let (validator, instruction, rpc) = meteora_semantic_fixture(false, true);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, true);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
             .await
             .is_ok());
-        let (validator, instruction, rpc) = meteora_semantic_fixture(true, false);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, true, false);
+        assert!(validator
+            .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
+            .await
+            .is_ok());
+        let (validator, instruction, rpc) = meteora_semantic_fixture(true, false, false);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
             .await
@@ -5771,6 +5791,7 @@ mod tests {
     fn pumpswap_sell_semantic_fixture(
         corrupt_pool_owner: bool,
         missing_destination: bool,
+        without_pool_v2: bool,
     ) -> (TransactionValidator, Instruction, std::sync::Arc<RpcClient>) {
         let payer = Pubkey::new_unique();
         let wallet = Pubkey::new_unique();
@@ -5811,7 +5832,7 @@ mod tests {
         let current_fee_recipient =
             Pubkey::from_str("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL").unwrap();
         let current_fee_ata = ata(current_fee_recipient, quote_mint);
-        let metas = vec![
+        let mut metas = vec![
             AccountMeta::new(pool, false),
             AccountMeta::new(wallet, true),
             AccountMeta::new_readonly(Pubkey::from_str(PUMP_GLOBAL_CONFIG).unwrap(), false),
@@ -5840,6 +5861,9 @@ mod tests {
             AccountMeta::new_readonly(current_fee_recipient, false),
             AccountMeta::new(current_fee_ata, false),
         ];
+        if without_pool_v2 {
+            metas.remove(21);
+        }
         let mut data = PUMPSWAP_SELL_DISCRIMINATOR.to_vec();
         data.extend_from_slice(&1_000_u64.to_le_bytes());
         data.extend_from_slice(&900_u64.to_le_bytes());
@@ -5857,7 +5881,7 @@ mod tests {
         global_data[..8].copy_from_slice(&PUMPSWAP_GLOBAL_DISCRIMINATOR);
         global_data[57..89].copy_from_slice(protocol.as_ref());
         let filler = rpc_account(vec![], SYSTEM_PROGRAM_ID);
-        let values = vec![
+        let mut values = vec![
             rpc_account(pool_data, if corrupt_pool_owner { SYSTEM_PROGRAM_ID } else { program }),
             filler.clone(),
             rpc_account(global_data, program),
@@ -5887,6 +5911,9 @@ mod tests {
             filler,
             rpc_account(legacy_token_data(quote_mint, current_fee_recipient), token_program),
         ];
+        if without_pool_v2 {
+            values.remove(21);
+        }
         let mut policy = FeePayerPolicy::default();
         policy.system.canonical_ata_creation.allowed_output_mints =
             vec![base_mint.to_string(), quote_mint.to_string()];
@@ -5907,18 +5934,23 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn swap_pumpswap_semantics_accept_exact_sell_and_reject_fee_or_state_mutation() {
-        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, false);
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, false, false);
         let wallet = instruction.accounts[1].pubkey;
         assert!(validator.validate_pumpswap(&instruction, &rpc, wallet).await.is_ok());
         let mut wrong_fee = instruction.clone();
         wrong_fee.accounts[22].pubkey = Pubkey::new_unique();
         assert!(validator.validate_pumpswap(&wrong_fee, &rpc, wallet).await.is_err());
-        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, true);
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, false, true);
         assert!(validator
             .validate_pumpswap(&instruction, &rpc, instruction.accounts[1].pubkey)
             .await
             .is_ok());
-        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(true, false);
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(false, true, false);
+        assert!(validator
+            .validate_pumpswap(&instruction, &rpc, instruction.accounts[1].pubkey)
+            .await
+            .is_ok());
+        let (validator, instruction, rpc) = pumpswap_sell_semantic_fixture(true, false, false);
         assert!(validator
             .validate_pumpswap(&instruction, &rpc, instruction.accounts[1].pubkey)
             .await
@@ -5955,12 +5987,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn swap_route_dispatch_accepts_one_approved_family_and_rejects_mixed_direct_legs() {
-        let (validator, meteora, rpc) = meteora_semantic_fixture(false, false);
+        let (validator, meteora, rpc) = meteora_semantic_fixture(false, false, false);
         let wallet = meteora.accounts[10].pubkey;
         let transaction = swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora);
         assert!(validator.validate_swap_route(&transaction, &rpc).await.is_ok());
 
-        let (validator, pumpswap, rpc) = pumpswap_sell_semantic_fixture(false, false);
+        let (validator, pumpswap, rpc) = pumpswap_sell_semantic_fixture(false, false, false);
         let wallet = pumpswap.accounts[1].pubkey;
         let mut transaction =
             swap_route_transaction(validator.fee_payer_pubkey, wallet, pumpswap.clone());
