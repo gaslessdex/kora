@@ -101,14 +101,26 @@ fn validate_claims(
     let network = parse_amount(&claims.network_reimbursement_lamports)?;
     let setup = parse_amount(&claims.setup_rent_reimbursement_lamports)?;
     let sponsored = parse_amount(&claims.sponsored_cost_lamports)?;
+    let dynamic_mints = !policy.allowed_input_mints.is_empty();
+    let allowed_mint = if dynamic_mints {
+        policy.allowed_input_mints.iter().any(|mint| mint == &claims.input_mint)
+    } else {
+        claims.input_mint == policy.input_mint
+    };
+    let canonical_source = Pubkey::from_str(&claims.pilot_wallet)
+        .ok()
+        .zip(Pubkey::from_str(&claims.input_mint).ok())
+        .map(|(wallet, mint)| spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &spl_token_interface::id()).to_string());
     if claims.schema_version != "recover-authorization-v1"
         || claims.action != "CLEAN_RECOVER"
         || claims.network != policy.authorization_network
         || !policy.allowed_users.iter().any(|identity| {
             claims.pilot_wallet == identity.wallet
-                && claims.source_token_account == identity.source_account
+                && (dynamic_mints || claims.source_token_account == identity.source_account)
         })
-        || claims.input_mint != policy.input_mint
+        || !allowed_mint
+        || (dynamic_mints
+            && canonical_source.as_deref() != Some(claims.source_token_account.as_str()))
         || claims.output_mint != WRAPPED_SOL_MINT
         || claims.treasury != policy.settlement_wallet
         || claims.quote_id.is_empty()
@@ -274,6 +286,7 @@ mod tests {
             }],
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
+            approved_dex_families: vec![],
             decimals: 6,
             authorization_public_key: authority.pubkey().to_string(),
             authorization_network: "mainnet-beta".to_string(),

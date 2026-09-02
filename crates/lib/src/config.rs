@@ -232,11 +232,15 @@ pub struct RecoverPolicy {
     #[serde(default = "default_recover_dex_family")]
     pub approved_dex_family: String,
     #[serde(default)]
+    pub approved_dex_families: Vec<String>,
+    #[serde(default)]
     pub allowed_users: Vec<RecoverUserPolicy>,
     #[serde(default)]
     pub settlement_wallet: String,
     #[serde(default)]
     pub input_mint: String,
+    #[serde(default)]
+    pub allowed_input_mints: Vec<String>,
     pub decimals: u8,
     #[serde(default = "default_recover_swap_fee_bps")]
     pub swap_fee_bps: u16,

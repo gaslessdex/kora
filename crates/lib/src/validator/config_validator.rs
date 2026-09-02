@@ -505,10 +505,7 @@ impl ConfigValidator {
                         .to_string(),
                 );
             }
-            let identities = [
-                ("settlement_wallet", &recover.settlement_wallet),
-                ("input_mint", &recover.input_mint),
-            ];
+            let identities = [("settlement_wallet", &recover.settlement_wallet)];
             for (name, value) in identities {
                 if Pubkey::from_str(value).is_err() {
                     errors.push(format!("Invalid Recover {name}"));
@@ -519,7 +516,25 @@ impl ConfigValidator {
                     "Recover allowed_users must contain between 1 and 10 entries".to_string(),
                 );
             }
-            let mint = Pubkey::from_str(&recover.input_mint).ok();
+            let dynamic_mints = !recover.allowed_input_mints.is_empty();
+            let mint =
+                if dynamic_mints { None } else { Pubkey::from_str(&recover.input_mint).ok() };
+            let effective_mints = if dynamic_mints {
+                recover.allowed_input_mints.clone()
+            } else {
+                vec![recover.input_mint.clone()]
+            };
+            if effective_mints.is_empty()
+                || effective_mints.len() > 100
+                || effective_mints.iter().collect::<std::collections::HashSet<_>>().len()
+                    != effective_mints.len()
+                || effective_mints.iter().any(|value| Pubkey::from_str(value).is_err())
+            {
+                errors.push(
+                    "Recover allowed_input_mints must be a unique list of at most 100 valid mints"
+                        .to_string(),
+                );
+            }
             let token_program = spl_token_interface::id();
             let native_mint =
                 Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
@@ -565,8 +580,8 @@ impl ConfigValidator {
                         .to_string(),
                 );
             }
-            if !config.validation.allowed_tokens.contains(&recover.input_mint) {
-                errors.push("Recover input_mint is not in allowed_tokens".to_string());
+            if effective_mints.iter().any(|mint| !config.validation.allowed_tokens.contains(mint)) {
+                errors.push("Every Recover input mint must be in allowed_tokens".to_string());
             }
             if recover.decimals == 0 || recover.decimals > 9 {
                 errors.push("Recover decimals must be between 1 and 9".to_string());
@@ -584,8 +599,20 @@ impl ConfigValidator {
             {
                 errors.push("Recover V1 compute policy must be exactly 100000 CU at 375000 micro-lamports/CU".to_string());
             }
-            if recover.approved_dex_family != "RAYDIUM_CLMM" {
-                errors.push("Recover approved_dex_family must be RAYDIUM_CLMM".to_string());
+            let recover_families = if recover.approved_dex_families.is_empty() {
+                vec![recover.approved_dex_family.as_str()]
+            } else {
+                recover.approved_dex_families.iter().map(String::as_str).collect()
+            };
+            if recover_families.is_empty()
+                || recover_families.len() > 3
+                || recover_families
+                    .iter()
+                    .any(|family| !matches!(*family, "RAYDIUM_CLMM" | "METEORA_DLMM" | "PUMPSWAP"))
+                || recover_families.iter().collect::<std::collections::HashSet<_>>().len()
+                    != recover_families.len()
+            {
+                errors.push("Recover approved DEX families must be a unique subset of RAYDIUM_CLMM, METEORA_DLMM, and PUMPSWAP".to_string());
             }
             match recover.route_policy.as_str() {
                 "exact_snapshot" => {
@@ -634,14 +661,28 @@ impl ConfigValidator {
             {
                 errors.push(format!("Invalid Recover Jupiter auxiliary account: {e}"));
             }
-            for program in [
+            let mut required_programs = vec![
                 SYSTEM_PROGRAM_ID.to_string(),
                 SPL_TOKEN_PROGRAM_ID.to_string(),
                 spl_associated_token_account_interface::program::id().to_string(),
                 solana_compute_budget_interface::id().to_string(),
                 "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4".to_string(),
-                "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK".to_string(),
-            ] {
+            ];
+            for family in recover_families
+                .into_iter()
+                .filter(|family| matches!(*family, "RAYDIUM_CLMM" | "METEORA_DLMM" | "PUMPSWAP"))
+            {
+                required_programs.push(
+                    match family {
+                        "RAYDIUM_CLMM" => "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+                        "METEORA_DLMM" => "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+                        "PUMPSWAP" => "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+                        _ => unreachable!(),
+                    }
+                    .to_string(),
+                );
+            }
+            for program in required_programs {
                 if !config.validation.allowed_programs.contains(&program) {
                     errors.push(format!("Recover requires allowed program {program}"));
                 }
@@ -994,6 +1035,7 @@ mod tests {
             enabled: true,
             route_policy: route_policy.to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
+            approved_dex_families: vec![],
             allowed_users: vec![RecoverUserPolicy {
                 wallet: wallet.to_string(),
                 source_account: source_account.to_string(),
@@ -1001,6 +1043,7 @@ mod tests {
             }],
             settlement_wallet: Pubkey::new_unique().to_string(),
             input_mint: input_mint.to_string(),
+            allowed_input_mints: vec![],
             decimals: 6,
             swap_fee_bps: 30,
             rent_fee_bps: 300,
@@ -1073,6 +1116,30 @@ mod tests {
         legacy_config.validation.fee_payer_policy.system.recover = legacy_policy;
         let errors = recover_config_errors(legacy_config).await;
         assert!(errors.is_empty(), "legacy config errors: {errors:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_input_mint_registry_is_bounded_and_must_remain_in_allowed_tokens() {
+        let mut config = recover_config("semantic_family");
+        let second = Pubkey::new_unique().to_string();
+        let first = config.validation.fee_payer_policy.system.recover.input_mint.clone();
+        config.validation.fee_payer_policy.system.recover.allowed_input_mints =
+            vec![first.clone(), second.clone()];
+        config.validation.allowed_tokens.push(second.clone());
+        assert!(recover_config_errors(config.clone()).await.is_empty());
+
+        config.validation.allowed_tokens.retain(|mint| mint != &second);
+        assert!(recover_config_errors(config.clone())
+            .await
+            .iter()
+            .any(|error| error.contains("Every Recover input mint")));
+        config.validation.allowed_tokens.push(second.clone());
+        config.validation.fee_payer_policy.system.recover.allowed_input_mints.push(second);
+        assert!(recover_config_errors(config)
+            .await
+            .iter()
+            .any(|error| error.contains("allowed_input_mints")));
     }
 
     #[tokio::test]

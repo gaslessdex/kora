@@ -777,7 +777,27 @@ impl TransactionValidator {
         }
         let parse = |value: &str| Pubkey::from_str(value).map_err(|_| KoraError::ConfigError);
         let treasury = parse(&policy.settlement_wallet)?;
-        let mint = parse(&policy.input_mint)?;
+        let dynamic_mints = !policy.allowed_input_mints.is_empty();
+        let authorized_mint = transaction
+            .recover_authorization_claims
+            .as_ref()
+            .map(|claims| claims.input_mint.as_str());
+        let mint_value = if dynamic_mints {
+            authorized_mint.ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Recover Value requires server authorization".to_string(),
+                )
+            })?
+        } else {
+            policy.input_mint.as_str()
+        };
+        if dynamic_mints && !policy.allowed_input_mints.iter().any(|allowed| allowed == mint_value)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value input mint is not allowed".to_string(),
+            ));
+        }
+        let mint = parse(mint_value)?;
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
             .map_err(|_| KoraError::ConfigError)?;
         let token_program = spl_token_interface::id();
@@ -806,7 +826,11 @@ impl TransactionValidator {
             .ok_or_else(|| {
                 KoraError::InvalidTransaction("Recover Value user is not allowed".to_string())
             })?;
-        let source = parse(&identity.source_account)?;
+        let source = if dynamic_mints {
+            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program)
+        } else {
+            parse(&identity.source_account)?
+        };
         let wrapped = parse(&identity.wrapped_sol_account)?;
         if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
             return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
@@ -943,63 +967,123 @@ impl TransactionValidator {
                 "Recover Value settlement accounts are invalid".to_string(),
             ));
         }
-        let raydium_contexts = transaction
+        let meteora_program =
+            Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let pumpswap_program =
+            Pubkey::from_str(PUMPSWAP_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let dex_programs = [raydium_program, meteora_program, pumpswap_program];
+        let dex_contexts = transaction
             .inner_instruction_contexts
             .iter()
-            .filter(|context| context.instruction.program_id == raydium_program)
+            .filter(|context| dex_programs.contains(&context.instruction.program_id))
             .collect::<Vec<_>>();
-        if raydium_contexts.len() != 1
-            || raydium_contexts[0].outer_instruction_index as usize != jupiter_index
-            || raydium_contexts[0].stack_height != Some(2)
+        if dex_contexts.len() != 1
+            || dex_contexts[0].outer_instruction_index as usize != jupiter_index
+            || dex_contexts[0].stack_height != Some(2)
         {
             return Err(KoraError::InvalidTransaction(
-                "Recover Value requires exactly one direct Jupiter to Raydium CLMM CPI".to_string(),
+                "Recover Value requires exactly one direct approved DEX CPI from Jupiter"
+                    .to_string(),
             ));
         }
-        let raydium = &raydium_contexts[0].instruction;
-        let pool_is_approved = if policy.route_policy == "exact_snapshot" {
+        let dex = &dex_contexts[0].instruction;
+        let family = if dex.program_id == raydium_program {
+            "RAYDIUM_CLMM"
+        } else if dex.program_id == meteora_program {
+            "METEORA_DLMM"
+        } else {
+            "PUMPSWAP"
+        };
+        let approved_families = if policy.approved_dex_families.is_empty() {
+            vec![policy.approved_dex_family.as_str()]
+        } else {
+            policy.approved_dex_families.iter().map(String::as_str).collect()
+        };
+        if !approved_families.contains(&family)
+            || (policy.route_policy == "exact_snapshot" && family != "RAYDIUM_CLMM")
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value route DEX family is not approved".to_string(),
+            ));
+        }
+        let mut tick_accounts_start = 0;
+        if family == "RAYDIUM_CLMM" {
             let approved_pools = policy
                 .approved_pool_accounts
                 .iter()
                 .map(|value| parse(value))
                 .collect::<Result<Vec<_>, _>>()?;
-            raydium.accounts.get(2).is_some_and(|account| approved_pools.contains(&account.pubkey))
+            let pool_is_approved = policy.route_policy != "exact_snapshot"
+                || dex
+                    .accounts
+                    .get(2)
+                    .is_some_and(|account| approved_pools.contains(&account.pubkey));
+            let token_2022_program = spl_token_2022_interface::id();
+            let memo_program =
+                Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+            tick_accounts_start = if dex.data.len() == 41
+                && dex.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
+                && (12..=13).contains(&dex.accounts.len())
+            {
+                9
+            } else if dex.data.len() == 41
+                && dex.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
+                && (16..=17).contains(&dex.accounts.len())
+                && dex.accounts[9].pubkey == token_2022_program
+                && dex.accounts[10].pubkey == memo_program
+                && dex.accounts[11].pubkey == mint
+                && dex.accounts[12].pubkey == native_mint
+            {
+                13
+            } else {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value Raydium CLMM instruction variant or account shape is invalid"
+                        .to_string(),
+                ));
+            };
+            if dex.accounts[0].pubkey != wallet
+                || dex.accounts[2].pubkey == self.fee_payer_pubkey
+                || dex.accounts[3].pubkey != source
+                || dex.accounts[4].pubkey != wrapped
+                || dex.accounts[8].pubkey != token_program
+                || !pool_is_approved
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value Raydium CLMM instruction shape is invalid".to_string(),
+                ));
+            }
+        } else if family == "METEORA_DLMM" {
+            if dex.accounts.get(4).map(|account| account.pubkey) != Some(source)
+                || dex.accounts.get(5).map(|account| account.pubkey) != Some(wrapped)
+                || ![
+                    dex.accounts.get(6).map(|account| account.pubkey),
+                    dex.accounts.get(7).map(|account| account.pubkey),
+                ]
+                .contains(&Some(mint))
+                || ![
+                    dex.accounts.get(6).map(|account| account.pubkey),
+                    dex.accounts.get(7).map(|account| account.pubkey),
+                ]
+                .contains(&Some(native_mint))
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value Meteora DLMM direction is invalid".to_string(),
+                ));
+            }
         } else {
-            true
-        };
-        let token_2022_program = spl_token_2022_interface::id();
-        let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-            .map_err(|_| KoraError::ConfigError)?;
-        let tick_accounts_start = if raydium.data.len() == 41
-            && raydium.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
-            && (12..=13).contains(&raydium.accounts.len())
-        {
-            9
-        } else if raydium.data.len() == 41
-            && raydium.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
-            && (16..=17).contains(&raydium.accounts.len())
-            && raydium.accounts[9].pubkey == token_2022_program
-            && raydium.accounts[10].pubkey == memo_program
-            && raydium.accounts[11].pubkey == mint
-            && raydium.accounts[12].pubkey == native_mint
-        {
-            13
-        } else {
-            return Err(KoraError::InvalidTransaction(
-                "Recover Value Raydium CLMM instruction variant or account shape is invalid"
-                    .to_string(),
-            ));
-        };
-        if raydium.accounts[0].pubkey != wallet
-            || raydium.accounts[2].pubkey == self.fee_payer_pubkey
-            || raydium.accounts[3].pubkey != source
-            || raydium.accounts[4].pubkey != wrapped
-            || raydium.accounts[8].pubkey != token_program
-            || !pool_is_approved
-        {
-            return Err(KoraError::InvalidTransaction(
-                "Recover Value Raydium CLMM instruction shape is invalid".to_string(),
-            ));
+            let is_sell = dex.data.get(..8) == Some(PUMPSWAP_SELL_DISCRIMINATOR.as_slice());
+            let (source_index, output_index, input_mint_index, output_mint_index) =
+                if is_sell { (5, 6, 3, 4) } else { (6, 5, 4, 3) };
+            if dex.accounts.get(source_index).map(|account| account.pubkey) != Some(source)
+                || dex.accounts.get(output_index).map(|account| account.pubkey) != Some(wrapped)
+                || dex.accounts.get(input_mint_index).map(|account| account.pubkey) != Some(mint)
+                || dex.accounts.get(output_mint_index).map(|account| account.pubkey)
+                    != Some(native_mint)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Recover Value PumpSwap direction is invalid".to_string(),
+                ));
+            }
         }
         let auxiliary_accounts = policy
             .allowed_jupiter_auxiliary_accounts
@@ -1015,16 +1099,16 @@ impl TransactionValidator {
             token_program,
             SYSTEM_PROGRAM_ID,
             jupiter_program,
-            raydium_program,
+            dex.program_id,
         ]);
         allowed_jupiter_accounts.extend(auxiliary_accounts);
-        allowed_jupiter_accounts.extend(raydium.accounts.iter().map(|account| account.pubkey));
+        allowed_jupiter_accounts.extend(dex.accounts.iter().map(|account| account.pubkey));
         if outer[jupiter_index].accounts.iter().any(|account| {
             !allowed_jupiter_accounts.contains(&account.pubkey)
                 || (account.is_signer
                     && account.pubkey != wallet
                     && account.pubkey != self.fee_payer_pubkey)
-        }) || raydium.accounts.iter().any(|account| {
+        }) || dex.accounts.iter().any(|account| {
             !outer[jupiter_index]
                 .accounts
                 .iter()
@@ -1048,27 +1132,34 @@ impl TransactionValidator {
             ));
         }
         let mut account_addresses = vec![source, mint, wrapped];
-        account_addresses.extend(
-            [1_usize, 2, 5, 6, 7]
-                .into_iter()
-                .chain(tick_accounts_start..raydium.accounts.len())
-                .map(|index| raydium.accounts[index].pubkey),
-        );
+        if family == "RAYDIUM_CLMM" {
+            account_addresses.extend(
+                [1_usize, 2, 5, 6, 7]
+                    .into_iter()
+                    .chain(tick_accounts_start..dex.accounts.len())
+                    .map(|index| dex.accounts[index].pubkey),
+            );
+        }
         let accounts = rpc_client.get_multiple_accounts(&account_addresses).await?;
         if accounts.len() != account_addresses.len() {
             return Err(KoraError::InvalidTransaction(
-                "Recover Value Raydium CLMM account state is incomplete".to_string(),
+                "Recover Value account state is incomplete".to_string(),
             ));
         }
-        self.validate_recover_route(
-            raydium,
-            &accounts[3..],
-            raydium_program,
-            token_program,
-            mint,
-            native_mint,
-            tick_accounts_start,
-        )?;
+        match family {
+            "RAYDIUM_CLMM" => self.validate_recover_route(
+                dex,
+                &accounts[3..],
+                raydium_program,
+                token_program,
+                mint,
+                native_mint,
+                tick_accounts_start,
+            )?,
+            "METEORA_DLMM" => self.validate_meteora_dlmm(dex, rpc_client, wallet).await?,
+            "PUMPSWAP" => self.validate_pumpswap(dex, rpc_client, wallet).await?,
+            _ => return Err(KoraError::ConfigError),
+        }
         let source_account = accounts[0].as_ref().ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value source is missing".to_string())
         })?;
@@ -1099,7 +1190,8 @@ impl TransactionValidator {
         })?;
         if mint_account.owner != token_program
             || mint_account.data.len() != 82
-            || mint_account.data[44] != policy.decimals
+            || (!dynamic_mints && mint_account.data[44] != policy.decimals)
+            || (dynamic_mints && (mint_account.data[44] == 0 || mint_account.data[44] > 9))
             || mint_account.data[45] != 1
         {
             return Err(KoraError::InvalidTransaction(
@@ -3264,6 +3356,7 @@ mod tests {
             enabled: true,
             route_policy: "semantic_family".to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
+            approved_dex_families: vec![],
             allowed_users: vec![crate::config::RecoverUserPolicy {
                 wallet: wallet.to_string(),
                 source_account: source.to_string(),
@@ -3271,6 +3364,7 @@ mod tests {
             }],
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
+            allowed_input_mints: vec![],
             decimals: 6,
             swap_fee_bps: 30,
             rent_fee_bps: 300,
