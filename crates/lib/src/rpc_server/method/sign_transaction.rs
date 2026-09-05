@@ -71,7 +71,7 @@ pub async fn sign_transaction(
         request.relay_authorization.as_ref(),
     )?;
     if let Some(claims) = &resolved_transaction.relay_authorization_claims {
-        consume_relay_authorization(claims)?;
+        consume_relay_authorization(claims).await?;
     }
 
     let (signed_transaction, _) =

@@ -4,16 +4,14 @@ use crate::{
     transaction::{RelayAuthorizationClaims, VersionedTransactionResolved},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use once_cell::sync::Lazy;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solana_message::VersionedMessage;
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey, signature::Signature};
 use std::{
-    collections::HashMap,
     str::FromStr,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use utoipa::ToSchema;
 
@@ -25,7 +23,8 @@ const CLOCK_SKEW_SECONDS: u64 = 30;
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-static USED_NONCES: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+const REPLAY_URL_ENV: &str = "KORA_RELAY_REDIS_REST_URL";
+const REPLAY_TOKEN_ENV: &str = "KORA_RELAY_REDIS_REST_TOKEN";
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RelayAuthorization {
@@ -204,14 +203,97 @@ fn validate_claims(
     Ok(())
 }
 
-pub fn consume_relay_authorization(claims: &RelayAuthorizationClaims) -> Result<(), KoraError> {
-    let now =
-        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| KoraError::ConfigError)?.as_secs();
-    let mut used = USED_NONCES.lock().map_err(|_| {
-        KoraError::InternalServerError("Relay authorization replay lock failed".to_string())
-    })?;
-    used.retain(|_, expires_at| *expires_at > now);
-    if used.insert(claims.nonce.clone(), claims.expires_at_unix_seconds).is_some() {
+trait RelayReplayStore {
+    async fn consume(&self, key: &str, ttl_seconds: u64) -> Result<bool, KoraError>;
+}
+
+struct UpstashRelayReplayStore {
+    url: String,
+    token: String,
+    client: Client,
+}
+
+impl UpstashRelayReplayStore {
+    fn from_env() -> Result<Self, KoraError> {
+        let url = std::env::var(REPLAY_URL_ENV).map_err(|_| KoraError::ConfigError)?;
+        let token = std::env::var(REPLAY_TOKEN_ENV).map_err(|_| KoraError::ConfigError)?;
+        if token.is_empty()
+            || Url::parse(&url).map_err(|_| KoraError::ConfigError)?.scheme() != "https"
+        {
+            return Err(KoraError::ConfigError);
+        }
+        Ok(Self { url, token, client: Client::new() })
+    }
+
+    #[cfg(test)]
+    fn for_test(url: String, token: String) -> Self {
+        Self { url, token, client: Client::new() }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpstashResponse {
+    result: Option<String>,
+    error: Option<String>,
+}
+
+impl RelayReplayStore for UpstashRelayReplayStore {
+    async fn consume(&self, key: &str, ttl_seconds: u64) -> Result<bool, KoraError> {
+        let response = self
+            .client
+            .post(&self.url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!(["SET", key, "consumed", "NX", "EX", ttl_seconds]))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                KoraError::InternalServerError(
+                    "Relay authorization replay store is unavailable".to_string(),
+                )
+            })?;
+        let status = response.status();
+        let body = response.json::<UpstashResponse>().await.map_err(|_| {
+            KoraError::InternalServerError(
+                "Relay authorization replay store returned an invalid response".to_string(),
+            )
+        })?;
+        if !status.is_success() || body.error.is_some() {
+            return Err(KoraError::InternalServerError(
+                "Relay authorization replay store rejected the request".to_string(),
+            ));
+        }
+        Ok(body.result.as_deref() == Some("OK"))
+    }
+}
+
+fn replay_key_and_ttl(
+    claims: &RelayAuthorizationClaims,
+    now: u64,
+) -> Result<(String, u64), KoraError> {
+    let ttl =
+        claims.expires_at_unix_seconds.checked_sub(now).filter(|value| *value > 0).ok_or_else(
+            || KoraError::InvalidTransaction("Relay authorization is expired".to_string()),
+        )?;
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        claims.schema_version,
+        claims.network,
+        claims.nonce,
+        claims.message_hash,
+        claims.relay_request_id,
+        claims.quote_id
+    );
+    Ok((format!("gasless:kora:relay-authorization:{}", hex::encode(Sha256::digest(identity))), ttl))
+}
+
+async fn consume_with_store<S: RelayReplayStore>(
+    claims: &RelayAuthorizationClaims,
+    store: &S,
+    now: u64,
+) -> Result<(), KoraError> {
+    let (key, ttl) = replay_key_and_ttl(claims, now)?;
+    if !store.consume(&key, ttl).await? {
         return Err(KoraError::InvalidTransaction(
             "Relay authorization was already used".to_string(),
         ));
@@ -219,10 +301,19 @@ pub fn consume_relay_authorization(claims: &RelayAuthorizationClaims) -> Result<
     Ok(())
 }
 
+pub async fn consume_relay_authorization(
+    claims: &RelayAuthorizationClaims,
+) -> Result<(), KoraError> {
+    let now =
+        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| KoraError::ConfigError)?.as_secs();
+    consume_with_store(claims, &UpstashRelayReplayStore::from_env()?, now).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use mockito::{Matcher, Server};
     use solana_message::{
         compiled_instruction::CompiledInstruction,
         v0::{Message, MessageAddressTableLookup},
@@ -233,6 +324,28 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::VersionedTransaction,
     };
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone, Default)]
+    struct MemoryReplayStore {
+        values: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl RelayReplayStore for MemoryReplayStore {
+        async fn consume(&self, key: &str, ttl_seconds: u64) -> Result<bool, KoraError> {
+            let mut values = self.values.lock().map_err(|_| {
+                KoraError::InternalServerError("test replay lock failed".to_string())
+            })?;
+            if values.contains_key(key) {
+                return Ok(false);
+            }
+            values.insert(key.to_string(), ttl_seconds);
+            Ok(true)
+        }
+    }
 
     struct Fixture {
         authority: Keypair,
@@ -395,8 +508,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn authorization_rejects_expiry_wrong_scope_and_replay() {
+    #[tokio::test]
+    async fn authorization_rejects_expiry_wrong_scope_and_replay() {
         let fixture = fixture(false);
         let expired =
             authorize(&fixture, Pubkey::new_unique().to_string(), now().saturating_sub(120));
@@ -429,8 +542,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(consume_relay_authorization(&claims).is_ok());
-        assert!(consume_relay_authorization(&claims).is_err());
+        let store = MemoryReplayStore::default();
+        assert!(consume_with_store(&claims, &store, now()).await.is_ok());
+        assert!(consume_with_store(&claims, &store, now()).await.is_err());
 
         let non_relay = fixture.transaction.clone();
         let mut policy = fixture.policy.clone();
@@ -442,5 +556,61 @@ mod tests {
             Some(&authorization),
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_replay_store_is_atomic_shared_and_expiry_bounded() {
+        let fixture = fixture(false);
+        let first = validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            Some(&authorize(&fixture, "first".to_string(), now())),
+        )
+        .unwrap()
+        .unwrap();
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        let instance_a = MemoryReplayStore { values: shared.clone() };
+        let instance_b = MemoryReplayStore { values: shared };
+        let attempts = futures::future::join_all((0..16).map(|index| {
+            let store = if index % 2 == 0 { instance_a.clone() } else { instance_b.clone() };
+            let claims = first.clone();
+            async move { consume_with_store(&claims, &store, now()).await.is_ok() }
+        }))
+        .await;
+        assert_eq!(attempts.into_iter().filter(|accepted| *accepted).count(), 1);
+
+        let different = validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            Some(&authorize(&fixture, "different".to_string(), now())),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(consume_with_store(&different, &instance_b, now()).await.is_ok());
+        assert!(consume_with_store(&different, &instance_a, different.expires_at_unix_seconds)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn upstash_replay_store_uses_set_nx_ex() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer test-token")
+            .match_body(Matcher::Regex(
+                r#"\["SET","gasless:kora:relay-authorization:[0-9a-f]+","consumed","NX","EX",60\]"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"result":"OK"}"#)
+            .create_async()
+            .await;
+        let store = UpstashRelayReplayStore::for_test(server.url(), "test-token".to_string());
+        assert!(store.consume("gasless:kora:relay-authorization:abcd", 60).await.unwrap());
+        mock.assert_async().await;
     }
 }
