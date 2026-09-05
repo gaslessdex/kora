@@ -689,6 +689,34 @@ impl ConfigValidator {
             }
         }
 
+        let relay = &config.validation.fee_payer_policy.system.relay;
+        if relay.enabled {
+            if Pubkey::from_str(&relay.authorization_public_key).is_err() {
+                errors.push("Invalid Relay authorization_public_key".to_string());
+            }
+            if relay.authorization_network != "mainnet-beta" {
+                errors.push("Relay authorization_network must be mainnet-beta".to_string());
+            }
+            if relay.authorization_max_lifetime_seconds == 0
+                || relay.authorization_max_lifetime_seconds > 300
+            {
+                errors.push(
+                    "Relay authorization_max_lifetime_seconds must be between 1 and 300"
+                        .to_string(),
+                );
+            }
+            if config
+                .validation
+                .allowed_programs
+                .contains(&"99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2".to_string())
+            {
+                errors.push(
+                    "Relay program must not be present in the global allowed_programs list"
+                        .to_string(),
+                );
+            }
+        }
+
         // Validate Token2022 extensions
         if let Err(e) = validate_token2022_extensions(&config.validation.token_2022) {
             errors.push(format!("Token2022 extension validation failed: {e}"));
@@ -2112,6 +2140,7 @@ mod tests {
                         swap: Default::default(),
                         clean: Default::default(),
                         recover: Default::default(),
+                        relay: Default::default(),
                         send: Default::default(),
                         allow_transfer: true,
                         allow_assign: true,

@@ -579,6 +579,7 @@ impl FeePayerPolicyBuilder {
                     swap: Default::default(),
                     clean: Default::default(),
                     recover: Default::default(),
+                    relay: Default::default(),
                     send: Default::default(),
                     allow_transfer: false,
                     allow_assign: false,

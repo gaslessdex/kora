@@ -1,4 +1,4 @@
-use super::recover_authorization::RecoverAuthorizationClaims;
+use super::{recover_authorization::RecoverAuthorizationClaims, RelayAuthorizationClaims};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSimulateTransactionConfig};
@@ -30,6 +30,7 @@ use solana_address_lookup_table_interface::state::AddressLookupTable;
 pub struct VersionedTransactionResolved {
     pub transaction: VersionedTransaction,
     pub recover_authorization_claims: Option<RecoverAuthorizationClaims>,
+    pub relay_authorization_claims: Option<RelayAuthorizationClaims>,
 
     // Includes lookup table addresses
     pub all_account_keys: Vec<Pubkey>,
@@ -90,6 +91,7 @@ impl VersionedTransactionResolved {
         let mut resolved = Self {
             transaction: transaction.clone(),
             recover_authorization_claims: None,
+            relay_authorization_claims: None,
             all_account_keys: vec![],
             all_instructions: vec![],
             inner_instruction_contexts: vec![],
@@ -143,6 +145,7 @@ impl VersionedTransactionResolved {
         Ok(Self {
             transaction: transaction.clone(),
             recover_authorization_claims: None,
+            relay_authorization_claims: None,
             all_account_keys: transaction.message.static_account_keys().to_vec(),
             all_instructions: Self::uncompile_with_message_privileges(
                 transaction.message.instructions(),
@@ -355,6 +358,15 @@ impl VersionedTransactionOps for VersionedTransactionResolved {
         // Validate transaction fee using resolved transaction
         let estimated_fee = TransactionFeeUtil::get_estimate_fee_resolved(rpc_client, self).await?;
         validator.validate_lamport_fee(estimated_fee)?;
+        if self
+            .relay_authorization_claims
+            .as_ref()
+            .is_some_and(|claims| estimated_fee > claims.max_sponsor_lamports)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Relay transaction fee exceeds its authorized sponsor maximum".to_string(),
+            ));
+        }
 
         // Sign transaction
         let message_bytes = transaction.message.serialize();

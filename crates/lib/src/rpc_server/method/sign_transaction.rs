@@ -1,6 +1,11 @@
 use crate::{
     rpc_server::{
-        method::recover_authorization::{validate_recover_authorization, RecoverAuthorization},
+        method::{
+            recover_authorization::{validate_recover_authorization, RecoverAuthorization},
+            relay_authorization::{
+                consume_relay_authorization, validate_relay_authorization, RelayAuthorization,
+            },
+        },
         middleware_utils::default_sig_verify,
     },
     state::{get_config, get_request_signer_with_signer_key},
@@ -25,6 +30,8 @@ pub struct SignTransactionRequest {
     pub sig_verify: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recover_authorization: Option<RecoverAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_authorization: Option<RelayAuthorization>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -57,6 +64,15 @@ pub async fn sign_transaction(
         &get_config()?.validation.fee_payer_policy.system.recover,
         request.recover_authorization.as_ref(),
     )?;
+    resolved_transaction.relay_authorization_claims = validate_relay_authorization(
+        &resolved_transaction,
+        &signer.pubkey(),
+        &get_config()?.validation.fee_payer_policy.system.relay,
+        request.relay_authorization.as_ref(),
+    )?;
+    if let Some(claims) = &resolved_transaction.relay_authorization_claims {
+        consume_relay_authorization(claims)?;
+    }
 
     let (signed_transaction, _) =
         resolved_transaction.sign_transaction(&signer, rpc_client).await?;
@@ -92,6 +108,7 @@ mod tests {
             signer_key: None,
             sig_verify: true,
             recover_authorization: None,
+            relay_authorization: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;
@@ -113,6 +130,7 @@ mod tests {
             signer_key: Some("invalid_pubkey".to_string()),
             sig_verify: true,
             recover_authorization: None,
+            relay_authorization: None,
         };
 
         let result = sign_transaction(&rpc_client, request).await;

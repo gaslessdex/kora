@@ -28,6 +28,7 @@ const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const PHANTOM_LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+const RELAY_PROGRAM_ID: &str = "99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2";
 const MAX_LIGHTHOUSE_ASSERTIONS: usize = 4;
 const MAX_LIGHTHOUSE_DATA_BYTES: usize = 256;
 // This validator intentionally supports Raydium's legacy SPL-token-only `swap`
@@ -334,8 +335,11 @@ impl TransactionValidator {
         transaction_resolved: &VersionedTransactionResolved,
     ) -> Result<(), KoraError> {
         let lighthouse = Self::lighthouse_program()?;
+        let relay = Pubkey::from_str(RELAY_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         for instruction in &transaction_resolved.all_instructions {
             if instruction.program_id != lighthouse
+                && !(transaction_resolved.relay_authorization_claims.is_some()
+                    && instruction.program_id == relay)
                 && !self.allowed_programs.contains(&instruction.program_id)
             {
                 return Err(KoraError::InvalidTransaction(format!(

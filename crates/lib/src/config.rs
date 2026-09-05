@@ -171,9 +171,27 @@ pub struct SystemInstructionPolicy {
     /// GASLESS-only policy for one exact full-balance Recover Value route.
     #[serde(default)]
     pub recover: RecoverPolicy,
+    /// GASLESS-only authorization for exact Relay cross-chain deposits.
+    #[serde(default)]
+    pub relay: RelayPolicy,
     /// Nested policy for nonce account operations
     #[serde(default)]
     pub nonce: NonceInstructionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct RelayPolicy {
+    pub enabled: bool,
+    #[serde(default)]
+    pub authorization_public_key: String,
+    #[serde(default)]
+    pub authorization_network: String,
+    #[serde(default = "default_relay_authorization_max_lifetime_seconds")]
+    pub authorization_max_lifetime_seconds: u64,
+}
+
+fn default_relay_authorization_max_lifetime_seconds() -> u64 {
+    90
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
