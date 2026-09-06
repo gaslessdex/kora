@@ -24,6 +24,25 @@ const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+fn valid_raydium_tick_array_sequence(starts: &[i32], current_start: i32, interval: i32) -> bool {
+    if !(2..=3).contains(&starts.len()) || interval <= 0 {
+        return false;
+    }
+    let Some(first_delta) = starts[1].checked_sub(starts[0]) else { return false };
+    if first_delta == 0 || first_delta % interval != 0 {
+        return false;
+    }
+    let direction = first_delta.signum();
+    if direction > 0 && starts[0] < current_start || direction < 0 && starts[0] > current_start {
+        return false;
+    }
+    starts.windows(2).all(|pair| {
+        pair[1]
+            .checked_sub(pair[0])
+            .is_some_and(|delta| delta != 0 && delta.signum() == direction && delta % interval == 0)
+    })
+}
 const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
@@ -1508,9 +1527,7 @@ impl TransactionValidator {
             }
         }
         if bitmap_count != 1
-            || !(2..=3).contains(&starts.len())
-            || starts.first().is_none_or(|start| *start < expected_current_start)
-            || starts.windows(2).any(|pair| pair[1] <= pair[0])
+            || !valid_raydium_tick_array_sequence(&starts, expected_current_start, interval)
         {
             return Err(invalid());
         }
@@ -2872,6 +2889,17 @@ mod tests {
         program::ID as SYSTEM_PROGRAM_ID,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn raydium_tick_arrays_must_start_at_current_range_and_be_consecutive_in_one_direction() {
+        assert!(valid_raydium_tick_array_sequence(&[-600, 0, 600], -600, 600));
+        assert!(valid_raydium_tick_array_sequence(&[-600, -1200, -1800], -600, 600));
+        assert!(valid_raydium_tick_array_sequence(&[-600, 600], -600, 600));
+        assert!(valid_raydium_tick_array_sequence(&[0, 600], -600, 600));
+        assert!(!valid_raydium_tick_array_sequence(&[0, -600], -600, 600));
+        assert!(!valid_raydium_tick_array_sequence(&[-600, 1], -600, 600));
+        assert!(!valid_raydium_tick_array_sequence(&[-600, 0, -1200], -600, 600));
+    }
 
     // Helper functions to reduce test duplication and setup config
     fn setup_default_config() {
