@@ -1587,6 +1587,22 @@ impl TransactionValidator {
         Ok(rent)
     }
 
+    fn swap_user_signer(
+        &self,
+        transaction: &VersionedTransactionResolved,
+    ) -> Result<Pubkey, KoraError> {
+        let signer_keys = transaction.transaction.message.static_account_keys();
+        if transaction.transaction.message.header().num_required_signatures != 2
+            || transaction.transaction.message.header().num_readonly_signed_accounts > 1
+            || signer_keys.first() != Some(&self.fee_payer_pubkey)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Swap requires exactly the configured payer and one user signer".to_string(),
+            ));
+        }
+        Ok(signer_keys[1])
+    }
+
     async fn validate_swap_route(
         &self,
         transaction: &VersionedTransactionResolved,
@@ -1602,16 +1618,7 @@ impl TransactionValidator {
         let meteora = parse(METEORA_DLMM_PROGRAM_ID)?;
         let pumpswap = parse(PUMPSWAP_PROGRAM_ID)?;
         let dex_programs = [raydium, meteora, pumpswap];
-        let signer_keys = transaction.transaction.message.static_account_keys();
-        if transaction.transaction.message.header().num_required_signatures != 2
-            || transaction.transaction.message.header().num_readonly_signed_accounts != 0
-            || signer_keys.first() != Some(&self.fee_payer_pubkey)
-        {
-            return Err(KoraError::InvalidTransaction(
-                "Swap requires exactly the configured payer and one user signer".to_string(),
-            ));
-        }
-        let wallet = signer_keys[1];
+        let wallet = self.swap_user_signer(transaction)?;
         let outer = self.economic_outer(transaction)?;
         let compute_program = solana_compute_budget_interface::id();
         let expected_limit =
@@ -6275,8 +6282,16 @@ mod tests {
         payer: Pubkey,
         wallet: Pubkey,
         dex: Instruction,
+        readonly_wallet: bool,
     ) -> VersionedTransactionResolved {
         let mut route_accounts = dex.accounts.clone();
+        if readonly_wallet {
+            for account in &mut route_accounts {
+                if account.pubkey == wallet {
+                    account.is_writable = false;
+                }
+            }
+        }
         if !route_accounts.iter().any(|meta| meta.pubkey == dex.program_id) {
             route_accounts.push(AccountMeta::new_readonly(dex.program_id, false));
         }
@@ -6305,13 +6320,18 @@ mod tests {
     async fn swap_route_dispatch_accepts_one_approved_family_and_rejects_mixed_direct_legs() {
         let (validator, meteora, rpc) = meteora_semantic_fixture(false, false, false);
         let wallet = meteora.accounts[10].pubkey;
-        let transaction = swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora);
+        let transaction =
+            swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora.clone(), false);
         assert!(validator.validate_swap_route(&transaction, &rpc).await.is_ok());
+
+        let transaction = swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora, true);
+        assert_eq!(transaction.transaction.message.header().num_readonly_signed_accounts, 1);
+        assert_eq!(validator.swap_user_signer(&transaction).unwrap(), wallet);
 
         let (validator, pumpswap, rpc) = pumpswap_sell_semantic_fixture(false, false, false);
         let wallet = pumpswap.accounts[1].pubkey;
         let mut transaction =
-            swap_route_transaction(validator.fee_payer_pubkey, wallet, pumpswap.clone());
+            swap_route_transaction(validator.fee_payer_pubkey, wallet, pumpswap.clone(), false);
         let mut foreign = pumpswap;
         foreign.program_id = Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).unwrap();
         transaction.all_instructions.push(foreign.clone());
