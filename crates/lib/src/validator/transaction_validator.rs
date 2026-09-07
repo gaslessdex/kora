@@ -240,6 +240,40 @@ fn valid_xstock_token_account(
     authority: Option<Pubkey>,
     expected_size: usize,
 ) -> bool {
+    valid_xstock_token_account_with_extensions(
+        account,
+        mint,
+        authority,
+        expected_size,
+        &[
+            ExtensionType::ImmutableOwner,
+            ExtensionType::TransferHookAccount,
+            ExtensionType::PausableAccount,
+        ],
+    )
+}
+
+fn valid_xstock_program_vault(account: &Account, mint: Pubkey, authority: Pubkey) -> bool {
+    // Current Raydium and Meteora xStock vaults are program-derived Token-2022 accounts,
+    // not ATAs. Their live 175-byte profile has PausableAccount and TransferHookAccount
+    // but intentionally lacks ATA-only ImmutableOwner. PDA/authority relationships are
+    // validated separately by each venue-specific validator.
+    valid_xstock_token_account_with_extensions(
+        account,
+        mint,
+        Some(authority),
+        175,
+        &[ExtensionType::TransferHookAccount, ExtensionType::PausableAccount],
+    )
+}
+
+fn valid_xstock_token_account_with_extensions(
+    account: &Account,
+    mint: Pubkey,
+    authority: Option<Pubkey>,
+    expected_size: usize,
+    required: &[ExtensionType],
+) -> bool {
     if account.owner != TOKEN_2022_PROGRAM_ID || account.data.len() != expected_size {
         return false;
     }
@@ -249,11 +283,6 @@ fn valid_xstock_token_account(
     let Ok(types) = state.get_extension_types() else {
         return false;
     };
-    let required = [
-        ExtensionType::ImmutableOwner,
-        ExtensionType::TransferHookAccount,
-        ExtensionType::PausableAccount,
-    ];
     state.base.mint == mint
         && authority.map(|owner| state.base.owner == owner).unwrap_or(true)
         && state.base.state == spl_token_2022_interface::state::AccountState::Initialized
@@ -1651,12 +1680,7 @@ impl TransactionValidator {
                     && vault.data[32..64] == instruction.accounts[2].pubkey.to_bytes()
                     && vault.data[108] == 1
             } else {
-                valid_xstock_token_account(
-                    vault,
-                    expected_mint,
-                    Some(instruction.accounts[2].pubkey),
-                    179,
-                )
+                valid_xstock_program_vault(vault, expected_mint, instruction.accounts[2].pubkey)
             };
             if !valid {
                 return Err(invalid());
@@ -2261,12 +2285,7 @@ impl TransactionValidator {
                         instruction.accounts[0].pubkey,
                     )
                 } else {
-                    !valid_xstock_token_account(
-                        vault,
-                        mint,
-                        Some(instruction.accounts[0].pubkey),
-                        179,
-                    )
+                    !valid_xstock_program_vault(vault, mint, instruction.accounts[0].pubkey)
                 }
             {
                 return Err(invalid());
@@ -6552,6 +6571,18 @@ mod tests {
         data
     }
 
+    fn xstock_program_vault_data(mint: Pubkey, authority: Pubkey) -> Vec<u8> {
+        // Sanitized live STRCx Raydium vault captured on mainnet on 2026-09-07.
+        // Program vaults have the 175-byte PausableAccount + TransferHookAccount
+        // profile and do not carry the ATA-only ImmutableOwner extension.
+        let mut data = base64::engine::general_purpose::STANDARD
+            .decode("B+gUMR5zExL9UIO0lwh3ituxS62Sx+R5eV0ZK5sHHPy5QK+B3tDdt6omLGZ/OQNzscJ96tIlHx64oLFh5YrSe5986WYXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhsAAAAPAAEAAA==")
+            .unwrap();
+        data[..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(authority.as_ref());
+        data
+    }
+
     fn raydium_current_semantic_fixture(
     ) -> (TransactionValidator, Instruction, Vec<Option<Account>>, Pubkey, Pubkey, Pubkey, Pubkey)
     {
@@ -6752,6 +6783,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn swap_raydium_accepts_only_the_live_xstock_program_vault_profile() {
+        let (validator, instruction, mut accounts, _, input_mint, output_mint, token_program) =
+            raydium_current_semantic_fixture();
+        let program = instruction.program_id;
+        let pool = instruction.accounts[2].pubkey;
+        accounts[2] = Some(Account {
+            lamports: 1,
+            data: xstock_program_vault_data(input_mint, pool),
+            owner: TOKEN_2022_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        });
+        let validate = |accounts: &[Option<Account>]| {
+            validator.validate_raydium_clmm_accounts(
+                &instruction,
+                accounts,
+                program,
+                TOKEN_2022_PROGRAM_ID,
+                token_program,
+                input_mint,
+                output_mint,
+                6,
+                6,
+                9,
+                "fixture invalid",
+            )
+        };
+        assert!(validate(&accounts).is_ok());
+
+        let mut ata_profile = accounts.clone();
+        let data = base64::engine::general_purpose::STANDARD
+            .decode("B+gUMR5zExL9UIO0lwh3ituxS62Sx+R5eV0ZK5sHHPwGb1kiUcxHdHglpZrRQi6kNXP1KNpd7ir3gSsxT5lF4+DZymqOIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAAbAAAADwABAAA=")
+            .unwrap();
+        let vault = ata_profile[2].as_mut().unwrap();
+        vault.data = data;
+        vault.data[..32].copy_from_slice(input_mint.as_ref());
+        vault.data[32..64].copy_from_slice(pool.as_ref());
+        assert!(validate(&ata_profile).is_err());
+
+        let mut delegated = accounts.clone();
+        delegated[2].as_mut().unwrap().data[72..76].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(validate(&delegated).is_err());
+    }
+
+    #[test]
+    #[serial]
     fn swap_raydium_current_shape_rejects_wrong_user_payer_and_instruction_data() {
         let (validator, instruction, _, wallet, _, _, token_program) =
             raydium_current_semantic_fixture();
@@ -6802,12 +6879,14 @@ mod tests {
         corrupt_pair_owner: bool,
         missing_destination: bool,
         without_memo: bool,
+        xstock_input: bool,
     ) -> (TransactionValidator, Instruction, std::sync::Arc<RpcClient>) {
         let payer = Pubkey::new_unique();
         let wallet = Pubkey::new_unique();
         let mint_x = Pubkey::new_unique();
         let mint_y = Pubkey::new_unique();
         let token_program = spl_token_interface::id();
+        let token_program_x = if xstock_input { TOKEN_2022_PROGRAM_ID } else { token_program };
         let program = Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).unwrap();
         let base_key = Pubkey::new_unique();
         let mut ordered = [mint_x, mint_y];
@@ -6819,7 +6898,7 @@ mod tests {
         .0;
         let vault_x = Pubkey::find_program_address(&[pair.as_ref(), mint_x.as_ref()], &program).0;
         let vault_y = Pubkey::find_program_address(&[pair.as_ref(), mint_y.as_ref()], &program).0;
-        let user_x = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint_x, &token_program);
+        let user_x = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint_x, &token_program_x);
         let user_y = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint_y, &token_program);
         let oracle = Pubkey::find_program_address(&[b"oracle", pair.as_ref()], &program).0;
         let bins = [0_i64, 1_i64].map(|index| {
@@ -6841,7 +6920,7 @@ mod tests {
             AccountMeta::new(oracle, false),
             AccountMeta::new(program, false),
             AccountMeta::new(wallet, true),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program_x, false),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(), false),
             AccountMeta::new_readonly(
@@ -6880,15 +6959,27 @@ mod tests {
         let mut values = vec![
             rpc_account(pair_data, if corrupt_pair_owner { SYSTEM_PROGRAM_ID } else { program }),
             filler.clone(),
-            rpc_account(legacy_token_data(mint_x, pair), token_program),
+            if xstock_input {
+                rpc_account(xstock_program_vault_data(mint_x, pair), TOKEN_2022_PROGRAM_ID)
+            } else {
+                rpc_account(legacy_token_data(mint_x, pair), token_program)
+            },
             rpc_account(legacy_token_data(mint_y, pair), token_program),
-            rpc_account(legacy_token_data(mint_x, wallet), token_program),
+            if xstock_input {
+                xstock_token_account_json(&mint_x, &wallet, 1_000_000)
+            } else {
+                rpc_account(legacy_token_data(mint_x, wallet), token_program)
+            },
             if missing_destination {
                 serde_json::Value::Null
             } else {
                 rpc_account(legacy_token_data(mint_y, wallet), token_program)
             },
-            rpc_account(legacy_mint_data(6), token_program),
+            if xstock_input {
+                xstock_mint_json()
+            } else {
+                rpc_account(legacy_mint_data(6), token_program)
+            },
             rpc_account(legacy_mint_data(9), token_program),
             rpc_account(oracle_data, program),
             filler.clone(),
@@ -6924,10 +7015,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn swap_meteora_semantics_accept_exact_shape_and_reject_role_or_state_mutation() {
-        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, false);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, false, false);
         let wallet = instruction.accounts[10].pubkey;
         assert!(validator.validate_meteora_dlmm(&instruction, &rpc, wallet).await.is_ok());
-        let (validator, mut legacy_swap, rpc) = meteora_semantic_fixture(false, false, true);
+        let (validator, mut legacy_swap, rpc) = meteora_semantic_fixture(false, false, true, false);
         let wallet = legacy_swap.accounts[10].pubkey;
         legacy_swap.data[..8].copy_from_slice(&METEORA_SWAP_DISCRIMINATOR);
         legacy_swap.data[16..24].fill(0);
@@ -6944,21 +7035,27 @@ mod tests {
         let mut wrong_role = instruction.clone();
         wrong_role.accounts[8].is_writable = false;
         assert!(validator.validate_meteora_dlmm(&wrong_role, &rpc, wallet).await.is_err());
-        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, true);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, true, false);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
             .await
             .is_ok());
-        let (validator, instruction, rpc) = meteora_semantic_fixture(false, true, false);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, true, false, false);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
             .await
             .is_ok());
-        let (validator, instruction, rpc) = meteora_semantic_fixture(true, false, false);
+        let (validator, instruction, rpc) = meteora_semantic_fixture(true, false, false, false);
         assert!(validator
             .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
             .await
             .is_err());
+
+        let (validator, instruction, rpc) = meteora_semantic_fixture(false, false, false, true);
+        assert!(validator
+            .validate_meteora_dlmm(&instruction, &rpc, instruction.accounts[10].pubkey)
+            .await
+            .is_ok());
     }
 
     fn pumpswap_sell_semantic_fixture(
@@ -7170,7 +7267,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn swap_route_dispatch_accepts_one_approved_family_and_rejects_mixed_direct_legs() {
-        let (validator, meteora, rpc) = meteora_semantic_fixture(false, false, false);
+        let (validator, meteora, rpc) = meteora_semantic_fixture(false, false, false, false);
         let wallet = meteora.accounts[10].pubkey;
         let transaction =
             swap_route_transaction(validator.fee_payer_pubkey, wallet, meteora.clone(), false);
