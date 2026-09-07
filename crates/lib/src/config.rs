@@ -217,10 +217,36 @@ pub struct SendPolicy {
     pub approved_mints: Vec<SendMintPolicy>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SendMintPolicy {
     pub mint: String,
     pub decimals: u8,
+    #[serde(default = "default_send_token_program")]
+    pub token_program: String,
+    #[serde(default = "default_send_token_account_size")]
+    pub token_account_size: usize,
+    #[serde(default)]
+    pub require_unconfigured_transfer_hook: bool,
+}
+
+fn default_send_token_program() -> String {
+    spl_token_interface::id().to_string()
+}
+
+const fn default_send_token_account_size() -> usize {
+    165
+}
+
+impl Default for SendMintPolicy {
+    fn default() -> Self {
+        Self {
+            mint: String::new(),
+            decimals: 0,
+            token_program: default_send_token_program(),
+            token_account_size: default_send_token_account_size(),
+            require_unconfigured_transfer_hook: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

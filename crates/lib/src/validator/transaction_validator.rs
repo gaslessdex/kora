@@ -16,6 +16,14 @@ use solana_sdk::{
     account::Account, instruction::Instruction, pubkey::Pubkey, transaction::VersionedTransaction,
 };
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_PROGRAM_ID};
+use spl_token_2022_interface::{
+    extension::{
+        default_account_state::DefaultAccountState, pausable::PausableConfig,
+        transfer_hook::TransferHook, BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+    },
+    state::{Account as Token2022AccountState, Mint as Token2022MintState},
+    ID as TOKEN_2022_PROGRAM_ID,
+};
 use std::{collections::HashSet, str::FromStr};
 
 use crate::fee::price::PriceModel;
@@ -185,6 +193,103 @@ fn legacy_mint_decimals(account: &Account, token_program: Pubkey) -> Option<u8> 
         return None;
     }
     Some(account.data[44])
+}
+
+fn valid_xstock_mint(account: &Account, decimals: u8) -> bool {
+    if account.owner != TOKEN_2022_PROGRAM_ID {
+        return false;
+    }
+    let Ok(mint) = StateWithExtensions::<Token2022MintState>::unpack(&account.data) else {
+        return false;
+    };
+    let Ok(types) = mint.get_extension_types() else {
+        return false;
+    };
+    let required = [
+        ExtensionType::ConfidentialTransferMint,
+        ExtensionType::DefaultAccountState,
+        ExtensionType::PermanentDelegate,
+        ExtensionType::TransferHook,
+        ExtensionType::MetadataPointer,
+        ExtensionType::TokenMetadata,
+        ExtensionType::ScaledUiAmount,
+        ExtensionType::Pausable,
+    ];
+    let hook_unconfigured = mint
+        .get_extension::<TransferHook>()
+        .ok()
+        .is_some_and(|hook| Option::<Pubkey>::from(hook.program_id).is_none());
+    let initialized_by_default =
+        mint.get_extension::<DefaultAccountState>().ok().is_some_and(|state| state.state == 1);
+    let unpaused = mint
+        .get_extension::<PausableConfig>()
+        .ok()
+        .is_some_and(|config| !bool::from(config.paused));
+    mint.base.is_initialized
+        && mint.base.decimals == decimals
+        && types.len() == required.len()
+        && required.iter().all(|required_type| types.contains(required_type))
+        && hook_unconfigured
+        && initialized_by_default
+        && unpaused
+}
+
+fn valid_xstock_token_account(
+    account: &Account,
+    mint: Pubkey,
+    authority: Option<Pubkey>,
+    expected_size: usize,
+) -> bool {
+    if account.owner != TOKEN_2022_PROGRAM_ID || account.data.len() != expected_size {
+        return false;
+    }
+    let Ok(state) = StateWithExtensions::<Token2022AccountState>::unpack(&account.data) else {
+        return false;
+    };
+    let Ok(types) = state.get_extension_types() else {
+        return false;
+    };
+    let required = [
+        ExtensionType::ImmutableOwner,
+        ExtensionType::TransferHookAccount,
+        ExtensionType::PausableAccount,
+    ];
+    state.base.mint == mint
+        && authority.map(|owner| state.base.owner == owner).unwrap_or(true)
+        && state.base.state == spl_token_2022_interface::state::AccountState::Initialized
+        && state.base.delegate.is_none()
+        && state.base.delegated_amount == 0
+        && state.base.close_authority.is_none()
+        && state.base.is_native.is_none()
+        && types.len() == required.len()
+        && required.iter().all(|required_type| types.contains(required_type))
+}
+
+fn supported_token_account_identity(
+    account: &Account,
+    authority: Pubkey,
+) -> Option<(Pubkey, Pubkey)> {
+    if account.owner == spl_token_interface::id() {
+        return token_account_mint(account, account.owner, authority)
+            .map(|mint| (mint, account.owner));
+    }
+    if account.owner != TOKEN_2022_PROGRAM_ID || account.data.len() < 72 {
+        return None;
+    }
+    let mint = Pubkey::try_from(&account.data[..32]).ok()?;
+    valid_xstock_token_account(account, mint, Some(authority), 179)
+        .then_some((mint, TOKEN_2022_PROGRAM_ID))
+}
+
+fn supported_mint_decimals(account: &Account, token_program: Pubkey) -> Option<u8> {
+    if token_program == spl_token_interface::id() {
+        legacy_mint_decimals(account, token_program)
+    } else if token_program == TOKEN_2022_PROGRAM_ID {
+        let mint = StateWithExtensions::<Token2022MintState>::unpack(&account.data).ok()?;
+        valid_xstock_mint(account, mint.base.decimals).then_some(mint.base.decimals)
+    } else {
+        None
+    }
 }
 
 pub struct TransactionValidator {
@@ -506,7 +611,10 @@ impl TransactionValidator {
             self.validate_clean(transaction_resolved, rpc_client).await?;
         } else if self.fee_payer_policy.system.send.enabled
             && !has_outer_jupiter
-            && outer.iter().any(|instruction| instruction.program_id == spl_token_interface::id())
+            && outer.iter().any(|instruction| {
+                instruction.program_id == spl_token_interface::id()
+                    || instruction.program_id == TOKEN_2022_PROGRAM_ID
+            })
         {
             self.validate_send(transaction_resolved, rpc_client, payer_creations).await?;
         }
@@ -1416,6 +1524,7 @@ impl TransactionValidator {
             accounts,
             raydium_program,
             token_program,
+            token_program,
             input_mint,
             output_mint,
             self.fee_payer_policy.system.recover.decimals,
@@ -1431,7 +1540,8 @@ impl TransactionValidator {
         instruction: &Instruction,
         accounts: &[Option<Account>],
         raydium_program: Pubkey,
-        token_program: Pubkey,
+        input_token_program: Pubkey,
+        output_token_program: Pubkey,
         input_mint: Pubkey,
         output_mint: Pubkey,
         input_decimals: u8,
@@ -1527,13 +1637,28 @@ impl TransactionValidator {
         {
             return Err(invalid());
         }
-        for (vault, expected_mint) in [(input_vault, input_mint), (output_vault, output_mint)] {
-            if vault.owner != token_program
-                || vault.data.len() != 165
-                || vault.data[..32] != expected_mint.to_bytes()
-                || vault.data[32..64] != instruction.accounts[2].pubkey.to_bytes()
-                || vault.data[108] != 1
-            {
+        for (vault, expected_mint, token_program) in [
+            (input_vault, input_mint, input_token_program),
+            (output_vault, output_mint, output_token_program),
+        ] {
+            let valid = if token_program == spl_token_interface::id() {
+                // Preserve the audited legacy Raydium-vault semantics, including wrapped-SOL
+                // vault fixtures whose native reserve field is not part of this relationship
+                // proof. User-owned accounts remain subject to the stricter parser above.
+                vault.owner == token_program
+                    && vault.data.len() == 165
+                    && vault.data[..32] == expected_mint.to_bytes()
+                    && vault.data[32..64] == instruction.accounts[2].pubkey.to_bytes()
+                    && vault.data[108] == 1
+            } else {
+                valid_xstock_token_account(
+                    vault,
+                    expected_mint,
+                    Some(instruction.accounts[2].pubkey),
+                    179,
+                )
+            };
+            if !valid {
                 return Err(invalid());
             }
         }
@@ -1741,6 +1866,116 @@ impl TransactionValidator {
             ));
         }
         let jupiter_index = jupiter_indices[0];
+        if !self.fee_payer_policy.system.send.settlement_wallet.is_empty() {
+            let ata_program = spl_associated_token_account_interface::program::id();
+            let creates_output_ata =
+                outer.get(2).is_some_and(|instruction| instruction.program_id == ata_program);
+            if jupiter_index != 2 + usize::from(creates_output_ata)
+                || outer.len() != jupiter_index + 3
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Swap outer instruction envelope is invalid".to_string(),
+                ));
+            }
+            let settlement_wallet =
+                Pubkey::from_str(&self.fee_payer_policy.system.send.settlement_wallet)
+                    .map_err(|_| KoraError::ConfigError)?;
+            let transfers = &outer[jupiter_index + 1..];
+            let token_program = transfers[0].program_id;
+            if ![spl_token_interface::id(), TOKEN_2022_PROGRAM_ID].contains(&token_program)
+                || transfers.iter().any(|instruction| {
+                    instruction.program_id != token_program || instruction.accounts.len() != 4
+                })
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Swap settlement token program or account shape is invalid".to_string(),
+                ));
+            }
+            let input_mint = transfers[0].accounts[1].pubkey;
+            let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &wallet,
+            &input_mint,
+            &token_program,
+        );
+            let settlement = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &settlement_wallet,
+            &input_mint,
+            &token_program,
+        );
+            let approved = self
+                .fee_payer_policy
+                .system
+                .send
+                .approved_mints
+                .iter()
+                .find(|approved| approved.mint == input_mint.to_string())
+                .ok_or_else(|| {
+                    KoraError::InvalidTransaction("Swap input mint is not approved".to_string())
+                })?;
+            let approved_program =
+                Pubkey::from_str(&approved.token_program).map_err(|_| KoraError::ConfigError)?;
+            for instruction in transfers {
+                let parsed = if token_program == spl_token_interface::id() {
+                    match spl_token_interface::instruction::TokenInstruction::unpack(
+                        &instruction.data,
+                    ) {
+                        Ok(
+                            spl_token_interface::instruction::TokenInstruction::TransferChecked {
+                                amount,
+                                decimals,
+                            },
+                        ) => Some((amount, decimals)),
+                        _ => None,
+                    }
+                } else {
+                    match spl_token_2022_interface::instruction::TokenInstruction::unpack(
+                    &instruction.data,
+                ) {
+                    Ok(
+                        spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                            amount,
+                            decimals,
+                        },
+                    ) => Some((amount, decimals)),
+                    _ => None,
+                }
+                };
+                if parsed
+                    .is_none_or(|(amount, decimals)| amount == 0 || decimals != approved.decimals)
+                    || approved_program != token_program
+                    || instruction.accounts[0].pubkey != source
+                    || instruction.accounts[1].pubkey != input_mint
+                    || instruction.accounts[2].pubkey != settlement
+                    || instruction.accounts[3].pubkey != wallet
+                {
+                    return Err(KoraError::InvalidTransaction(
+                        "Swap settlement transfers do not match exact policy".to_string(),
+                    ));
+                }
+            }
+            let source_state = rpc_client.get_account(&source).await?;
+            if supported_token_account_identity(&source_state, wallet)
+                != Some((input_mint, token_program))
+                || !outer[jupiter_index]
+                    .accounts
+                    .iter()
+                    .any(|account| account.pubkey == source && account.is_writable)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Swap input account is not bound to Jupiter".to_string(),
+                ));
+            }
+            if token_program == TOKEN_2022_PROGRAM_ID {
+                let mint_account = rpc_client.get_account(&input_mint).await?;
+                if !approved.require_unconfigured_transfer_hook
+                    || !valid_xstock_mint(&mint_account, approved.decimals)
+                {
+                    return Err(KoraError::InvalidTransaction(
+                        "Swap xStock mint profile or TransferHook state changed".to_string(),
+                    ));
+                }
+            }
+        }
         let direct = transaction
             .inner_instruction_contexts
             .iter()
@@ -1832,8 +2067,8 @@ impl TransactionValidator {
         let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
         let states = rpc_client.get_multiple_accounts(&addresses).await?;
         let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
-        let input_mint =
-            token_account_mint(state(3)?, token_program, wallet).ok_or_else(invalid)?;
+        let (input_mint, input_token_program) =
+            supported_token_account_identity(state(3)?, wallet).ok_or_else(invalid)?;
         let output_mint = if tick_start == 13 {
             instruction.accounts[12].pubkey
         } else {
@@ -1849,6 +2084,14 @@ impl TransactionValidator {
                 bytes.and_then(|value| value.try_into().ok()).ok_or_else(invalid)?,
             )
         };
+        let mint_states = rpc_client.get_multiple_accounts(&[input_mint, output_mint]).await?;
+        let input_mint_state = mint_states.first().and_then(Option::as_ref).ok_or_else(invalid)?;
+        let output_mint_state = mint_states.get(1).and_then(Option::as_ref).ok_or_else(invalid)?;
+        let output_token_program = output_mint_state.owner;
+        let input_decimals =
+            supported_mint_decimals(input_mint_state, input_token_program).ok_or_else(invalid)?;
+        let output_decimals =
+            supported_mint_decimals(output_mint_state, output_token_program).ok_or_else(invalid)?;
         let output_state = states.get(4).and_then(Option::as_ref);
         if input_mint == output_mint
             || !self.allowed_tokens.contains(&input_mint)
@@ -1857,34 +2100,28 @@ impl TransactionValidator {
                 != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
                     &wallet,
                     &input_mint,
-                    &token_program,
+                    &input_token_program,
                 )
             || instruction.accounts[4].pubkey
                 != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
                     &wallet,
                     &output_mint,
-                    &token_program,
+                    &output_token_program,
                 )
             || output_state.is_some_and(|account| {
-                token_account_mint(account, token_program, wallet) != Some(output_mint)
+                supported_token_account_identity(account, wallet)
+                    != Some((output_mint, output_token_program))
             })
+            || input_mint_state.owner != input_token_program
+            || (tick_start == 9
+                && (input_token_program != token_program
+                    || output_token_program != token_program))
             || (tick_start == 13
                 && (instruction.accounts[11].pubkey != input_mint
                     || instruction.accounts[12].pubkey != output_mint))
         {
             return Err(invalid());
         }
-        let mint_states = rpc_client.get_multiple_accounts(&[input_mint, output_mint]).await?;
-        let input_decimals = mint_states
-            .first()
-            .and_then(Option::as_ref)
-            .and_then(|account| legacy_mint_decimals(account, token_program))
-            .ok_or_else(invalid)?;
-        let output_decimals = mint_states
-            .get(1)
-            .and_then(Option::as_ref)
-            .and_then(|account| legacy_mint_decimals(account, token_program))
-            .ok_or_else(invalid)?;
         let mut semantic_accounts = vec![
             states.get(1).cloned().flatten(),
             states.get(2).cloned().flatten(),
@@ -1897,7 +2134,8 @@ impl TransactionValidator {
             instruction,
             &semantic_accounts,
             program,
-            token_program,
+            input_token_program,
+            output_token_program,
             input_mint,
             output_mint,
             input_decimals,
@@ -1919,6 +2157,7 @@ impl TransactionValidator {
         let program =
             Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         let token_program = spl_token_interface::id();
+        let token_2022_program = TOKEN_2022_PROGRAM_ID;
         let memo = Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         if instruction.program_id != program
             || instruction.data.len() < 24
@@ -1944,8 +2183,8 @@ impl TransactionValidator {
         }) || instruction.accounts[1].pubkey != program
             || instruction.accounts[9].pubkey != program
             || instruction.accounts[10].pubkey != wallet
-            || instruction.accounts[11].pubkey != token_program
-            || instruction.accounts[12].pubkey != token_program
+            || ![token_program, token_2022_program].contains(&instruction.accounts[11].pubkey)
+            || ![token_program, token_2022_program].contains(&instruction.accounts[12].pubkey)
             || instruction.accounts[event_index].pubkey
                 != Pubkey::find_program_address(&[b"__event_authority"], &program).0
             || instruction.accounts[program_index].pubkey != program
@@ -1958,15 +2197,13 @@ impl TransactionValidator {
         let pair = state(0)?;
         let mint_x = state(6)?;
         let mint_y = state(7)?;
+        let token_program_x = instruction.accounts[11].pubkey;
+        let token_program_y = instruction.accounts[12].pubkey;
         if pair.owner != program
             || pair.data.len() != 904
             || pair.data[..8] != METEORA_LB_PAIR_DISCRIMINATOR
-            || mint_x.owner != token_program
-            || mint_x.data.len() != 82
-            || mint_x.data[45] != 1
-            || mint_y.owner != token_program
-            || mint_y.data.len() != 82
-            || mint_y.data[45] != 1
+            || supported_mint_decimals(mint_x, token_program_x).is_none()
+            || supported_mint_decimals(mint_y, token_program_y).is_none()
             || !self.allowed_tokens.contains(&instruction.accounts[6].pubkey)
             || !self.allowed_tokens.contains(&instruction.accounts[7].pubkey)
             || pair.data[88..120] != instruction.accounts[6].pubkey.to_bytes()
@@ -2005,9 +2242,10 @@ impl TransactionValidator {
         if !pair_candidates.contains(&instruction.accounts[0].pubkey) {
             return Err(invalid());
         }
-        for (index, mint) in
-            [(2, instruction.accounts[6].pubkey), (3, instruction.accounts[7].pubkey)]
-        {
+        for (index, mint, mint_program) in [
+            (2, instruction.accounts[6].pubkey, token_program_x),
+            (3, instruction.accounts[7].pubkey, token_program_y),
+        ] {
             let vault = state(index)?;
             if instruction.accounts[index].pubkey
                 != Pubkey::find_program_address(
@@ -2015,22 +2253,32 @@ impl TransactionValidator {
                     &program,
                 )
                 .0
-                || !valid_legacy_token_account(
-                    vault,
-                    token_program,
-                    mint,
-                    instruction.accounts[0].pubkey,
-                )
+                || if mint_program == token_program {
+                    !valid_legacy_token_account(
+                        vault,
+                        mint_program,
+                        mint,
+                        instruction.accounts[0].pubkey,
+                    )
+                } else {
+                    !valid_xstock_token_account(
+                        vault,
+                        mint,
+                        Some(instruction.accounts[0].pubkey),
+                        179,
+                    )
+                }
             {
                 return Err(invalid());
             }
         }
         let user_in = state(4)?;
-        let input_mint = token_account_mint(user_in, token_program, wallet).ok_or_else(invalid)?;
-        let output_mint = if input_mint == instruction.accounts[6].pubkey {
-            instruction.accounts[7].pubkey
+        let (input_mint, input_token_program) =
+            supported_token_account_identity(user_in, wallet).ok_or_else(invalid)?;
+        let (output_mint, output_token_program) = if input_mint == instruction.accounts[6].pubkey {
+            (instruction.accounts[7].pubkey, token_program_y)
         } else if input_mint == instruction.accounts[7].pubkey {
-            instruction.accounts[6].pubkey
+            (instruction.accounts[6].pubkey, token_program_x)
         } else {
             return Err(invalid());
         };
@@ -2038,9 +2286,10 @@ impl TransactionValidator {
         if input_mint == output_mint
             || !ordered_mints.contains(&input_mint)
             || !ordered_mints.contains(&output_mint)
-            || instruction.accounts[4].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &token_program)
-            || instruction.accounts[5].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &output_mint, &token_program)
-            || user_out.is_some_and(|account| token_account_mint(account, token_program, wallet) != Some(output_mint))
+            || input_token_program != if input_mint == instruction.accounts[6].pubkey { token_program_x } else { token_program_y }
+            || instruction.accounts[4].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &input_token_program)
+            || instruction.accounts[5].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &output_mint, &output_token_program)
+            || user_out.is_some_and(|account| supported_token_account_identity(account, wallet) != Some((output_mint, output_token_program)))
         {
             return Err(invalid());
         }
@@ -2311,7 +2560,7 @@ impl TransactionValidator {
             ));
         }
 
-        let token_program = spl_token_interface::id();
+        let legacy_token_program = spl_token_interface::id();
         let ata_program = spl_associated_token_account_interface::program::id();
         let allowed_mints = policy
             .allowed_output_mints
@@ -2433,6 +2682,16 @@ impl TransactionValidator {
         let destination = outer.accounts[1].pubkey;
         let outer_wallet = outer.accounts[2].pubkey;
         let mint = outer.accounts[3].pubkey;
+        let token_program = outer.accounts[5].pubkey;
+        let account_size = if token_program == legacy_token_program {
+            165
+        } else if token_program == TOKEN_2022_PROGRAM_ID {
+            179
+        } else {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA token program is not supported".to_string(),
+            ));
+        };
         if payer != self.fee_payer_pubkey
             || outer_wallet != wallet
             || !allowed_mints.contains(&mint)
@@ -2465,22 +2724,32 @@ impl TransactionValidator {
         if context.instruction.accounts.len() != 2
             || context.instruction.accounts[1].pubkey != destination
             || owner != token_program
-            || space != 165
+            || space != account_size
         {
             return Err(KoraError::InvalidTransaction(
                 "Canonical ATA CreateAccount fields are invalid".to_string(),
             ));
         }
-        let rent = rpc_client.get_minimum_balance_for_rent_exemption(165).await?;
+        let rent = rpc_client.get_minimum_balance_for_rent_exemption(account_size as usize).await?;
         if lamports != rent {
             return Err(KoraError::InvalidTransaction(
                 "Canonical ATA CreateAccount rent is invalid".to_string(),
             ));
         }
-        let existing = rpc_client.get_multiple_accounts(&[destination]).await?;
+        let existing = rpc_client.get_multiple_accounts(&[destination, mint]).await?;
         if existing.first().and_then(|account| account.as_ref()).is_some() {
             return Err(KoraError::InvalidTransaction(
                 "Canonical ATA destination already exists".to_string(),
+            ));
+        }
+        if token_program == TOKEN_2022_PROGRAM_ID
+            && !existing
+                .get(1)
+                .and_then(|account| account.as_ref())
+                .is_some_and(|account| valid_xstock_mint(account, 8))
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Canonical ATA xStock mint profile changed".to_string(),
             ));
         }
         Ok(())
@@ -2499,7 +2768,7 @@ impl TransactionValidator {
             ));
         }
 
-        let token_program = spl_token_interface::id();
+        let legacy_token_program = spl_token_interface::id();
         let ata_program = spl_associated_token_account_interface::program::id();
         let compute_program = solana_compute_budget_interface::id();
         let jupiter_program =
@@ -2570,9 +2839,10 @@ impl TransactionValidator {
         let creates_recipient_ata = outer[send_index].program_id == ata_program;
         let transfer_index = send_index + usize::from(creates_recipient_ata);
         if outer.len() != transfer_index + 3
-            || outer[transfer_index..]
-                .iter()
-                .any(|instruction| instruction.program_id != token_program)
+            || outer[transfer_index..].iter().any(|instruction| {
+                instruction.program_id != legacy_token_program
+                    && instruction.program_id != TOKEN_2022_PROGRAM_ID
+            })
             || creates_recipient_ata != (payer_creations == 1)
         {
             return Err(KoraError::InvalidTransaction(
@@ -2588,6 +2858,13 @@ impl TransactionValidator {
             ));
         }
         let mint = first_transfer.accounts[1].pubkey;
+        let token_program = first_transfer.program_id;
+        if outer[transfer_index..].iter().any(|instruction| instruction.program_id != token_program)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "SEND token programs must be identical".to_string(),
+            ));
+        }
         let destination = first_transfer.accounts[2].pubkey;
         let approved = policy
             .approved_mints
@@ -2596,6 +2873,18 @@ impl TransactionValidator {
             .ok_or_else(|| {
                 KoraError::InvalidTransaction("SEND mint is not approved".to_string())
             })?;
+        let approved_token_program =
+            Pubkey::from_str(&approved.token_program).map_err(|_| KoraError::ConfigError)?;
+        if token_program != approved_token_program
+            || (approved.require_unconfigured_transfer_hook
+                && token_program != TOKEN_2022_PROGRAM_ID)
+            || (!approved.require_unconfigured_transfer_hook
+                && token_program != legacy_token_program)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "SEND token program does not match the exact mint policy".to_string(),
+            ));
+        }
         if !self.allowed_tokens.contains(&mint) {
             return Err(KoraError::InvalidTransaction(
                 "SEND mint is not globally allowed".to_string(),
@@ -2661,8 +2950,13 @@ impl TransactionValidator {
                         ))
                     }
                 };
-            let rent = rpc_client.get_minimum_balance_for_rent_exemption(165).await?;
-            if owner != token_program || space != 165 || lamports != rent {
+            let rent = rpc_client
+                .get_minimum_balance_for_rent_exemption(approved.token_account_size)
+                .await?;
+            if owner != token_program
+                || space != approved.token_account_size as u64
+                || lamports != rent
+            {
                 return Err(KoraError::InvalidTransaction(
                     "SEND ATA CreateAccount fields are invalid".to_string(),
                 ));
@@ -2677,19 +2971,33 @@ impl TransactionValidator {
         let expected_destinations = [destination, settlement, settlement];
         let mut total_debit = 0_u64;
         for (index, instruction) in outer[transfer_index..].iter().enumerate() {
-            let (amount, decimals) =
+            let parsed = if token_program == legacy_token_program {
                 match spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data)
                 {
                     Ok(spl_token_interface::instruction::TokenInstruction::TransferChecked {
                         amount,
                         decimals,
-                    }) => (amount, decimals),
-                    _ => {
-                        return Err(KoraError::InvalidTransaction(
-                            "SEND requires TransferChecked instructions".to_string(),
-                        ))
-                    }
-                };
+                    }) => Some((amount, decimals)),
+                    _ => None,
+                }
+            } else {
+                match spl_token_2022_interface::instruction::TokenInstruction::unpack(
+                    &instruction.data,
+                ) {
+                    Ok(
+                        spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                            amount,
+                            decimals,
+                        },
+                    ) => Some((amount, decimals)),
+                    _ => None,
+                }
+            };
+            let (amount, decimals) = parsed.ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "SEND requires TransferChecked instructions".to_string(),
+                )
+            })?;
             if amount == 0
                 || decimals != approved.decimals
                 || instruction.accounts.len() != 4
@@ -2708,22 +3016,15 @@ impl TransactionValidator {
         }
         if transaction.inner_instruction_contexts.iter().any(|context| {
             context.instruction.program_id == token_program
-                && matches!(
-                    spl_token_interface::instruction::TokenInstruction::unpack(
-                        &context.instruction.data
-                    ),
-                    Ok(spl_token_interface::instruction::TokenInstruction::Transfer { .. })
-                        | Ok(spl_token_interface::instruction::TokenInstruction::TransferChecked {
-                            ..
-                        })
-                )
+                && matches!(context.instruction.data.first(), Some(3 | 12))
         }) {
             return Err(KoraError::InvalidTransaction(
                 "SEND does not permit inner token transfers".to_string(),
             ));
         }
 
-        let accounts = rpc_client.get_multiple_accounts(&[destination, source, settlement]).await?;
+        let accounts =
+            rpc_client.get_multiple_accounts(&[destination, source, settlement, mint]).await?;
         let destination_account = accounts.first().and_then(|account| account.as_ref());
         if destination_account.is_some() == creates_recipient_ata {
             return Err(KoraError::InvalidTransaction(
@@ -2738,7 +3039,7 @@ impl TransactionValidator {
             accounts.get(2).and_then(|account| account.as_ref()).ok_or_else(|| {
                 KoraError::InvalidTransaction("SEND settlement ATA is missing".to_string())
             })?;
-        let token_account_valid =
+        let legacy_token_account_valid =
             |account: &solana_sdk::account::Account, expected_owner: Option<Pubkey>| {
                 account.owner == token_program
                     && account.data.len() == 165
@@ -2748,6 +3049,32 @@ impl TransactionValidator {
                         .unwrap_or(true)
                     && account.data[108] == 1
             };
+        let token_account_valid =
+            |account: &solana_sdk::account::Account, expected_owner: Option<Pubkey>| {
+                if token_program == legacy_token_program {
+                    legacy_token_account_valid(account, expected_owner)
+                } else {
+                    valid_xstock_token_account(
+                        account,
+                        mint,
+                        expected_owner,
+                        approved.token_account_size,
+                    )
+                }
+            };
+        if token_program == TOKEN_2022_PROGRAM_ID {
+            let mint_account =
+                accounts.get(3).and_then(|account| account.as_ref()).ok_or_else(|| {
+                    KoraError::InvalidTransaction("SEND mint account is missing".to_string())
+                })?;
+            if !approved.require_unconfigured_transfer_hook
+                || !valid_xstock_mint(mint_account, approved.decimals)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "SEND xStock mint profile or TransferHook state changed".to_string(),
+                ));
+            }
+        }
         let recipient = match recipient_from_creation {
             Some(recipient) => recipient,
             None => {
@@ -4404,6 +4731,122 @@ mod tests {
         })
     }
 
+    fn xstock_token_account_json(mint: &Pubkey, owner: &Pubkey, amount: u64) -> serde_json::Value {
+        // Sanitized ordinary STRCx account captured from mainnet on 2026-09-07. Its exact
+        // 179-byte layout contains ImmutableOwner, PausableAccount, and TransferHookAccount.
+        let mut data = base64::engine::general_purpose::STANDARD.decode(
+            "B+gUMR5zExL9UIO0lwh3ituxS62Sx+R5eV0ZK5sHHPwGb1kiUcxHdHglpZrRQi6kNXP1KNpd7ir3gSsxT5lF4+DZymqOIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAAbAAAADwABAAA=",
+        ).unwrap();
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(owner.as_ref());
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        json!({
+            "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"],
+            "executable": false,
+            "lamports": 1_944_231,
+            "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+            "rentEpoch": 0
+        })
+    }
+
+    fn xstock_mint_json() -> serde_json::Value {
+        // Sanitized live STRCx mint captured on 2026-09-07. TransferHook is present with
+        // program_id=None; all other fields are exercised by valid_xstock_mint.
+        json!({
+            "data": ["AQAAAGVqQkIv6okUBqQZ0dHeCPQqhHlBtaGulevOYZrDFyk0CXxrMb0qAAAIAQEAAAD/3+wbzSzTg5PITaoIyRzA041nf/jQq3tdAz8A9zLMMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQABD+fHuLje4B+pFy3TmAJcivsAJKWAm5ORVi0NeJKXpxgfoFDEecxMS/VCDtJcId4rbsUutksfkeXldGSubBxz8DAAgAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGBgABAAEZADgABm9ZIlHMR3R4JaWa0UIupDVz9SjaXe4q94ErMU+ZReO6wyLDtTTxP9TClGoAAAAA7E+7dFZL8T8aACEA/9/sG80s04OTyE2qCMkcwNONZ3/40Kt7XQM/APcyzDAABABBAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgBAAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATALQAQ/nx7i43uAfqRct05gCXIr7ACSlgJuTkVYtDXiSl6cYH6BQxHnMTEv1Qg7SXCHeK27FLrZLH5Hl5XRkrmwcc/BsAAABTdHJhdGVneSBQUCBWYXJpYWJsZSB4U3RvY2sFAAAAU1RSQ3hEAAAAaHR0cHM6Ly94c3RvY2tzLW1ldGFkYXRhLmJhY2tlZC5maS90b2tlbnMvU29sYW5hL1NUUkN4L21ldGFkYXRhLmpzb24AAAAA", "base64"],
+            "executable": false,
+            "lamports": 5_000_000,
+            "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+            "rentEpoch": 0
+        })
+    }
+
+    fn xstock_send_fixture(
+        existing: bool,
+    ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>) {
+        let payer = Pubkey::new_unique();
+        let sender = Pubkey::new_unique();
+        let recipient = loop {
+            let candidate = Pubkey::new_unique();
+            if candidate.is_on_curve() {
+                break candidate;
+            }
+        };
+        let treasury = Pubkey::new_unique();
+        let mint = Pubkey::from_str("Xs78JED6PFZxWc2wCEPspZW9kL3Se5J7L5TChKgsidH").unwrap();
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&sender, &mint, &TOKEN_2022_PROGRAM_ID);
+        let destination = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&recipient, &mint, &TOKEN_2022_PROGRAM_ID);
+        let settlement = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&treasury, &mint, &TOKEN_2022_PROGRAM_ID);
+        let mut policy = FeePayerPolicy::default();
+        policy.system.send = SendPolicy {
+            enabled: true,
+            settlement_wallet: treasury.to_string(),
+            approved_mints: vec![SendMintPolicy {
+                mint: mint.to_string(),
+                decimals: 8,
+                token_program: TOKEN_2022_PROGRAM_ID.to_string(),
+                token_account_size: 179,
+                require_unconfigured_transfer_hook: true,
+            }],
+        };
+        setup_config_with_policy(policy);
+        let transfer = |destination: Pubkey, amount: u64| {
+            spl_token_2022_interface::instruction::transfer_checked(
+                &TOKEN_2022_PROGRAM_ID,
+                &source,
+                &mint,
+                &destination,
+                &sender,
+                &[],
+                amount,
+                8,
+            )
+            .unwrap()
+        };
+        let ata = spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+            &payer, &recipient, &mint, &TOKEN_2022_PROGRAM_ID,
+        );
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS),
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT),
+            transfer(destination, 500_000),
+            transfer(settlement, 2_100),
+            transfer(settlement, 500),
+        ];
+        if !existing {
+            instructions.insert(2, ata);
+        }
+        let message = VersionedMessage::Legacy(Message::new(&instructions, Some(&payer)));
+        let mut transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        if !existing {
+            let create =
+                create_account(&payer, &destination, 1_944_231, 179, &TOKEN_2022_PROGRAM_ID);
+            transaction.all_instructions.push(create.clone());
+            transaction.inner_instruction_contexts.push(InnerInstructionContext {
+                instruction: create,
+                outer_instruction_index: 2,
+                stack_height: Some(2),
+            });
+        }
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(1_944_231));
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({
+                "context": { "slot": 1 },
+                "value": [
+                    if existing { xstock_token_account_json(&mint, &recipient, 0) } else { serde_json::Value::Null },
+                    xstock_token_account_json(&mint, &sender, 1_000_000),
+                    xstock_token_account_json(&mint, &treasury, 0),
+                    xstock_mint_json()
+                ]
+            }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc)
+    }
+
     fn send_ata_fixture_with_source(
         existing: bool,
         source_state: u8,
@@ -4437,7 +4880,11 @@ mod tests {
         policy.system.send = SendPolicy {
             enabled: true,
             settlement_wallet: treasury.to_string(),
-            approved_mints: vec![SendMintPolicy { mint: mint.to_string(), decimals: 6 }],
+            approved_mints: vec![SendMintPolicy {
+                mint: mint.to_string(),
+                decimals: 6,
+                ..Default::default()
+            }],
         };
         setup_config_with_policy(policy);
         let ata = spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(&payer, &recipient, &mint, &token_program);
@@ -4539,6 +4986,28 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn gasless_send_accepts_only_the_exact_live_xstock_token_2022_profile() {
+        let (validator, transaction, rpc) = xstock_send_fixture(true);
+        let result = validator.validate_send(&transaction, &rpc, 0).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let (missing_validator, missing_ata, missing_rpc) = xstock_send_fixture(false);
+        let result = missing_validator.validate_send(&missing_ata, &missing_rpc, 1).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let mut wrong_program = transaction.clone();
+        wrong_program.all_instructions[2].program_id = spl_token_interface::id();
+        assert!(validator.validate_send(&wrong_program, &rpc, 0).await.is_err());
+
+        let mut extra_transfer_account = transaction.clone();
+        extra_transfer_account.all_instructions[2]
+            .accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+        assert!(validator.validate_send(&extra_transfer_account, &rpc, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn gasless_send_ata_exception_accepts_only_exact_standalone_shape() {
         let (validator, transaction, rpc, _, _, _, _, _) = send_ata_fixture(false);
         let result = validator.validate_send(&transaction, &rpc, 1).await;
@@ -4602,6 +5071,7 @@ mod tests {
             approved_mints: vec![SendMintPolicy {
                 mint: unapproved_mint_c.to_string(),
                 decimals: 6,
+                ..Default::default()
             }],
         };
         setup_config_with_policy(policy);
@@ -4612,7 +5082,11 @@ mod tests {
         policy.system.send = SendPolicy {
             enabled: true,
             settlement_wallet: treasury,
-            approved_mints: vec![SendMintPolicy { mint: mint_b.to_string(), decimals: 6 }],
+            approved_mints: vec![SendMintPolicy {
+                mint: mint_b.to_string(),
+                decimals: 6,
+                ..Default::default()
+            }],
         };
         setup_config_with_policy(policy);
         let validator = TransactionValidator::new(payer).unwrap();
@@ -6205,6 +6679,7 @@ mod tests {
                 instruction,
                 accounts,
                 program,
+                token_program,
                 token_program,
                 input_mint,
                 output_mint,
