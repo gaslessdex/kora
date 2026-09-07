@@ -43,6 +43,71 @@ fn valid_raydium_tick_array_sequence(starts: &[i32], current_start: i32, interva
             .is_some_and(|delta| delta != 0 && delta.signum() == direction && delta % interval == 0)
     })
 }
+
+fn valid_raydium_exact_in_route(raydium_data: &[u8], jupiter_data: &[u8]) -> bool {
+    // Jupiter owns the user-visible exact-input slippage guard. Current Jupiter routes set
+    // Raydium's inner `other_amount_threshold` to zero, so bind the CPI amount to the guarded
+    // outer route instead of requiring a redundant non-zero inner threshold.
+    if raydium_data.len() != 41
+        || jupiter_data.len() != 39
+        || ![RAYDIUM_SWAP_DISCRIMINATOR, RAYDIUM_SWAP_V2_DISCRIMINATOR]
+            .contains(&raydium_data[..8].try_into().unwrap_or([0; 8]))
+        || jupiter_data[..8] != JUPITER_ROUTE_DISCRIMINATOR
+        || raydium_data[40] != 1
+    {
+        return false;
+    }
+    let amount = u64::from_le_bytes(raydium_data[8..16].try_into().unwrap_or([0; 8]));
+    let routed_amount = u64::from_le_bytes(jupiter_data[8..16].try_into().unwrap_or([0; 8]));
+    let quoted_output = u64::from_le_bytes(jupiter_data[16..24].try_into().unwrap_or([0; 8]));
+    let slippage_bps = u16::from_le_bytes(jupiter_data[24..26].try_into().unwrap_or([0; 2]));
+    amount > 0
+        && amount == routed_amount
+        && quoted_output > 0
+        && (1..=100).contains(&slippage_bps)
+        && jupiter_data[26] == 0
+}
+
+fn raydium_tick_accounts_start(
+    instruction: &Instruction,
+    jupiter_instruction: &Instruction,
+    wallet: Pubkey,
+    token_program: Pubkey,
+    token_2022_program: Pubkey,
+    memo_program: Pubkey,
+) -> Option<usize> {
+    let legacy = instruction.data.len() == 41
+        && instruction.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
+        && (12..=13).contains(&instruction.accounts.len());
+    let v2 = instruction.data.len() == 41
+        && instruction.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
+        && (16..=17).contains(&instruction.accounts.len());
+    if (!legacy && !v2)
+        || !valid_raydium_exact_in_route(&instruction.data, &jupiter_instruction.data)
+        || instruction.accounts[0].pubkey != wallet
+        || instruction.accounts[8].pubkey != token_program
+    {
+        return None;
+    }
+    let tick_start = if legacy {
+        9
+    } else {
+        if instruction.accounts[9].pubkey != token_2022_program
+            || instruction.accounts[10].pubkey != memo_program
+        {
+            return None;
+        }
+        13
+    };
+    let writable = [2_usize, 3, 4, 5, 6, 7];
+    if instruction.accounts.iter().enumerate().any(|(index, meta)| {
+        meta.is_signer != (index == 0)
+            || meta.is_writable != (writable.contains(&index) || index >= tick_start)
+    }) {
+        return None;
+    }
+    Some(tick_start)
+}
 const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
@@ -54,6 +119,7 @@ const MAX_LIGHTHOUSE_DATA_BYTES: usize = 256;
 // account layout. Its 13-account shape is different from `swap_v2`, even though
 // both instructions encode the same four swap arguments after the discriminator.
 const RAYDIUM_SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+const JUPITER_ROUTE_DISCRIMINATOR: [u8; 8] = [187, 100, 250, 204, 49, 196, 175, 20];
 const RAYDIUM_SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
 const RAYDIUM_POOL_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 const RAYDIUM_AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
@@ -1726,7 +1792,9 @@ impl TransactionValidator {
             ));
         }
         match family {
-            "RAYDIUM_CLMM" => self.validate_raydium_clmm(dex, rpc_client, wallet).await,
+            "RAYDIUM_CLMM" => {
+                self.validate_raydium_clmm(dex, &outer[jupiter_index], rpc_client, wallet).await
+            }
             "METEORA_DLMM" => self.validate_meteora_dlmm(dex, rpc_client, wallet).await,
             "PUMPSWAP" => self.validate_pumpswap(dex, rpc_client, wallet).await,
             _ => Err(KoraError::InvalidTransaction("Swap DEX family is not approved".to_string())),
@@ -1736,6 +1804,7 @@ impl TransactionValidator {
     async fn validate_raydium_clmm(
         &self,
         instruction: &Instruction,
+        jupiter_instruction: &Instruction,
         rpc_client: &RpcClient,
         wallet: Pubkey,
     ) -> Result<(), KoraError> {
@@ -1747,36 +1816,17 @@ impl TransactionValidator {
         let token_program = spl_token_interface::id();
         let token_2022_program = spl_token_2022_interface::id();
         let memo_program = Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
-        let legacy = instruction.data.len() == 41
-            && instruction.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
-            && (12..=13).contains(&instruction.accounts.len());
-        let v2 = instruction.data.len() == 41
-            && instruction.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
-            && (16..=17).contains(&instruction.accounts.len());
-        if instruction.program_id != program
-            || (!legacy && !v2)
-            || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
-            || u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?) == 0
-            || instruction.accounts[0].pubkey != wallet
-            || instruction.accounts[8].pubkey != token_program
-        {
+        let Some(tick_start) = raydium_tick_accounts_start(
+            instruction,
+            jupiter_instruction,
+            wallet,
+            token_program,
+            token_2022_program,
+            memo_program,
+        ) else {
             return Err(invalid());
-        }
-        let tick_start = if legacy {
-            9
-        } else {
-            if instruction.accounts[9].pubkey != token_2022_program
-                || instruction.accounts[10].pubkey != memo_program
-            {
-                return Err(invalid());
-            }
-            13
         };
-        let writable = [2_usize, 3, 4, 5, 6, 7];
-        if instruction.accounts.iter().enumerate().any(|(index, meta)| {
-            meta.is_signer != (index == 0)
-                || meta.is_writable != (writable.contains(&index) || index >= tick_start)
-        }) {
+        if instruction.program_id != program {
             return Err(invalid());
         }
         let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
@@ -1784,7 +1834,7 @@ impl TransactionValidator {
         let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
         let input_mint =
             token_account_mint(state(3)?, token_program, wallet).ok_or_else(invalid)?;
-        let output_mint = if v2 {
+        let output_mint = if tick_start == 13 {
             instruction.accounts[12].pubkey
         } else {
             let pool = state(2)?;
@@ -1818,7 +1868,7 @@ impl TransactionValidator {
             || output_state.is_some_and(|account| {
                 token_account_mint(account, token_program, wallet) != Some(output_mint)
             })
-            || (v2
+            || (tick_start == 13
                 && (instruction.accounts[11].pubkey != input_mint
                     || instruction.accounts[12].pubkey != output_mint))
         {
@@ -2899,6 +2949,60 @@ mod tests {
         assert!(!valid_raydium_tick_array_sequence(&[0, -600], -600, 600));
         assert!(!valid_raydium_tick_array_sequence(&[-600, 1], -600, 600));
         assert!(!valid_raydium_tick_array_sequence(&[-600, 0, -1200], -600, 600));
+    }
+
+    fn current_jupiter_route_data(amount: u64, output: u64, slippage_bps: u16) -> Vec<u8> {
+        let mut data = JUPITER_ROUTE_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&output.to_le_bytes());
+        data.extend_from_slice(&slippage_bps.to_le_bytes());
+        data.extend_from_slice(&[0; 13]);
+        data
+    }
+
+    fn current_raydium_swap_data(amount: u64, minimum_output: u64) -> Vec<u8> {
+        let mut data = RAYDIUM_SWAP_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&minimum_output.to_le_bytes());
+        data.extend_from_slice(&0_u128.to_le_bytes());
+        data.push(1);
+        data
+    }
+
+    #[test]
+    fn raydium_current_zero_inner_minimum_requires_exact_jupiter_input_protection() {
+        // Sanitized from the fresh 2026-09-07 USDC -> USDT Jupiter/Raydium CLMM route.
+        let raydium = current_raydium_swap_data(98_358, 0);
+        let jupiter = current_jupiter_route_data(98_358, 98_344, 50);
+        assert!(valid_raydium_exact_in_route(&raydium, &jupiter));
+
+        let mut historical = raydium.clone();
+        historical[16..24].copy_from_slice(&97_853_u64.to_le_bytes());
+        assert!(valid_raydium_exact_in_route(&historical, &jupiter));
+
+        let mut v2 = raydium.clone();
+        v2[..8].copy_from_slice(&RAYDIUM_SWAP_V2_DISCRIMINATOR);
+        assert!(valid_raydium_exact_in_route(&v2, &jupiter));
+
+        for mutation in 0..9 {
+            let mut raydium = raydium.clone();
+            let mut jupiter = jupiter.clone();
+            match mutation {
+                0 => raydium[8..16].fill(0),
+                1 => raydium[8] ^= 1,
+                2 => raydium[40] = 0,
+                3 => raydium[0] ^= 1,
+                4 => jupiter[0] ^= 1,
+                5 => jupiter[16..24].fill(0),
+                6 => jupiter[24..26].fill(0),
+                7 => jupiter[24..26].copy_from_slice(&101_u16.to_le_bytes()),
+                _ => jupiter[26] = 1,
+            }
+            assert!(
+                !valid_raydium_exact_in_route(&raydium, &jupiter),
+                "Raydium/Jupiter amount or protection mutation {mutation} must fail"
+            );
+        }
     }
 
     // Helper functions to reduce test duplication and setup config
@@ -5972,6 +6076,251 @@ mod tests {
         data[64..72].copy_from_slice(&1_000_000_u64.to_le_bytes());
         data[108] = 1;
         data
+    }
+
+    fn raydium_current_semantic_fixture(
+    ) -> (TransactionValidator, Instruction, Vec<Option<Account>>, Pubkey, Pubkey, Pubkey, Pubkey)
+    {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let input_mint = Pubkey::new_unique();
+        let output_mint = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
+        let config_index = 0_u16;
+        let (config, config_bump) =
+            Pubkey::find_program_address(&[b"amm_config", &config_index.to_be_bytes()], &program);
+        let pool = Pubkey::new_unique();
+        let input_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &token_program);
+        let output_account = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &output_mint, &token_program);
+        let input_vault = Pubkey::new_unique();
+        let output_vault = Pubkey::new_unique();
+        let observation = Pubkey::new_unique();
+        let starts = [-60_i32, -120, -240];
+        let ticks = starts.map(|start| {
+            Pubkey::find_program_address(
+                &[b"tick_array", pool.as_ref(), &start.to_be_bytes()],
+                &program,
+            )
+            .0
+        });
+        let bitmap = Pubkey::find_program_address(
+            &[b"pool_tick_array_bitmap_extension", pool.as_ref()],
+            &program,
+        )
+        .0;
+        let metas = vec![
+            AccountMeta::new_readonly(wallet, true),
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(input_account, false),
+            AccountMeta::new(output_account, false),
+            AccountMeta::new(input_vault, false),
+            AccountMeta::new(output_vault, false),
+            AccountMeta::new(observation, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(ticks[0], false),
+            AccountMeta::new(bitmap, false),
+            AccountMeta::new(ticks[1], false),
+            AccountMeta::new(ticks[2], false),
+        ];
+        let instruction =
+            Instruction::new_with_bytes(program, &current_raydium_swap_data(98_358, 0), metas);
+        let account = |data: Vec<u8>, owner: Pubkey| {
+            Some(Account { lamports: 1, data, owner, executable: false, rent_epoch: 0 })
+        };
+        let mut amm = vec![0_u8; 117];
+        amm[..8].copy_from_slice(&RAYDIUM_AMM_CONFIG_DISCRIMINATOR);
+        amm[8] = config_bump;
+        amm[9..11].copy_from_slice(&config_index.to_le_bytes());
+        amm[47..51].copy_from_slice(&100_u32.to_le_bytes());
+        amm[51..53].copy_from_slice(&1_u16.to_le_bytes());
+        let mut pool_data = vec![0_u8; 1544];
+        pool_data[..8].copy_from_slice(&RAYDIUM_POOL_DISCRIMINATOR);
+        pool_data[9..41].copy_from_slice(config.as_ref());
+        pool_data[73..105].copy_from_slice(input_mint.as_ref());
+        pool_data[105..137].copy_from_slice(output_mint.as_ref());
+        pool_data[137..169].copy_from_slice(input_vault.as_ref());
+        pool_data[169..201].copy_from_slice(output_vault.as_ref());
+        pool_data[201..233].copy_from_slice(observation.as_ref());
+        pool_data[233] = 6;
+        pool_data[234] = 6;
+        pool_data[235..237].copy_from_slice(&1_u16.to_le_bytes());
+        pool_data[269..273].copy_from_slice(&(-1_i32).to_le_bytes());
+        let mut observation_data = vec![0_u8; 4483];
+        observation_data[..8].copy_from_slice(&RAYDIUM_OBSERVATION_DISCRIMINATOR);
+        observation_data[8] = 1;
+        observation_data[19..51].copy_from_slice(pool.as_ref());
+        let tick_data = |start: i32| {
+            let mut data = vec![0_u8; 10240];
+            data[..8].copy_from_slice(&RAYDIUM_TICK_ARRAY_DISCRIMINATOR);
+            data[8..40].copy_from_slice(pool.as_ref());
+            data[40..44].copy_from_slice(&start.to_le_bytes());
+            data
+        };
+        let mut bitmap_data = vec![0_u8; 1832];
+        bitmap_data[..8].copy_from_slice(&RAYDIUM_BITMAP_DISCRIMINATOR);
+        bitmap_data[8..40].copy_from_slice(pool.as_ref());
+        let accounts = vec![
+            account(amm, program),
+            account(pool_data, program),
+            account(legacy_token_data(input_mint, pool), token_program),
+            account(legacy_token_data(output_mint, pool), token_program),
+            account(observation_data, program),
+            account(tick_data(starts[0]), program),
+            account(bitmap_data, program),
+            account(tick_data(starts[1]), program),
+            account(tick_data(starts[2]), program),
+        ];
+        let mut policy = FeePayerPolicy::default();
+        policy.system.canonical_ata_creation.allowed_output_mints =
+            vec![input_mint.to_string(), output_mint.to_string()];
+        policy.system.swap = crate::config::SwapPolicy {
+            enabled: true,
+            approved_dex_families: vec!["RAYDIUM_CLMM".to_string()],
+        };
+        setup_config_with_policy(policy);
+        (
+            TransactionValidator::new(payer).unwrap(),
+            instruction,
+            accounts,
+            wallet,
+            input_mint,
+            output_mint,
+            token_program,
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn swap_raydium_current_state_fixture_accepts_and_rejects_account_mutations() {
+        let (validator, instruction, accounts, _, input_mint, output_mint, token_program) =
+            raydium_current_semantic_fixture();
+        let program = instruction.program_id;
+        let validate = |instruction: &Instruction,
+                        accounts: &[Option<Account>],
+                        input_mint: Pubkey,
+                        output_mint: Pubkey| {
+            validator.validate_raydium_clmm_accounts(
+                instruction,
+                accounts,
+                program,
+                token_program,
+                input_mint,
+                output_mint,
+                6,
+                6,
+                9,
+                "fixture invalid",
+            )
+        };
+        assert!(validate(&instruction, &accounts, input_mint, output_mint).is_ok());
+
+        let mut reverse_instruction = instruction.clone();
+        let mut reverse_accounts = accounts.clone();
+        reverse_instruction.accounts.swap(5, 6);
+        reverse_accounts.swap(2, 3);
+        let pool = reverse_instruction.accounts[2].pubkey;
+        for (meta_index, state_index, start) in
+            [(9_usize, 5_usize, -60_i32), (11, 7, 0), (12, 8, 60)]
+        {
+            let address = Pubkey::find_program_address(
+                &[b"tick_array", pool.as_ref(), &start.to_be_bytes()],
+                &program,
+            )
+            .0;
+            reverse_instruction.accounts[meta_index].pubkey = address;
+            let state = reverse_accounts[state_index].as_mut().unwrap();
+            state.data[40..44].copy_from_slice(&start.to_le_bytes());
+        }
+        assert!(
+            validate(&reverse_instruction, &reverse_accounts, output_mint, input_mint).is_ok(),
+            "the independently validated opposite mint/vault/tick direction must pass"
+        );
+        reverse_instruction.accounts.swap(11, 12);
+        reverse_accounts.swap(7, 8);
+        assert!(
+            validate(&reverse_instruction, &reverse_accounts, output_mint, input_mint).is_err(),
+            "a reversed opposite-direction tick sequence must fail"
+        );
+
+        for mutation in 0..9 {
+            let mut instruction = instruction.clone();
+            let mut accounts = accounts.clone();
+            match mutation {
+                0 => instruction.accounts[5].pubkey = Pubkey::new_unique(),
+                1 => instruction.accounts[6].pubkey = Pubkey::new_unique(),
+                2 => instruction.accounts[7].pubkey = Pubkey::new_unique(),
+                3 => instruction.accounts[1].pubkey = Pubkey::new_unique(),
+                4 => instruction.accounts[2].pubkey = Pubkey::new_unique(),
+                5 => instruction.accounts[9].pubkey = Pubkey::new_unique(),
+                6 => {
+                    instruction.accounts.swap(11, 12);
+                    accounts.swap(7, 8);
+                }
+                7 => {
+                    instruction.accounts.push(AccountMeta::new(Pubkey::new_unique(), false));
+                    accounts.push(Some(Account::default()));
+                }
+                _ => {
+                    instruction.accounts.remove(10);
+                    accounts.remove(6);
+                }
+            }
+            assert!(
+                validate(&instruction, &accounts, input_mint, output_mint).is_err(),
+                "Raydium account/state mutation {mutation} must fail"
+            );
+        }
+        assert!(validate(&instruction, &accounts, Pubkey::new_unique(), output_mint).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn swap_raydium_current_shape_rejects_wrong_user_payer_and_instruction_data() {
+        let (validator, instruction, _, wallet, _, _, token_program) =
+            raydium_current_semantic_fixture();
+        let jupiter = Instruction::new_with_bytes(
+            Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap(),
+            &current_jupiter_route_data(98_358, 98_344, 50),
+            instruction.accounts.clone(),
+        );
+        assert_eq!(
+            raydium_tick_accounts_start(
+                &instruction,
+                &jupiter,
+                wallet,
+                token_program,
+                spl_token_2022_interface::id(),
+                Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(),
+            ),
+            Some(9)
+        );
+        let mut wrong_user = instruction.clone();
+        wrong_user.accounts[0].pubkey = Pubkey::new_unique();
+        assert!(raydium_tick_accounts_start(
+            &wrong_user,
+            &jupiter,
+            wallet,
+            token_program,
+            spl_token_2022_interface::id(),
+            Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(),
+        )
+        .is_none());
+        let mut altered = instruction.clone();
+        altered.data[8] ^= 1;
+        assert!(raydium_tick_accounts_start(
+            &altered,
+            &jupiter,
+            wallet,
+            token_program,
+            spl_token_2022_interface::id(),
+            Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(),
+        )
+        .is_none());
+
+        let wrong_payer = swap_route_transaction(Pubkey::new_unique(), wallet, instruction, true);
+        assert!(validator.swap_user_signer(&wrong_payer).is_err());
     }
 
     fn meteora_semantic_fixture(
