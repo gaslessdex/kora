@@ -261,6 +261,12 @@ pub struct CleanPolicy {
     pub fee_bps: u16,
     #[serde(default = "default_clean_claim_accounts")]
     pub maximum_claim_accounts: u8,
+    #[serde(default = "default_claim_compute_unit_limit")]
+    pub claim_compute_unit_limit: u32,
+    #[serde(default = "default_claim_min_compute_unit_price")]
+    pub claim_min_compute_unit_price_micro_lamports: u64,
+    #[serde(default = "default_claim_max_compute_unit_price")]
+    pub claim_max_compute_unit_price_micro_lamports: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
@@ -345,6 +351,15 @@ fn default_clean_fee_bps() -> u16 {
 }
 fn default_clean_claim_accounts() -> u8 {
     10
+}
+fn default_claim_compute_unit_limit() -> u32 {
+    10_000
+}
+fn default_claim_min_compute_unit_price() -> u64 {
+    1_000
+}
+fn default_claim_max_compute_unit_price() -> u64 {
+    100_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]

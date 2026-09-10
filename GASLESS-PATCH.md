@@ -41,9 +41,12 @@ burn_enabled = false
 settlement_wallet = "EEFxZ3mtdPXNKkBQkbuAw1HBPvQvU2HVKWvRVbuciSsb"
 fee_bps = 300
 maximum_claim_accounts = 10
+claim_compute_unit_limit = 10000
+claim_min_compute_unit_price_micro_lamports = 1000
+claim_max_compute_unit_price_micro_lamports = 100000
 ```
 
-Claim/Burn validation is shape-specific: v0, exactly payer and user signers, exact 375000/100000 compute prefix, current ordinary legacy SPL state, user close destination, exact full-balance Burn where applicable, and exact 3% rent fee plus message network fee. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
+Claim/Burn validation is shape-specific: v0, exactly payer and user signers, current eligible SPL state, and user recovery destination. Claim requires the configured bounded compute prefix and a settlement of exactly the integer-floor 3% service fee; Kora's payer absorbs the network fee. Burn retains the exact 375000/100000 compute prefix, full-balance validation, and 3% fee plus network reimbursement. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
 
 ## Recover Value policy
 

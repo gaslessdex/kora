@@ -808,23 +808,20 @@ impl TransactionValidator {
             ));
         }
         let outer = self.economic_outer(transaction)?;
-        let price = [3, 216, 184, 5, 0, 0, 0, 0, 0];
-        let price_limit = outer.get(0).is_some_and(|ix| {
-            ix.program_id == compute_program && ix.accounts.is_empty() && ix.data == price
-        }) && outer.get(1).is_some_and(|ix| {
+        let is_price = |ix: &Instruction| {
+            ix.program_id == compute_program
+                && ix.accounts.is_empty()
+                && ix.data.len() == 9
+                && ix.data[0] == 3
+        };
+        let is_limit = |ix: &Instruction| {
             ix.program_id == compute_program
                 && ix.accounts.is_empty()
                 && ix.data.len() == 5
                 && ix.data[0] == 2
-        });
-        let limit_price = outer.get(0).is_some_and(|ix| {
-            ix.program_id == compute_program
-                && ix.accounts.is_empty()
-                && ix.data.len() == 5
-                && ix.data[0] == 2
-        }) && outer.get(1).is_some_and(|ix| {
-            ix.program_id == compute_program && ix.accounts.is_empty() && ix.data == price
-        });
+        };
+        let price_limit = outer.get(0).is_some_and(is_price) && outer.get(1).is_some_and(is_limit);
+        let limit_price = outer.get(0).is_some_and(is_limit) && outer.get(1).is_some_and(is_price);
         let phantom_augmented = Self::has_lighthouse(transaction)?;
         if outer.len() < 4
             || (!price_limit && !(phantom_augmented && limit_price))
@@ -836,8 +833,13 @@ impl TransactionValidator {
         }
         let limit_instruction =
             if outer[0].data.first() == Some(&2) { &outer[0] } else { &outer[1] };
+        let price_instruction =
+            if outer[0].data.first() == Some(&3) { &outer[0] } else { &outer[1] };
         let compute_limit = u32::from_le_bytes(
             limit_instruction.data[1..5].try_into().map_err(|_| KoraError::ConfigError)?,
+        );
+        let compute_price = u64::from_le_bytes(
+            price_instruction.data[1..9].try_into().map_err(|_| KoraError::ConfigError)?,
         );
         let transfer = outer.last().ok_or_else(|| {
             KoraError::InvalidTransaction("CLEAN settlement is missing".to_string())
@@ -863,13 +865,19 @@ impl TransactionValidator {
         let is_burn = token_instructions.first().and_then(|instruction| instruction.data.first())
             == Some(&15);
         if is_burn {
-            if !policy.burn_enabled || compute_limit != 100_000 || token_instructions.len() != 2 {
+            if !policy.burn_enabled
+                || compute_limit != 100_000
+                || compute_price != 375_000
+                || token_instructions.len() != 2
+            {
                 return Err(KoraError::InvalidTransaction(
                     "CLEAN Burn shape is disabled or invalid".to_string(),
                 ));
             }
         } else if !policy.claim_enabled
-            || compute_limit != 100_000
+            || compute_limit != policy.claim_compute_unit_limit
+            || compute_price < policy.claim_min_compute_unit_price_micro_lamports
+            || compute_price > policy.claim_max_compute_unit_price_micro_lamports
             || token_instructions.is_empty()
             || token_instructions.len() > usize::from(policy.maximum_claim_accounts)
         {
@@ -1033,11 +1041,14 @@ impl TransactionValidator {
         let service_fee =
             reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
                 / 10_000;
-        if settlement_lamports
-            != service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
-        {
+        let expected_settlement = if is_burn {
+            service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
+        } else {
+            service_fee
+        };
+        if settlement_lamports != expected_settlement {
             return Err(KoraError::InvalidTransaction(
-                "CLEAN settlement does not match rent, fee, and network cost".to_string(),
+                "CLEAN settlement does not match the action fee policy".to_string(),
             ));
         }
         Ok(())
@@ -3573,14 +3584,17 @@ mod tests {
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
             maximum_claim_accounts: 10,
+            claim_compute_unit_limit: 10_000,
+            claim_min_compute_unit_price_micro_lamports: 1_000,
+            claim_max_compute_unit_price_micro_lamports: 100_000,
         };
         setup_config_with_policy(policy);
         let mut instructions = vec![
             solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_price(
-                375_000,
+                if burn { 375_000 } else { 1_000 },
             ),
             solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(
-                100_000,
+                if burn { 100_000 } else { 10_000 },
             ),
         ];
         if burn {
@@ -3610,7 +3624,11 @@ mod tests {
             );
         }
         let reclaimed = 2_039_280_u64 * if burn { 1 } else { claim_accounts as u64 };
-        instructions.push(transfer(&wallet, &treasury, reclaimed * 300 / 10_000 + 42_500));
+        instructions.push(transfer(
+            &wallet,
+            &treasury,
+            reclaimed * 300 / 10_000 + if burn { 42_500 } else { 0 },
+        ));
         let message = solana_message::v0::Message::try_compile(
             &payer,
             &instructions,
@@ -3681,6 +3699,9 @@ mod tests {
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
             maximum_claim_accounts: 1,
+            claim_compute_unit_limit: 10_000,
+            claim_min_compute_unit_price_micro_lamports: 1_000,
+            claim_max_compute_unit_price_micro_lamports: 100_000,
         };
         setup_config_with_policy(policy);
         let claim = if withdraw_excess {
@@ -3704,10 +3725,10 @@ mod tests {
             .unwrap()
         };
         let instructions = vec![
-            ComputeBudgetInstruction::set_compute_unit_price(375_000),
-            ComputeBudgetInstruction::set_compute_unit_limit(100_000),
+            ComputeBudgetInstruction::set_compute_unit_price(1_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(10_000),
             claim,
-            transfer(&wallet, &treasury, recoverable * 300 / 10_000 + 42_500),
+            transfer(&wallet, &treasury, recoverable * 300 / 10_000),
         ];
         let message = solana_message::v0::Message::try_compile(
             &payer,
@@ -4613,7 +4634,7 @@ mod tests {
     async fn claim_v2_rejects_the_hosted_adversarial_matrix() {
         let (validator, original, rpc) = claim_v2_fixture(true, true);
         assert!(validator.validate_clean(&original, &rpc).await.is_ok());
-        for mutation in 0..18 {
+        for mutation in 0..19 {
             let mut transaction = original.clone();
             match mutation {
                 0 => transaction
@@ -4667,7 +4688,14 @@ mod tests {
                         data
                     }
                 }
-                _ => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                17 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                _ => {
+                    transaction.all_instructions[3].data =
+                        bincode::serialize(&SystemInstruction::Transfer {
+                            lamports: 160_720 * 300 / 10_000 + 42_500,
+                        })
+                        .unwrap()
+                }
             }
             assert!(
                 validator.validate_clean(&transaction, &rpc).await.is_err(),
@@ -4709,7 +4737,7 @@ mod tests {
         for mutation in 0..12 {
             let mut transaction = original.clone();
             match mutation {
-                0 => transaction.all_instructions[0].data[1] ^= 1,
+                0 => transaction.all_instructions[0].data = vec![3, 0, 0, 0, 0, 0, 0, 0, 0],
                 1 => transaction.all_instructions[1].data[1] ^= 1,
                 2 => transaction.all_instructions.swap(0, 1),
                 3 => {

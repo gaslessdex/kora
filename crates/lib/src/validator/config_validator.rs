@@ -489,6 +489,14 @@ impl ConfigValidator {
             if clean.maximum_claim_accounts == 0 || clean.maximum_claim_accounts > 10 {
                 errors.push("CLEAN maximum_claim_accounts must be between 1 and 10".to_string());
             }
+            if clean.claim_enabled
+                && (!(2_500..=100_000).contains(&clean.claim_compute_unit_limit)
+                    || clean.claim_min_compute_unit_price_micro_lamports
+                        > clean.claim_max_compute_unit_price_micro_lamports
+                    || clean.claim_max_compute_unit_price_micro_lamports > 375_000)
+            {
+                errors.push("CLEAN Claim compute and priority-fee bounds are invalid".to_string());
+            }
             if clean.claim_v2_enabled && clean.maximum_claim_accounts != 1 {
                 errors.push(
                     "CLEAN Claim V2 canary requires exactly one maximum_claim_account".to_string(),
