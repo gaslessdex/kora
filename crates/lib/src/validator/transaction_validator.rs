@@ -12,6 +12,7 @@ use crate::{
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_program::program_option::COption;
 use solana_sdk::{
     account::Account, instruction::Instruction, pubkey::Pubkey, transaction::VersionedTransaction,
 };
@@ -19,7 +20,8 @@ use solana_system_interface::{instruction::SystemInstruction, program::ID as SYS
 use spl_token_2022_interface::{
     extension::{
         default_account_state::DefaultAccountState, pausable::PausableConfig,
-        transfer_hook::TransferHook, BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+        transfer_fee::TransferFeeAmount, transfer_hook::TransferHook, BaseStateWithExtensions,
+        ExtensionType, StateWithExtensions,
     },
     state::{Account as Token2022AccountState, Mint as Token2022MintState},
     ID as TOKEN_2022_PROGRAM_ID,
@@ -292,6 +294,28 @@ fn valid_xstock_token_account_with_extensions(
         && state.base.is_native.is_none()
         && types.len() == required.len()
         && required.iter().all(|required_type| types.contains(required_type))
+}
+
+fn valid_claim_v2_account_extensions(state: &StateWithExtensions<Token2022AccountState>) -> bool {
+    let Ok(types) = state.get_extension_types() else {
+        return false;
+    };
+    let allowed = [
+        ExtensionType::TransferFeeAmount,
+        ExtensionType::ImmutableOwner,
+        ExtensionType::MemoTransfer,
+        ExtensionType::CpiGuard,
+        ExtensionType::NonTransferableAccount,
+        ExtensionType::TransferHookAccount,
+        ExtensionType::PausableAccount,
+    ];
+    if types.iter().any(|extension| !allowed.contains(extension)) {
+        return false;
+    }
+    !types.contains(&ExtensionType::TransferFeeAmount)
+        || state
+            .get_extension::<TransferFeeAmount>()
+            .is_ok_and(|extension| u64::from(extension.withheld_amount) == 0)
 }
 
 fn supported_token_account_identity(
@@ -608,8 +632,9 @@ impl TransactionValidator {
             outer.iter().any(|instruction| instruction.program_id == jupiter_program);
         let has_clean_shape = !has_outer_jupiter
             && outer.iter().any(|instruction| {
-                instruction.program_id == spl_token_interface::id()
-                    && matches!(instruction.data.first(), Some(9 | 15))
+                (instruction.program_id == spl_token_interface::id()
+                    || instruction.program_id == TOKEN_2022_PROGRAM_ID)
+                    && matches!(instruction.data.first(), Some(9 | 15 | 38))
             });
         let recover_close_count = outer
             .iter()
@@ -750,7 +775,7 @@ impl TransactionValidator {
         rpc_client: &RpcClient,
     ) -> Result<(), KoraError> {
         let policy = &self.fee_payer_policy.system.clean;
-        let token_program = spl_token_interface::id();
+        let legacy_token_program = spl_token_interface::id();
         let compute_program = solana_compute_budget_interface::id();
         let settlement_wallet =
             Pubkey::from_str(&policy.settlement_wallet).map_err(|_| KoraError::ConfigError)?;
@@ -854,17 +879,35 @@ impl TransactionValidator {
         }
         let close_start = usize::from(is_burn);
         if token_instructions[close_start..].iter().any(|instruction| {
-            instruction.program_id != token_program
-                || !matches!(
-                    spl_token_interface::instruction::TokenInstruction::unpack(&instruction.data),
-                    Ok(spl_token_interface::instruction::TokenInstruction::CloseAccount)
-                )
+            let instruction_type = spl_token_2022_interface::instruction::TokenInstruction::unpack(
+                &instruction.data,
+            );
+            let permitted_claim_instruction = if policy.claim_v2_enabled {
+                matches!(
+                    instruction_type,
+                    Ok(spl_token_2022_interface::instruction::TokenInstruction::CloseAccount)
+                        | Ok(spl_token_2022_interface::instruction::TokenInstruction::WithdrawExcessLamports)
+                ) && (instruction.program_id == legacy_token_program
+                    || instruction.program_id == TOKEN_2022_PROGRAM_ID)
+            } else {
+                matches!(
+                    instruction_type,
+                    Ok(spl_token_2022_interface::instruction::TokenInstruction::CloseAccount)
+                ) && instruction.program_id == legacy_token_program
+            };
+            !permitted_claim_instruction
                 || instruction.accounts.len() != 3
+                || instruction.accounts[0].is_signer
+                || !instruction.accounts[0].is_writable
                 || instruction.accounts[1].pubkey != wallet
+                || !instruction.accounts[1].is_signer
+                || !instruction.accounts[1].is_writable
                 || instruction.accounts[2].pubkey != wallet
+                || !instruction.accounts[2].is_signer
+                || !instruction.accounts[2].is_writable
         }) {
             return Err(KoraError::InvalidTransaction(
-                "CLEAN close-account fields are invalid".to_string(),
+                "CLEAN claim-account fields are invalid".to_string(),
             ));
         }
         let source_keys = token_instructions[close_start..]
@@ -903,38 +946,49 @@ impl TransactionValidator {
             let account = account.as_ref().ok_or_else(|| {
                 KoraError::InvalidTransaction("CLEAN token account is missing".to_string())
             })?;
-            let data = &account.data;
-            let expected_amount = u64::from_le_bytes(
-                data.get(64..72)
-                    .ok_or_else(|| {
-                        KoraError::InvalidTransaction(
-                            "CLEAN token account is malformed".to_string(),
-                        )
-                    })?
-                    .try_into()
-                    .map_err(|_| KoraError::ConfigError)?,
-            );
-            let close_tag = data.get(129..133).ok_or_else(|| {
-                KoraError::InvalidTransaction("CLEAN token account is malformed".to_string())
-            })?;
-            let close_valid = close_tag == [0, 0, 0, 0];
-            if account.owner != token_program
-                || data.len() != 165
-                || data.get(32..64) != Some(wallet.as_ref())
-                || data.get(72..76) != Some(&[0, 0, 0, 0])
-                || data.get(108) != Some(&1)
-                || data.get(109..113) != Some(&[0, 0, 0, 0])
-                || data.get(121..129) != Some(&[0, 0, 0, 0, 0, 0, 0, 0])
-                || !close_valid
-                || (!is_burn && expected_amount != 0)
+            let state = StateWithExtensions::<Token2022AccountState>::unpack(&account.data)
+                .map_err(|_| {
+                    KoraError::InvalidTransaction("CLEAN token account is malformed".to_string())
+                })?;
+            let instruction = &token_instructions[close_start + index];
+            let is_withdraw = instruction.data.first() == Some(&38);
+            let close_authority_valid = state.base.close_authority == COption::None
+                || state.base.close_authority == COption::Some(wallet);
+            if account.owner != instruction.program_id
+                || ![legacy_token_program, TOKEN_2022_PROGRAM_ID].contains(&account.owner)
+                || state.base.owner != wallet
+                || state.base.state != spl_token_2022_interface::state::AccountState::Initialized
+                || state.base.is_native.is_some()
+                || (account.owner == legacy_token_program && account.data.len() != 165)
+                || (account.owner == TOKEN_2022_PROGRAM_ID
+                    && !valid_claim_v2_account_extensions(&state))
+                || (!policy.claim_v2_enabled
+                    && (state.base.delegate.is_some()
+                        || state.base.delegated_amount != 0
+                        || state.base.close_authority.is_some()))
+                || (!is_burn && !is_withdraw && (state.base.amount != 0 || !close_authority_valid))
             {
                 return Err(KoraError::InvalidTransaction(
                     "CLEAN token account is not eligible".to_string(),
                 ));
             }
-            reclaimed = reclaimed.checked_add(account.lamports).ok_or(KoraError::ConfigError)?;
+            let recoverable = if is_withdraw {
+                let rent_floor =
+                    rpc_client.get_minimum_balance_for_rent_exemption(account.data.len()).await?;
+                account.lamports.checked_sub(rent_floor).filter(|value| *value > 0).ok_or_else(
+                    || {
+                        KoraError::InvalidTransaction(
+                            "CLEAN account has no excess lamports".to_string(),
+                        )
+                    },
+                )?
+            } else {
+                account.lamports
+            };
+            reclaimed = reclaimed.checked_add(recoverable).ok_or(KoraError::ConfigError)?;
             if is_burn && index == 0 {
                 let burn = &token_instructions[0];
+                let expected_amount = state.base.amount;
                 let (amount, decimals) =
                     match spl_token_interface::instruction::TokenInstruction::unpack(&burn.data) {
                         Ok(spl_token_interface::instruction::TokenInstruction::BurnChecked {
@@ -947,7 +1001,7 @@ impl TransactionValidator {
                             ))
                         }
                     };
-                if burn.program_id != token_program
+                if burn.program_id != legacy_token_program
                     || burn.accounts.len() != 3
                     || burn.accounts[0].pubkey != source_keys[0]
                     || burn.accounts[2].pubkey != wallet
@@ -962,7 +1016,7 @@ impl TransactionValidator {
                     accounts.last().and_then(|account| account.as_ref()).ok_or_else(|| {
                         KoraError::InvalidTransaction("CLEAN Burn mint is missing".to_string())
                     })?;
-                if mint.owner != token_program
+                if mint.owner != legacy_token_program
                     || mint.data.len() != 82
                     || mint.data[44] == 0
                     || mint.data[45] != 1
@@ -3514,6 +3568,7 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.clean = CleanPolicy {
             claim_enabled,
+            claim_v2_enabled: false,
             burn_enabled,
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
@@ -3603,6 +3658,86 @@ mod tests {
         );
         let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
         (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet, treasury)
+    }
+
+    fn claim_v2_fixture(
+        token_2022: bool,
+        withdraw_excess: bool,
+    ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let source = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program =
+            if token_2022 { TOKEN_2022_PROGRAM_ID } else { spl_token_interface::id() };
+        let rent_floor = 2_039_280_u64;
+        let recoverable = if withdraw_excess { 160_720_u64 } else { rent_floor };
+        let mut policy = FeePayerPolicy::default();
+        policy.system.clean = CleanPolicy {
+            claim_enabled: true,
+            claim_v2_enabled: true,
+            burn_enabled: false,
+            settlement_wallet: treasury.to_string(),
+            fee_bps: 300,
+            maximum_claim_accounts: 1,
+        };
+        setup_config_with_policy(policy);
+        let claim = if withdraw_excess {
+            Instruction::new_with_bytes(
+                token_program,
+                &[38],
+                vec![
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(wallet, false),
+                    AccountMeta::new_readonly(wallet, true),
+                ],
+            )
+        } else {
+            spl_token_2022_interface::instruction::close_account(
+                &token_program,
+                &source,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap()
+        };
+        let instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(375_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(100_000),
+            claim,
+            transfer(&wallet, &treasury, recoverable * 300 / 10_000 + 42_500),
+        ];
+        let message = solana_message::v0::Message::try_compile(
+            &payer,
+            &instructions,
+            &[],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        let transaction = TransactionUtil::new_unsigned_versioned_transaction_resolved(
+            VersionedMessage::V0(message),
+        )
+        .unwrap();
+        let mut token_data = vec![0_u8; 165];
+        token_data[0..32].copy_from_slice(mint.as_ref());
+        token_data[32..64].copy_from_slice(wallet.as_ref());
+        token_data[108] = 1;
+        let account_lamports = rent_floor + if withdraw_excess { recoverable } else { 0 };
+        let account = json!({ "data": [base64::engine::general_purpose::STANDARD.encode(token_data), "base64"], "executable": false, "lamports": account_lamports, "owner": token_program.to_string(), "rentEpoch": 0 });
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": [account] }),
+        );
+        mocks.insert(RpcRequest::GetMinimumBalanceForRentExemption, json!(rent_floor));
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": 42_500 }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc)
     }
 
     fn recover_fixture(
@@ -4456,6 +4591,88 @@ mod tests {
             let (validator, transaction, rpc, _, _) =
                 clean_fixture(burn, !burn, burn, claim_accounts);
             assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claim_v2_accepts_only_the_four_one_account_instruction_classes() {
+        for (token_2022, withdraw_excess) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (validator, transaction, rpc) = claim_v2_fixture(token_2022, withdraw_excess);
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_ok(),
+                "token_2022={token_2022}, withdraw_excess={withdraw_excess}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claim_v2_rejects_the_hosted_adversarial_matrix() {
+        let (validator, original, rpc) = claim_v2_fixture(true, true);
+        assert!(validator.validate_clean(&original, &rpc).await.is_ok());
+        for mutation in 0..18 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => transaction
+                    .all_instructions
+                    .insert(2, transfer(&validator.fee_payer_pubkey, &Pubkey::new_unique(), 1)),
+                1 => {
+                    transaction.all_instructions[3].data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 50_000 })
+                            .unwrap()
+                }
+                2 => transaction.all_instructions[3].accounts[1].pubkey = Pubkey::new_unique(),
+                3 => transaction.all_instructions[3].accounts[0].pubkey = Pubkey::new_unique(),
+                4 => transaction
+                    .all_instructions
+                    .insert(2, Instruction::new_with_bytes(Pubkey::new_unique(), &[], vec![])),
+                5 => transaction.all_instructions[2].data[0] = 3,
+                6 => {
+                    transaction.all_instructions[2].program_id = spl_token_interface::id();
+                    transaction.all_instructions[2].data[0] = 3;
+                }
+                7 => transaction.all_instructions[2].data[0] = 15,
+                8 => transaction.all_instructions[2].data[0] = 4,
+                9 => transaction.all_instructions[2].data[0] = 6,
+                10 => transaction.all_instructions[2].accounts[1].pubkey = Pubkey::new_unique(),
+                11 => transaction.all_instructions[2].accounts[0].pubkey = Pubkey::new_unique(),
+                12 => transaction.all_instructions[2].program_id = Pubkey::new_unique(),
+                13 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.header.num_required_signatures = 3;
+                        message.account_keys.insert(2, Pubkey::new_unique());
+                    }
+                    _ => unreachable!(),
+                },
+                14 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.account_keys.push(Pubkey::new_unique())
+                    }
+                    _ => unreachable!(),
+                },
+                15 => {
+                    transaction.all_instructions[1].data = {
+                        let mut data = vec![2];
+                        data.extend_from_slice(&200_000_u32.to_le_bytes());
+                        data
+                    }
+                }
+                16 => {
+                    transaction.all_instructions[0].data = {
+                        let mut data = vec![3];
+                        data.extend_from_slice(&1_000_000_u64.to_le_bytes());
+                        data
+                    }
+                }
+                _ => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "Claim V2 adversarial mutation {mutation} must fail"
+            );
         }
     }
 

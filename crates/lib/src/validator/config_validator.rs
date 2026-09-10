@@ -475,8 +475,10 @@ impl ConfigValidator {
                 || config.validation.fee_payer_policy.system.allow_transfer
                 || config.validation.fee_payer_policy.spl_token.allow_burn
                 || config.validation.fee_payer_policy.spl_token.allow_close_account
+                || config.validation.fee_payer_policy.token_2022.allow_burn
+                || config.validation.fee_payer_policy.token_2022.allow_close_account
             {
-                errors.push("CLEAN requires global System transfer/create and SPL burn/close permissions to remain false".to_string());
+                errors.push("CLEAN requires global System transfer/create and token burn/close permissions to remain false".to_string());
             }
             if Pubkey::from_str(&clean.settlement_wallet).is_err() {
                 errors.push("Invalid CLEAN settlement_wallet".to_string());
@@ -487,7 +489,17 @@ impl ConfigValidator {
             if clean.maximum_claim_accounts == 0 || clean.maximum_claim_accounts > 10 {
                 errors.push("CLEAN maximum_claim_accounts must be between 1 and 10".to_string());
             }
-            for program in [SYSTEM_PROGRAM_ID.to_string(), SPL_TOKEN_PROGRAM_ID.to_string()] {
+            if clean.claim_v2_enabled && clean.maximum_claim_accounts != 1 {
+                errors.push(
+                    "CLEAN Claim V2 canary requires exactly one maximum_claim_account".to_string(),
+                );
+            }
+            let mut required_programs =
+                vec![SYSTEM_PROGRAM_ID.to_string(), SPL_TOKEN_PROGRAM_ID.to_string()];
+            if clean.claim_v2_enabled {
+                required_programs.push(TOKEN_2022_PROGRAM_ID.to_string());
+            }
+            for program in required_programs {
                 if !config.validation.allowed_programs.contains(&program) {
                     errors.push(format!("CLEAN requires allowed program {program}"));
                 }

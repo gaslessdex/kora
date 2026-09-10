@@ -252,6 +252,8 @@ impl Default for SendMintPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CleanPolicy {
     pub claim_enabled: bool,
+    #[serde(default)]
+    pub claim_v2_enabled: bool,
     pub burn_enabled: bool,
     #[serde(default)]
     pub settlement_wallet: String,
