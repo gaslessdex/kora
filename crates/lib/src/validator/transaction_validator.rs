@@ -875,9 +875,12 @@ impl TransactionValidator {
                 ));
             }
         } else if !policy.claim_enabled
-            || compute_limit != policy.claim_compute_unit_limit
-            || compute_price < policy.claim_min_compute_unit_price_micro_lamports
-            || compute_price > policy.claim_max_compute_unit_price_micro_lamports
+            || (!(compute_limit == policy.claim_compute_unit_limit
+                && compute_price >= policy.claim_min_compute_unit_price_micro_lamports
+                && compute_price <= policy.claim_max_compute_unit_price_micro_lamports)
+                && !(policy.claim_v1_transition_enabled
+                    && compute_limit == 100_000
+                    && compute_price == 375_000))
             || token_instructions.is_empty()
             || token_instructions.len() > usize::from(policy.maximum_claim_accounts)
         {
@@ -1041,7 +1044,11 @@ impl TransactionValidator {
         let service_fee =
             reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
                 / 10_000;
-        let expected_settlement = if is_burn {
+        let legacy_claim_transition = !is_burn
+            && policy.claim_v1_transition_enabled
+            && compute_limit == 100_000
+            && compute_price == 375_000;
+        let expected_settlement = if is_burn || legacy_claim_transition {
             service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
         } else {
             service_fee
@@ -3580,6 +3587,7 @@ mod tests {
         policy.system.clean = CleanPolicy {
             claim_enabled,
             claim_v2_enabled: false,
+            claim_v1_transition_enabled: false,
             burn_enabled,
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
@@ -3695,6 +3703,7 @@ mod tests {
         policy.system.clean = CleanPolicy {
             claim_enabled: true,
             claim_v2_enabled: true,
+            claim_v1_transition_enabled: false,
             burn_enabled: false,
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
@@ -4613,6 +4622,142 @@ mod tests {
                 clean_fixture(burn, !burn, burn, claim_accounts);
             assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claim_v1_transition_accepts_only_exact_old_or_new_economics() {
+        let service_fee = 2_039_280_u64 * 300 / 10_000;
+        let network_fee = 42_500_u64;
+
+        for (compute_price, compute_limit, settlement, accepted) in [
+            (1_000, 10_000, service_fee, true),
+            (1_000, 10_000, service_fee + 1, false),
+            (1_000, 10_000, service_fee + network_fee / 2, false),
+            (1_000, 10_000, service_fee + network_fee, false),
+            (375_000, 100_000, service_fee + network_fee, true),
+            (375_000, 100_000, service_fee, false),
+            (375_000, 100_000, service_fee + network_fee / 2, false),
+            (375_000, 100_000, service_fee + network_fee - 1, false),
+            (375_000, 100_000, service_fee + network_fee + 1, false),
+            (100_000, 100_000, service_fee + network_fee, false),
+            (375_000, 10_000, service_fee, false),
+            (375_001, 100_000, service_fee + network_fee, false),
+        ] {
+            let (mut validator, original, rpc, _, _) = clean_fixture(false, true, false, 1);
+            validator.fee_payer_policy.system.clean.claim_v1_transition_enabled = true;
+            let mut transaction = original.clone();
+            transaction.all_instructions[0] =
+                ComputeBudgetInstruction::set_compute_unit_price(compute_price);
+            transaction.all_instructions[1] =
+                ComputeBudgetInstruction::set_compute_unit_limit(compute_limit);
+            transaction.all_instructions.last_mut().unwrap().data =
+                bincode::serialize(&SystemInstruction::Transfer { lamports: settlement }).unwrap();
+            let result = validator.validate_clean(&transaction, &rpc).await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "price={compute_price}, limit={compute_limit}, settlement={settlement}, result={result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claim_v1_transition_rejects_adversarial_old_envelope_mutations() {
+        let (mut validator, mut original, rpc, _, _) = clean_fixture(false, true, false, 1);
+        validator.fee_payer_policy.system.clean.claim_v1_transition_enabled = true;
+        original.all_instructions[0] = ComputeBudgetInstruction::set_compute_unit_price(375_000);
+        original.all_instructions[1] = ComputeBudgetInstruction::set_compute_unit_limit(100_000);
+        original.all_instructions.last_mut().unwrap().data =
+            bincode::serialize(&SystemInstruction::Transfer {
+                lamports: 2_039_280 * 300 / 10_000 + 42_500,
+            })
+            .unwrap();
+        assert!(validator.validate_clean(&original, &rpc).await.is_ok());
+
+        for mutation in 0..14 {
+            let (mut validator, mut transaction, rpc, wallet, _) =
+                clean_fixture(false, true, false, 1);
+            validator.fee_payer_policy.system.clean.claim_v1_transition_enabled = true;
+            transaction.all_instructions[0] =
+                ComputeBudgetInstruction::set_compute_unit_price(375_000);
+            transaction.all_instructions[1] =
+                ComputeBudgetInstruction::set_compute_unit_limit(100_000);
+            transaction.all_instructions.last_mut().unwrap().data =
+                bincode::serialize(&SystemInstruction::Transfer {
+                    lamports: 2_039_280 * 300 / 10_000 + 42_500,
+                })
+                .unwrap();
+            match mutation {
+                0 => {
+                    transaction.all_instructions.last_mut().unwrap().accounts[1].pubkey =
+                        Pubkey::new_unique()
+                }
+                1 => transaction.all_instructions[2].accounts[1].pubkey = Pubkey::new_unique(),
+                2 => transaction.all_instructions[2].accounts[2].pubkey = Pubkey::new_unique(),
+                3 => transaction
+                    .all_instructions
+                    .insert(2, transfer(&validator.fee_payer_pubkey, &Pubkey::new_unique(), 1)),
+                4 => transaction.all_instructions.insert(
+                    2,
+                    spl_token_interface::instruction::transfer(
+                        &spl_token_interface::id(),
+                        &Pubkey::new_unique(),
+                        &Pubkey::new_unique(),
+                        &wallet,
+                        &[],
+                        1,
+                    )
+                    .unwrap(),
+                ),
+                5 => transaction.all_instructions[2].data[0] = 15,
+                6 => transaction.all_instructions[2].data[0] = 4,
+                7 => transaction.all_instructions[2].data[0] = 6,
+                8 => transaction.all_instructions[2].program_id = Pubkey::new_unique(),
+                9 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.header.num_required_signatures = 3;
+                        message.account_keys.insert(2, Pubkey::new_unique());
+                    }
+                    _ => unreachable!(),
+                },
+                10 => match &mut transaction.transaction.message {
+                    VersionedMessage::V0(message) => {
+                        message.account_keys.push(Pubkey::new_unique())
+                    }
+                    _ => unreachable!(),
+                },
+                11 => {
+                    transaction.all_instructions[1] =
+                        ComputeBudgetInstruction::set_compute_unit_limit(100_001)
+                }
+                12 => {
+                    transaction.all_instructions[0] =
+                        ComputeBudgetInstruction::set_compute_unit_price(375_001)
+                }
+                _ => {
+                    transaction.all_instructions.last_mut().unwrap().accounts[0].pubkey =
+                        validator.fee_payer_pubkey
+                }
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "transitional old-envelope mutation {mutation} must fail"
+            );
+        }
+
+        let (mut validator, mut transaction, rpc, _, _) =
+            clean_fixture_with_account_mutation(false, true, false, 1, Some(1));
+        validator.fee_payer_policy.system.clean.claim_v1_transition_enabled = true;
+        transaction.all_instructions[0] = ComputeBudgetInstruction::set_compute_unit_price(375_000);
+        transaction.all_instructions[1] = ComputeBudgetInstruction::set_compute_unit_limit(100_000);
+        transaction.all_instructions.last_mut().unwrap().data =
+            bincode::serialize(&SystemInstruction::Transfer {
+                lamports: 2_039_280 * 300 / 10_000 + 42_500,
+            })
+            .unwrap();
+        assert!(validator.validate_clean(&transaction, &rpc).await.is_err());
     }
 
     #[tokio::test]

@@ -254,6 +254,8 @@ pub struct CleanPolicy {
     pub claim_enabled: bool,
     #[serde(default)]
     pub claim_v2_enabled: bool,
+    #[serde(default)]
+    pub claim_v1_transition_enabled: bool,
     pub burn_enabled: bool,
     #[serde(default)]
     pub settlement_wallet: String,

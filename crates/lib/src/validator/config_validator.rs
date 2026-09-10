@@ -502,6 +502,18 @@ impl ConfigValidator {
                     "CLEAN Claim V2 canary requires exactly one maximum_claim_account".to_string(),
                 );
             }
+            if clean.claim_v1_transition_enabled
+                && (!clean.claim_enabled
+                    || clean.claim_v2_enabled
+                    || (clean.claim_compute_unit_limit == 100_000
+                        && clean.claim_min_compute_unit_price_micro_lamports <= 375_000
+                        && clean.claim_max_compute_unit_price_micro_lamports >= 375_000))
+            {
+                errors.push(
+                    "CLEAN Claim V1 transition requires Claim V1 with distinct old and new compute envelopes"
+                        .to_string(),
+                );
+            }
             let mut required_programs =
                 vec![SYSTEM_PROGRAM_ID.to_string(), SPL_TOKEN_PROGRAM_ID.to_string()];
             if clean.claim_v2_enabled {

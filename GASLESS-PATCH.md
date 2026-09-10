@@ -37,6 +37,7 @@ This policy is disabled by default and has not been deployed:
 ```toml
 [validation.fee_payer_policy.system.clean]
 claim_enabled = false
+claim_v1_transition_enabled = false
 burn_enabled = false
 settlement_wallet = "EEFxZ3mtdPXNKkBQkbuAw1HBPvQvU2HVKWvRVbuciSsb"
 fee_bps = 300
@@ -47,6 +48,13 @@ claim_max_compute_unit_price_micro_lamports = 100000
 ```
 
 Claim/Burn validation is shape-specific: v0, exactly payer and user signers, current eligible SPL state, and user recovery destination. Claim requires the configured bounded compute prefix and a settlement of exactly the integer-floor 3% service fee; Kora's payer absorbs the network fee. Burn retains the exact 375000/100000 compute prefix, full-balance validation, and 3% fee plus network reimbursement. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
+
+`claim_v1_transition_enabled` is a temporary, default-off migration switch. It is valid only for
+Claim V1 and only when the configured new compute envelope cannot overlap the legacy
+375000-micro-lamport/100000-CU envelope. When enabled, Kora accepts either the configured new
+compute envelope with exactly the 3% service-fee settlement, or that one legacy compute envelope
+with exactly the 3% service fee plus the RPC-computed network fee. Mixing either compute envelope
+with the other settlement amount, including any intermediate reimbursement, is rejected.
 
 ## Recover Value policy
 
