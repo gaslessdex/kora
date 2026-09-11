@@ -3881,10 +3881,11 @@ mod tests {
             &mint,
             &token_program,
         );
-        let rent_floor = 2_039_280_u64;
+        // Read-only Mainnet snapshot from 2026-09-11; fixture validation never submits.
+        let rent_floor = 1_855_569_u64;
         let recoverable = 183_711_u64;
         let token_amount = 3_785_080_u64;
-        let wallet_lamports = 890_900_u64;
+        let wallet_lamports = 890_880_u64;
         let lighthouse = Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap();
         let mut policy = FeePayerPolicy::default();
         policy.system.clean = CleanPolicy {
