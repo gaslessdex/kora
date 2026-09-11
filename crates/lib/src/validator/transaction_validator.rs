@@ -39,26 +39,50 @@ const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 100_000;
 const CLAIM_LIGHTHOUSE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000;
 const CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS: u64 = 100_000;
 
-fn claim_lighthouse_account_data(wallet_lamports: u64) -> Vec<u8> {
+#[cfg(test)]
+fn claim_lighthouse_account_data(lamport_floor: u64) -> Vec<u8> {
     let mut data = vec![6, 5, 3, 0];
-    let floor = (u128::from(wallet_lamports) * 9 / 10) as u64;
-    data.extend_from_slice(&floor.to_le_bytes());
+    data.extend_from_slice(&lamport_floor.to_le_bytes());
     data.extend_from_slice(&[4, 3, 0, 0, 1]);
     data.extend_from_slice(&0_u64.to_le_bytes());
     data.push(0);
     data
 }
 
-fn claim_lighthouse_token_data(token_amount: u64, wallet: Pubkey) -> Vec<u8> {
+#[cfg(test)]
+fn claim_lighthouse_token_data(amount_floor: u64, wallet: Pubkey) -> Vec<u8> {
     let mut data = vec![10, 5, 6, 8, 2];
-    let floor = (u128::from(token_amount) * 3 / 4) as u64;
-    data.extend_from_slice(&floor.to_le_bytes());
+    data.extend_from_slice(&amount_floor.to_le_bytes());
     data.extend_from_slice(&[4, 3, 0, 0, 6]);
     data.extend_from_slice(&0_u64.to_le_bytes());
     data.extend_from_slice(&[0, 1]);
     data.extend_from_slice(wallet.as_ref());
     data.extend_from_slice(&[0, 7, 0, 0]);
     data
+}
+
+fn claim_lighthouse_account_data_is_safe(data: &[u8], expected_post_lamports: u64) -> bool {
+    data.len() == 26
+        && data[..4] == [6, 5, 3, 0]
+        && u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8])) <= expected_post_lamports
+        && data[12..17] == [4, 3, 0, 0, 1]
+        && data[17..25] == [0; 8]
+        && data[25] == 0
+}
+
+fn claim_lighthouse_token_data_is_safe(
+    data: &[u8],
+    expected_post_amount: u64,
+    wallet: Pubkey,
+) -> bool {
+    data.len() == 64
+        && data[..5] == [10, 5, 6, 8, 2]
+        && u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8])) <= expected_post_amount
+        && data[13..18] == [4, 3, 0, 0, 6]
+        && data[18..26] == [0; 8]
+        && data[26..28] == [0, 1]
+        && data[28..60] == wallet.to_bytes()
+        && data[60..64] == [0, 7, 0, 0]
 }
 
 fn valid_raydium_tick_array_sequence(starts: &[i32], current_start: i32, interval: i32) -> bool {
@@ -1080,6 +1104,9 @@ impl TransactionValidator {
             }
         }
         let network_fee = rpc_client.get_fee_for_message(message).await?;
+        let service_fee =
+            reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
+                / 10_000;
         if phantom_augmented && !is_burn {
             let source = source_keys.first().ok_or_else(|| {
                 KoraError::InvalidTransaction("Lighthouse Claim source is missing".to_string())
@@ -1116,6 +1143,11 @@ impl TransactionValidator {
                 &source_state.base.mint,
                 &legacy_token_program,
             );
+            let expected_wallet_post = wallet_account
+                .lamports
+                .checked_add(reclaimed)
+                .and_then(|value| value.checked_sub(service_fee))
+                .ok_or(KoraError::ConfigError)?;
             if token_instructions.len() != 1
                 || token_instructions[0].program_id != legacy_token_program
                 || token_instructions[0].data.as_slice() != [38]
@@ -1132,23 +1164,23 @@ impl TransactionValidator {
                 || assertions[0].accounts[0].pubkey != wallet
                 || !assertions[0].accounts[0].is_signer
                 || !assertions[0].accounts[0].is_writable
-                || assertions[0].data != claim_lighthouse_account_data(wallet_account.lamports)
+                || !claim_lighthouse_account_data_is_safe(&assertions[0].data, expected_wallet_post)
                 || assertions[1].program_id != lighthouse
                 || assertions[1].accounts.len() != 1
                 || assertions[1].accounts[0].pubkey != *source
                 || assertions[1].accounts[0].is_signer
                 || !assertions[1].accounts[0].is_writable
-                || assertions[1].data
-                    != claim_lighthouse_token_data(source_state.base.amount, wallet)
+                || !claim_lighthouse_token_data_is_safe(
+                    &assertions[1].data,
+                    source_state.base.amount,
+                    wallet,
+                )
             {
                 return Err(KoraError::InvalidTransaction(
                     "Lighthouse Claim augmentation is invalid".to_string(),
                 ));
             }
         }
-        let service_fee =
-            reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
-                / 10_000;
         let expected_settlement = if is_burn {
             service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
         } else {
@@ -3916,12 +3948,12 @@ mod tests {
             transfer(&wallet, &treasury, recoverable * 300 / 10_000),
             Instruction::new_with_bytes(
                 lighthouse,
-                &claim_lighthouse_account_data(wallet_lamports),
+                &claim_lighthouse_account_data(801_810),
                 vec![AccountMeta::new_readonly(wallet, false)],
             ),
             Instruction::new_with_bytes(
                 lighthouse,
-                &claim_lighthouse_token_data(token_amount, wallet),
+                &claim_lighthouse_token_data(2_838_810, wallet),
                 vec![AccountMeta::new_readonly(source, false)],
             ),
         ];
@@ -4905,6 +4937,16 @@ mod tests {
     async fn claim_v2_accepts_exact_solflare_lighthouse_suffix() {
         let (validator, transaction, rpc) = claim_lighthouse_fixture();
         assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
+
+        for (wallet_floor, token_floor) in
+            [(801_792_u64, 2_838_810_u64), (1_069_080_u64, 3_785_080_u64)]
+        {
+            let (validator, mut transaction, rpc) = claim_lighthouse_fixture();
+            let wallet = transaction.all_instructions[4].accounts[0].pubkey;
+            transaction.all_instructions[4].data = claim_lighthouse_account_data(wallet_floor);
+            transaction.all_instructions[5].data = claim_lighthouse_token_data(token_floor, wallet);
+            assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
+        }
     }
 
     #[tokio::test]
@@ -4921,8 +4963,10 @@ mod tests {
                 4 => transaction.all_instructions[5].data.truncate(12),
                 5 => transaction.all_instructions[4].data[3] = 1,
                 6 => transaction.all_instructions[4].data[12] = 0,
-                7 => transaction.all_instructions[4].data[4] ^= 1,
-                8 => transaction.all_instructions[5].data[5] ^= 1,
+                7 => transaction.all_instructions[4].data[4..12]
+                    .copy_from_slice(&1_069_081_u64.to_le_bytes()),
+                8 => transaction.all_instructions[5].data[5..13]
+                    .copy_from_slice(&3_785_081_u64.to_le_bytes()),
                 9 => transaction.all_instructions[4].accounts[0].pubkey = Pubkey::new_unique(),
                 10 => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
                 11 => transaction.all_instructions[4].program_id = Pubkey::new_unique(),
