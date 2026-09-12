@@ -84,6 +84,10 @@ fn recover_lighthouse_account_data_is_safe(data: &[u8], expected_floor_lamports:
         && data[25] == 0
 }
 
+fn burn_lighthouse_account_data_is_safe(data: &[u8], maximum_floor_lamports: u64) -> bool {
+    claim_lighthouse_account_data_is_safe(data, maximum_floor_lamports)
+}
+
 fn claim_lighthouse_token_data_is_safe(
     data: &[u8],
     expected_post_amount: u64,
@@ -1182,10 +1186,7 @@ impl TransactionValidator {
                 || assertions[0].accounts[0].pubkey != wallet
                 || !assertions[0].accounts[0].is_signer
                 || !assertions[0].accounts[0].is_writable
-                || !recover_lighthouse_account_data_is_safe(
-                    &assertions[0].data,
-                    expected_wallet_post,
-                )
+                || !burn_lighthouse_account_data_is_safe(&assertions[0].data, expected_wallet_post)
             {
                 return Err(KoraError::InvalidTransaction(
                     "Lighthouse Burn augmentation is invalid".to_string(),
@@ -4099,7 +4100,7 @@ mod tests {
             transfer(&wallet, &treasury, service_fee + canonical_network),
             Instruction::new_with_bytes(
                 lighthouse,
-                &claim_lighthouse_account_data(expected_wallet_post),
+                &claim_lighthouse_account_data(expected_wallet_post - 100),
                 vec![solana_sdk::instruction::AccountMeta::new_readonly(wallet, false)],
             ),
         ];
@@ -5435,7 +5436,8 @@ mod tests {
                         .data
                 }
                 2 => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
-                3 => transaction.all_instructions[5].data[4] ^= 1,
+                3 => transaction.all_instructions[5].data[4..12]
+                    .copy_from_slice(&u64::MAX.to_le_bytes()),
                 4 => transaction.all_instructions[5].data[12] = 0,
                 5 => transaction.all_instructions[5].data[16] = 0,
                 6 => transaction.all_instructions[5].data[17] = 1,
