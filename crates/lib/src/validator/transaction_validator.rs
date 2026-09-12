@@ -38,6 +38,11 @@ const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_LIMIT: u32 = 50_000;
 const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 100_000;
 const CLAIM_LIGHTHOUSE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000;
 const CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS: u64 = 100_000;
+const BURN_CANONICAL_COMPUTE_UNIT_LIMIT: u32 = 100_000;
+const BURN_AUGMENTED_COMPUTE_UNIT_LIMIT: u32 = 120_000;
+const BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 375_000;
+const BURN_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS: u64 = 7_500;
+const BURN_MAX_NETWORK_FEE_LAMPORTS: u64 = 100_000;
 
 #[cfg(test)]
 fn claim_lighthouse_account_data(lamport_floor: u64) -> Vec<u8> {
@@ -925,8 +930,9 @@ impl TransactionValidator {
             == Some(&15);
         if is_burn {
             if !policy.burn_enabled
-                || compute_limit != 100_000
-                || compute_price != 375_000
+                || compute_price != BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
+                || (!phantom_augmented && compute_limit != BURN_CANONICAL_COMPUTE_UNIT_LIMIT)
+                || (phantom_augmented && compute_limit != BURN_AUGMENTED_COMPUTE_UNIT_LIMIT)
                 || token_instructions.len() != 2
             {
                 return Err(KoraError::InvalidTransaction(
@@ -1020,7 +1026,7 @@ impl TransactionValidator {
                     .pubkey,
             );
         }
-        if phantom_augmented && !is_burn {
+        if phantom_augmented {
             addresses.push(wallet);
         }
         let accounts = rpc_client.get_multiple_accounts(&addresses).await?;
@@ -1045,7 +1051,7 @@ impl TransactionValidator {
                 || (account.owner == legacy_token_program && account.data.len() != 165)
                 || (account.owner == TOKEN_2022_PROGRAM_ID
                     && !valid_claim_v2_account_extensions(&state))
-                || (!policy.claim_v2_enabled
+                || ((is_burn || !policy.claim_v2_enabled)
                     && (state.base.delegate.is_some()
                         || state.base.delegated_amount != 0
                         || state.base.close_authority.is_some()))
@@ -1095,8 +1101,10 @@ impl TransactionValidator {
                         "CLEAN Burn fields do not match current state".to_string(),
                     ));
                 }
-                let mint =
-                    accounts.last().and_then(|account| account.as_ref()).ok_or_else(|| {
+                let mint = accounts
+                    .get(source_keys.len())
+                    .and_then(|account| account.as_ref())
+                    .ok_or_else(|| {
                         KoraError::InvalidTransaction("CLEAN Burn mint is missing".to_string())
                     })?;
                 if mint.owner != legacy_token_program
@@ -1116,6 +1124,74 @@ impl TransactionValidator {
         let service_fee =
             reclaimed.checked_mul(u64::from(policy.fee_bps)).ok_or(KoraError::ConfigError)?
                 / 10_000;
+        let canonical_burn_network_fee = if is_burn && phantom_augmented {
+            let final_priority = u64::from(compute_limit)
+                .checked_mul(compute_price)
+                .and_then(|value| value.checked_add(999_999))
+                .map(|value| value / 1_000_000)
+                .ok_or(KoraError::ConfigError)?;
+            let canonical_priority = u64::from(BURN_CANONICAL_COMPUTE_UNIT_LIMIT)
+                .checked_mul(BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS)
+                .and_then(|value| value.checked_add(999_999))
+                .map(|value| value / 1_000_000)
+                .ok_or(KoraError::ConfigError)?;
+            let canonical = network_fee
+                .checked_sub(final_priority)
+                .and_then(|base| base.checked_add(canonical_priority))
+                .ok_or(KoraError::ConfigError)?;
+            if network_fee > BURN_MAX_NETWORK_FEE_LAMPORTS
+                || network_fee.checked_sub(canonical)
+                    != Some(BURN_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Burn network cost is invalid".to_string(),
+                ));
+            }
+            canonical
+        } else {
+            network_fee
+        };
+        if is_burn && phantom_augmented {
+            let wallet_account =
+                accounts.last().and_then(|account| account.as_ref()).ok_or_else(|| {
+                    KoraError::InvalidTransaction("Lighthouse Burn wallet is missing".to_string())
+                })?;
+            let outer_count = transaction.transaction.message.instructions().len();
+            let full_outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Lighthouse Burn instructions are unresolved".to_string(),
+                )
+            })?;
+            let assertions =
+                full_outer.get(full_outer.len().saturating_sub(1)..).ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Burn assertion is missing".to_string(),
+                    )
+                })?;
+            let expected_wallet_post = wallet_account
+                .lamports
+                .checked_add(reclaimed)
+                .and_then(|value| value.checked_sub(service_fee))
+                .and_then(|value| value.checked_sub(canonical_burn_network_fee))
+                .ok_or(KoraError::ConfigError)?;
+            if wallet_account.owner != SYSTEM_PROGRAM_ID
+                || !wallet_account.data.is_empty()
+                || assertions.len() != 1
+                || assertions[0].program_id != lighthouse
+                || assertions[0].accounts.len() != 1
+                || assertions[0].accounts[0].pubkey != wallet
+                || !assertions[0].accounts[0].is_signer
+                || !assertions[0].accounts[0].is_writable
+                || !recover_lighthouse_account_data_is_safe(
+                    &assertions[0].data,
+                    expected_wallet_post,
+                )
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Burn augmentation is invalid".to_string(),
+                ));
+            }
+        }
         if phantom_augmented && !is_burn {
             let source = source_keys.first().ok_or_else(|| {
                 KoraError::InvalidTransaction("Lighthouse Claim source is missing".to_string())
@@ -1191,7 +1267,7 @@ impl TransactionValidator {
             }
         }
         let expected_settlement = if is_burn {
-            service_fee.checked_add(network_fee).ok_or(KoraError::ConfigError)?
+            service_fee.checked_add(canonical_burn_network_fee).ok_or(KoraError::ConfigError)?
         } else {
             service_fee
         };
@@ -3968,6 +4044,105 @@ mod tests {
         (TransactionValidator::new(payer).unwrap(), transaction, rpc)
     }
 
+    fn burn_lighthouse_fixture(
+    ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>, Pubkey)
+    {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let source = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let lighthouse = Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap();
+        let amount = 123_456_u64;
+        let reclaimed = 2_039_280_u64;
+        let service_fee = reclaimed * 300 / 10_000;
+        let canonical_network = 42_500_u64;
+        let wallet_pre = 1_000_000_u64;
+        let expected_wallet_post = wallet_pre + reclaimed - service_fee - canonical_network;
+        let mut policy = FeePayerPolicy::default();
+        policy.system.clean = CleanPolicy {
+            claim_enabled: true,
+            claim_v2_enabled: true,
+            burn_enabled: true,
+            settlement_wallet: treasury.to_string(),
+            fee_bps: 300,
+            maximum_claim_accounts: 10,
+            claim_compute_unit_limit: 10_000,
+            claim_min_compute_unit_price_micro_lamports: 1_000,
+            claim_max_compute_unit_price_micro_lamports: 100_000,
+        };
+        setup_config_with_policy(policy);
+        let instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(
+                BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+            ),
+            ComputeBudgetInstruction::set_compute_unit_limit(BURN_AUGMENTED_COMPUTE_UNIT_LIMIT),
+            spl_token_interface::instruction::burn_checked(
+                &token_program,
+                &source,
+                &mint,
+                &wallet,
+                &[],
+                amount,
+                6,
+            )
+            .unwrap(),
+            spl_token_interface::instruction::close_account(
+                &token_program,
+                &source,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap(),
+            transfer(&wallet, &treasury, service_fee + canonical_network),
+            Instruction::new_with_bytes(
+                lighthouse,
+                &claim_lighthouse_account_data(expected_wallet_post),
+                vec![solana_sdk::instruction::AccountMeta::new_readonly(wallet, false)],
+            ),
+        ];
+        let message = solana_message::v0::Message::try_compile(
+            &payer,
+            &instructions,
+            &[],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        let transaction = TransactionUtil::new_unsigned_versioned_transaction_resolved(
+            VersionedMessage::V0(message),
+        )
+        .unwrap();
+        let mut token_data = vec![0_u8; 165];
+        token_data[0..32].copy_from_slice(mint.as_ref());
+        token_data[32..64].copy_from_slice(wallet.as_ref());
+        token_data[64..72].copy_from_slice(&amount.to_le_bytes());
+        token_data[108] = 1;
+        let mut mint_data = vec![0_u8; 82];
+        mint_data[44] = 6;
+        mint_data[45] = 1;
+        let values = vec![
+            Some(
+                json!({ "data": [base64::engine::general_purpose::STANDARD.encode(token_data), "base64"], "executable": false, "lamports": reclaimed, "owner": token_program.to_string(), "rentEpoch": 0 }),
+            ),
+            Some(
+                json!({ "data": [base64::engine::general_purpose::STANDARD.encode(mint_data), "base64"], "executable": false, "lamports": 1_461_600, "owner": token_program.to_string(), "rentEpoch": 0 }),
+            ),
+            Some(
+                json!({ "data": ["", "base64"], "executable": false, "lamports": wallet_pre, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 }),
+            ),
+        ];
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": values }),
+        );
+        mocks.insert(RpcRequest::GetFeeForMessage, json!({ "context": { "slot": 1 }, "value": canonical_network + BURN_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS }));
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet)
+    }
+
     fn claim_lighthouse_fixture(
     ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>) {
         let payer = Pubkey::new_unique();
@@ -5238,6 +5413,51 @@ mod tests {
         }
         assert_ne!(wallet, validator.fee_payer_pubkey);
         assert_ne!(treasury, validator.fee_payer_pubkey);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clean_burn_accepts_only_exact_solflare_lighthouse_envelope() {
+        let (validator, original, rpc, wallet) = burn_lighthouse_fixture();
+        assert!(validator.validate_clean(&original, &rpc).await.is_ok());
+        for mutation in 0..13 {
+            let mut transaction = original.clone();
+            match mutation {
+                0 => {
+                    transaction.all_instructions[1].data =
+                        ComputeBudgetInstruction::set_compute_unit_limit(119_999).data
+                }
+                1 => {
+                    transaction.all_instructions[0].data =
+                        ComputeBudgetInstruction::set_compute_unit_price(
+                            BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS - 1,
+                        )
+                        .data
+                }
+                2 => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
+                3 => transaction.all_instructions[5].data[4] ^= 1,
+                4 => transaction.all_instructions[5].data[12] = 0,
+                5 => transaction.all_instructions[5].data[16] = 0,
+                6 => transaction.all_instructions[5].data[17] = 1,
+                7 => transaction.all_instructions[5].data.push(0),
+                8 => transaction.all_instructions[5].data[0] = 0,
+                9 => transaction.all_instructions[2].data[1] ^= 1,
+                10 => {
+                    transaction.all_instructions[4].data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 103_679 })
+                            .unwrap()
+                }
+                11 => {
+                    transaction.all_instructions.insert(5, transaction.all_instructions[5].clone())
+                }
+                _ => transaction.all_instructions[5].accounts[0].is_writable = false,
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "Burn Lighthouse mutation {mutation} must fail"
+            );
+        }
+        assert_ne!(wallet, validator.fee_payer_pubkey);
     }
 
     #[tokio::test]
