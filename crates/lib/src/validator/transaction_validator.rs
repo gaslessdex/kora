@@ -223,6 +223,23 @@ const SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 375_000;
 const SEND_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS: u64 = 15_000;
 const SEND_MAX_NETWORK_FEE_LAMPORTS: u64 = 100_000;
 const SWAP_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+const SWAP_AUGMENTED_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 100_000;
+const SWAP_AUGMENTED_MAX_NETWORK_FEE_LAMPORTS: u64 = 150_000;
+
+fn swap_lighthouse_token_data_is_exact(data: &[u8], expected_floor: u64, wallet: Pubkey) -> bool {
+    data.len() == 64
+        && data[..5] == [10, 5, 6, 8, 2]
+        && u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8])) == expected_floor
+        && data[13..18] == [4, 3, 0, 0, 6]
+        && data[18..26] == [0; 8]
+        && data[26..28] == [0, 1]
+        && data[28..60] == wallet.to_bytes()
+        && data[60..64] == [0, 7, 0, 0]
+}
+
+fn ceil_three_quarters(value: u64) -> Option<u64> {
+    value.checked_mul(3)?.checked_add(3).map(|scaled| scaled / 4)
+}
 
 fn token_account_mint(
     account: &Account,
@@ -2409,7 +2426,145 @@ impl TransactionValidator {
             "METEORA_DLMM" => self.validate_meteora_dlmm(dex, rpc_client, wallet).await,
             "PUMPSWAP" => self.validate_pumpswap(dex, rpc_client, wallet).await,
             _ => Err(KoraError::InvalidTransaction("Swap DEX family is not approved".to_string())),
+        }?;
+
+        if Self::has_lighthouse(transaction)? {
+            if family != "RAYDIUM_CLMM"
+                || outer[1].data.len() != 9
+                || u64::from_le_bytes(outer[1].data[1..9].try_into().unwrap_or([0; 8]))
+                    != SWAP_AUGMENTED_COMPUTE_UNIT_PRICE_MICROLAMPORTS
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Swap compute policy is invalid".to_string(),
+                ));
+            }
+            let estimated_network_fee = 10_000_u64
+                .checked_add(
+                    u64::from(SWAP_COMPUTE_UNIT_LIMIT)
+                        .checked_mul(SWAP_AUGMENTED_COMPUTE_UNIT_PRICE_MICROLAMPORTS)
+                        .ok_or(KoraError::ConfigError)?
+                        .div_ceil(1_000_000),
+                )
+                .ok_or(KoraError::ConfigError)?;
+            let transfers = &outer[jupiter_index + 1..];
+            let token_program =
+                transfers.first().map(|instruction| instruction.program_id).ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Swap settlements are missing".to_string(),
+                    )
+                })?;
+            if estimated_network_fee != SWAP_AUGMENTED_MAX_NETWORK_FEE_LAMPORTS
+                || token_program != spl_token_interface::id()
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Swap sponsor cost is invalid".to_string(),
+                ));
+            }
+            let full_outer_count = transaction.transaction.message.instructions().len();
+            let full_outer =
+                transaction.all_instructions.get(..full_outer_count).ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Swap instructions are unresolved".to_string(),
+                    )
+                })?;
+            let assertions = full_outer.get(outer.len()..).ok_or_else(|| {
+                KoraError::InvalidTransaction("Lighthouse Swap assertions are missing".to_string())
+            })?;
+            let wallet_account = rpc_client.get_account(&wallet).await?;
+            let input_mint =
+                transfers[0].accounts.get(1).map(|meta| meta.pubkey).ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Swap input mint is missing".to_string(),
+                    )
+                })?;
+            let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &input_mint, &token_program);
+            let source_account = rpc_client.get_account(&source).await?;
+            let source_state =
+                StateWithExtensions::<Token2022AccountState>::unpack(&source_account.data)
+                    .map_err(|_| {
+                        KoraError::InvalidTransaction(
+                            "Lighthouse Swap source is malformed".to_string(),
+                        )
+                    })?;
+            let route_data = &outer[jupiter_index].data;
+            if route_data.len() != 39 || route_data[..8] != JUPITER_ROUTE_DISCRIMINATOR {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Swap route data is invalid".to_string(),
+                ));
+            }
+            let routed = u64::from_le_bytes(route_data[8..16].try_into().unwrap_or([0; 8]));
+            let quoted_output = u64::from_le_bytes(route_data[16..24].try_into().unwrap_or([0; 8]));
+            let settlement_total = transfers
+                .iter()
+                .try_fold(0_u64, |sum, instruction| {
+                    match spl_token_interface::instruction::TokenInstruction::unpack(
+                        &instruction.data,
+                    ) {
+                        Ok(
+                            spl_token_interface::instruction::TokenInstruction::TransferChecked {
+                                amount,
+                                ..
+                            },
+                        ) => sum.checked_add(amount),
+                        _ => None,
+                    }
+                })
+                .ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Swap settlement amounts are invalid".to_string(),
+                    )
+                })?;
+            let expected_source_post = source_state
+                .base
+                .amount
+                .checked_sub(routed)
+                .and_then(|value| value.checked_sub(settlement_total))
+                .ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse Swap source amount is invalid".to_string(),
+                    )
+                })?;
+            let output = dex.accounts.get(4).map(|meta| meta.pubkey).ok_or_else(|| {
+                KoraError::InvalidTransaction("Lighthouse Swap output is missing".to_string())
+            })?;
+            let lighthouse = Self::lighthouse_program()?;
+            let wallet_floor =
+                ceil_three_quarters(wallet_account.lamports).ok_or(KoraError::ConfigError)?;
+            let output_floor = ceil_three_quarters(quoted_output).ok_or(KoraError::ConfigError)?;
+            let source_floor =
+                ceil_three_quarters(expected_source_post).ok_or(KoraError::ConfigError)?;
+            if wallet_account.owner != SYSTEM_PROGRAM_ID
+                || !wallet_account.data.is_empty()
+                || source_state.base.delegate.is_some()
+                || source_state.base.delegated_amount != 0
+                || source_state.base.close_authority.is_some()
+                || source_state.base.is_native.is_some()
+                || assertions.len() != 3
+                || assertions[0].program_id != lighthouse
+                || assertions[0].accounts.len() != 1
+                || assertions[0].accounts[0].pubkey != wallet
+                || !assertions[0].accounts[0].is_signer
+                || assertions[0].accounts[0].is_writable
+                || !recover_lighthouse_account_data_is_safe(&assertions[0].data, wallet_floor)
+                || assertions[1].program_id != lighthouse
+                || assertions[1].accounts.len() != 1
+                || assertions[1].accounts[0].pubkey != output
+                || assertions[1].accounts[0].is_signer
+                || !assertions[1].accounts[0].is_writable
+                || !swap_lighthouse_token_data_is_exact(&assertions[1].data, output_floor, wallet)
+                || assertions[2].program_id != lighthouse
+                || assertions[2].accounts.len() != 1
+                || assertions[2].accounts[0].pubkey != source
+                || assertions[2].accounts[0].is_signer
+                || !assertions[2].accounts[0].is_writable
+                || !swap_lighthouse_token_data_is_exact(&assertions[2].data, source_floor, wallet)
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse Swap augmentation is invalid".to_string(),
+                ));
+            }
         }
+        Ok(())
     }
 
     async fn validate_raydium_clmm(
@@ -3794,6 +3949,36 @@ mod tests {
                 "Raydium/Jupiter amount or protection mutation {mutation} must fail"
             );
         }
+    }
+
+    #[test]
+    fn swap_lighthouse_payloads_require_exact_state_derived_floors() {
+        let wallet = Pubkey::new_unique();
+        let wallet_floor = ceil_three_quarters(5_111_070).unwrap();
+        let output_floor = ceil_three_quarters(144_186).unwrap();
+        let source_floor = ceil_three_quarters(3_376_209).unwrap();
+        assert_eq!(wallet_floor, 3_833_303);
+        assert_eq!(output_floor, 108_140);
+        assert_eq!(source_floor, 2_532_157);
+        assert!(recover_lighthouse_account_data_is_safe(
+            &claim_lighthouse_account_data(wallet_floor),
+            wallet_floor,
+        ));
+        let output = claim_lighthouse_token_data(output_floor, wallet);
+        let source = claim_lighthouse_token_data(source_floor, wallet);
+        assert!(swap_lighthouse_token_data_is_exact(&output, output_floor, wallet));
+        assert!(swap_lighthouse_token_data_is_exact(&source, source_floor, wallet));
+        assert!(!swap_lighthouse_token_data_is_exact(&output, output_floor + 1, wallet));
+        let mut trailing = source;
+        trailing.push(0);
+        assert!(!swap_lighthouse_token_data_is_exact(&trailing, source_floor, wallet));
+        assert_eq!(
+            10_000
+                + u64::from(SWAP_COMPUTE_UNIT_LIMIT)
+                    * SWAP_AUGMENTED_COMPUTE_UNIT_PRICE_MICROLAMPORTS
+                    / 1_000_000,
+            SWAP_AUGMENTED_MAX_NETWORK_FEE_LAMPORTS,
+        );
     }
 
     // Helper functions to reduce test duplication and setup config
