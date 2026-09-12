@@ -218,7 +218,10 @@ const PUMPSWAP_GLOBAL_DISCRIMINATOR: [u8; 8] = [149, 8, 156, 202, 160, 252, 176,
 const PUMPSWAP_GLOBAL_VOLUME_DISCRIMINATOR: [u8; 8] = [202, 42, 246, 43, 142, 190, 30, 255];
 const PUMPSWAP_USER_VOLUME_DISCRIMINATOR: [u8; 8] = [86, 255, 112, 14, 102, 53, 154, 250];
 const SEND_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const SEND_AUGMENTED_COMPUTE_UNIT_LIMIT: u32 = 240_000;
 const SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 375_000;
+const SEND_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS: u64 = 15_000;
+const SEND_MAX_NETWORK_FEE_LAMPORTS: u64 = 100_000;
 const SWAP_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
 fn token_account_mint(
@@ -3186,8 +3189,11 @@ impl TransactionValidator {
                 .data,
             ComputeBudgetInstruction::set_compute_unit_limit(SEND_COMPUTE_UNIT_LIMIT).data,
         ];
-        let expected_compute_limit_price =
-            [expected_compute_price_limit[1].clone(), expected_compute_price_limit[0].clone()];
+        let expected_augmented_compute_price_limit = [
+            expected_compute_price_limit[0].clone(),
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_AUGMENTED_COMPUTE_UNIT_LIMIT)
+                .data,
+        ];
         let compute_matches = |expected: &[Vec<u8>; 2]| {
             outer[..send_index].iter().zip(expected.iter()).all(|(instruction, data)| {
                 instruction.program_id == compute_program
@@ -3198,7 +3204,7 @@ impl TransactionValidator {
         let phantom_augmented = Self::has_lighthouse(transaction)?;
         if send_index != 2
             || (!compute_matches(&expected_compute_price_limit)
-                && !(phantom_augmented && compute_matches(&expected_compute_limit_price)))
+                && !(phantom_augmented && compute_matches(&expected_augmented_compute_price_limit)))
         {
             return Err(KoraError::InvalidTransaction(
                 "SEND requires the exact bounded compute-budget prefix".to_string(),
@@ -3391,8 +3397,9 @@ impl TransactionValidator {
             ));
         }
 
-        let accounts =
-            rpc_client.get_multiple_accounts(&[destination, source, settlement, mint]).await?;
+        let accounts = rpc_client
+            .get_multiple_accounts(&[destination, source, settlement, mint, sender])
+            .await?;
         let destination_account = accounts.first().and_then(|account| account.as_ref());
         if destination_account.is_some() == creates_recipient_ata {
             return Err(KoraError::InvalidTransaction(
@@ -3487,6 +3494,95 @@ impl TransactionValidator {
             return Err(KoraError::InvalidTransaction(
                 "SEND token accounts are not healthy".to_string(),
             ));
+        }
+        if phantom_augmented {
+            let lighthouse = Self::lighthouse_program()?;
+            let wallet_account =
+                accounts.get(4).and_then(|account| account.as_ref()).ok_or_else(|| {
+                    KoraError::InvalidTransaction("Lighthouse SEND wallet is missing".to_string())
+                })?;
+            let source_amount =
+                u64::from_le_bytes(source_account.data[64..72].try_into().map_err(|_| {
+                    KoraError::InvalidTransaction("Lighthouse SEND source is invalid".to_string())
+                })?);
+            let expected_source_post =
+                source_amount.checked_sub(total_debit).ok_or(KoraError::ConfigError)?;
+            let outer_count = transaction.transaction.message.instructions().len();
+            let full_outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Lighthouse SEND instructions are unresolved".to_string(),
+                )
+            })?;
+            let assertions =
+                full_outer.get(full_outer.len().saturating_sub(2)..).ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Lighthouse SEND assertions are missing".to_string(),
+                    )
+                })?;
+            let network_fee = match &transaction.transaction.message {
+                solana_message::VersionedMessage::Legacy(message) => {
+                    rpc_client.get_fee_for_message(message).await?
+                }
+                solana_message::VersionedMessage::V0(message)
+                    if message.address_table_lookups.is_empty() =>
+                {
+                    rpc_client.get_fee_for_message(message).await?
+                }
+                _ => {
+                    return Err(KoraError::InvalidTransaction(
+                        "Lighthouse SEND lookup tables are forbidden".to_string(),
+                    ))
+                }
+            };
+            let canonical_priority = u64::from(SEND_COMPUTE_UNIT_LIMIT)
+                .checked_mul(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS)
+                .and_then(|value| value.checked_add(999_999))
+                .map(|value| value / 1_000_000)
+                .ok_or(KoraError::ConfigError)?;
+            let final_priority = u64::from(SEND_AUGMENTED_COMPUTE_UNIT_LIMIT)
+                .checked_mul(SEND_COMPUTE_UNIT_PRICE_MICROLAMPORTS)
+                .and_then(|value| value.checked_add(999_999))
+                .map(|value| value / 1_000_000)
+                .ok_or(KoraError::ConfigError)?;
+            let canonical_network_fee = network_fee
+                .checked_sub(final_priority)
+                .and_then(|base| base.checked_add(canonical_priority))
+                .ok_or(KoraError::ConfigError)?;
+            if token_program != legacy_token_program
+                || creates_recipient_ata
+                || wallet_account.owner != SYSTEM_PROGRAM_ID
+                || !wallet_account.data.is_empty()
+                || source_account.data[72..76] != [0, 0, 0, 0]
+                || source_account.data[121..129] != [0; 8]
+                || source_account.data[129..133] != [0, 0, 0, 0]
+                || network_fee > SEND_MAX_NETWORK_FEE_LAMPORTS
+                || network_fee.checked_sub(canonical_network_fee)
+                    != Some(SEND_MAX_WALLET_SAFETY_OVERHEAD_LAMPORTS)
+                || assertions.len() != 2
+                || assertions[0].program_id != lighthouse
+                || assertions[0].accounts.len() != 1
+                || assertions[0].accounts[0].pubkey != sender
+                || !assertions[0].accounts[0].is_signer
+                || assertions[0].accounts[0].is_writable
+                || !claim_lighthouse_account_data_is_safe(
+                    &assertions[0].data,
+                    wallet_account.lamports,
+                )
+                || assertions[1].program_id != lighthouse
+                || assertions[1].accounts.len() != 1
+                || assertions[1].accounts[0].pubkey != source
+                || assertions[1].accounts[0].is_signer
+                || !assertions[1].accounts[0].is_writable
+                || !claim_lighthouse_token_data_is_safe(
+                    &assertions[1].data,
+                    expected_source_post,
+                    sender,
+                )
+            {
+                return Err(KoraError::InvalidTransaction(
+                    "Lighthouse SEND augmentation is invalid".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -5716,9 +5812,14 @@ mod tests {
                     if existing { xstock_token_account_json(&mint, &recipient, 0) } else { serde_json::Value::Null },
                     xstock_token_account_json(&mint, &sender, 1_000_000),
                     xstock_token_account_json(&mint, &treasury, 0),
-                    xstock_mint_json()
+                    xstock_mint_json(),
+                    json!({ "data": ["", "base64"], "executable": false, "lamports": 3_833_303, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 })
                 ]
             }),
+        );
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": 100_000 }),
         );
         let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
         (TransactionValidator::new(payer).unwrap(), transaction, rpc)
@@ -5829,9 +5930,15 @@ mod tests {
                 "value": [
                     if existing { Some(send_token_account_json(&mint, &recipient, 0, &token_program, 1, false)) } else { None },
                     Some(send_token_account_json(&mint, &sender, source_amount, &token_program, source_state, source_delegated)),
-                    Some(send_token_account_json(&mint, &treasury, 0, &token_program, 1, false))
+                    Some(send_token_account_json(&mint, &treasury, 0, &token_program, 1, false)),
+                    None::<serde_json::Value>,
+                    Some(json!({ "data": ["", "base64"], "executable": false, "lamports": 3_833_303, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 }))
                 ]
             }),
+        );
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": 100_000 }),
         );
         let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
         (
@@ -5881,6 +5988,63 @@ mod tests {
             .accounts
             .push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
         assert!(validator.validate_send(&extra_transfer_account, &rpc, 0).await.is_err());
+    }
+
+    fn send_lighthouse_fixture() -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Pubkey,
+    ) {
+        let (validator, canonical, rpc, payer, sender, _, _, _) = send_ata_fixture(true);
+        let source = canonical.all_instructions[2].accounts[0].pubkey;
+        let mut instructions = canonical.all_instructions.clone();
+        instructions[1] =
+            ComputeBudgetInstruction::set_compute_unit_limit(SEND_AUGMENTED_COMPUTE_UNIT_LIMIT);
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap(),
+            accounts: vec![AccountMeta::new_readonly(sender, true)],
+            data: claim_lighthouse_account_data(3_833_303),
+        });
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap(),
+            accounts: vec![AccountMeta::new(source, false)],
+            data: claim_lighthouse_token_data(497_400, sender),
+        });
+        let message = VersionedMessage::Legacy(Message::new(&instructions, Some(&payer)));
+        let transaction =
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap();
+        (validator, transaction, rpc, sender, source)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn gasless_send_accepts_only_the_exact_solflare_lighthouse_envelope() {
+        let (validator, transaction, rpc, sender, source) = send_lighthouse_fixture();
+        let result = validator.validate_send(&transaction, &rpc, 0).await;
+        assert!(result.is_ok(), "{result:?}");
+        for index in 0..10 {
+            let (validator, mut mutated, rpc, _, _) = send_lighthouse_fixture();
+            match index {
+                0 => {
+                    mutated.all_instructions[1].data =
+                        ComputeBudgetInstruction::set_compute_unit_limit(239_999).data
+                }
+                1 => mutated.all_instructions[2].data[1] ^= 1,
+                2 => mutated.all_instructions[5].accounts[0].pubkey = source,
+                3 => mutated.all_instructions[6].accounts[0].pubkey = sender,
+                4 => mutated.all_instructions[5].data = claim_lighthouse_account_data(3_833_304),
+                5 => {
+                    mutated.all_instructions[6].data = claim_lighthouse_token_data(497_401, sender)
+                }
+                6 => mutated.all_instructions[6].data.push(0),
+                7 => mutated.all_instructions[5].accounts[0].is_writable = true,
+                8 => mutated.all_instructions[6].accounts[0].is_writable = false,
+                _ => mutated.all_instructions.swap(5, 6),
+            }
+            assert!(validator.validate_send(&mutated, &rpc, 0).await.is_err(), "mutation {index}");
+        }
     }
 
     #[tokio::test]
