@@ -21,7 +21,10 @@ use spl_token_2022_interface::{
         default_account_state::DefaultAccountState, pausable::PausableConfig,
         transfer_hook::TransferHook, BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
-    state::{Account as Token2022AccountState, Mint as Token2022MintState},
+    state::{
+        Account as Token2022AccountState, AccountState as TokenAccountState,
+        Mint as Token2022MintState,
+    },
     ID as TOKEN_2022_PROGRAM_ID,
 };
 use std::{collections::HashSet, str::FromStr};
@@ -518,8 +521,118 @@ impl TransactionValidator {
         self.validate_programs(transaction_resolved)?;
         self.validate_transfer_amounts(transaction_resolved, rpc_client).await?;
         self.validate_disallowed_accounts(transaction_resolved)?;
+        self.validate_relay_live_state(transaction_resolved, rpc_client).await?;
         self.validate_fee_payer_usage(transaction_resolved, rpc_client).await?;
 
+        Ok(())
+    }
+
+    async fn validate_relay_live_state(
+        &self,
+        transaction_resolved: &VersionedTransactionResolved,
+        rpc_client: &RpcClient,
+    ) -> Result<(), KoraError> {
+        let Some(claims) = transaction_resolved.relay_authorization_claims.as_ref() else {
+            return Ok(());
+        };
+        let wallet = Pubkey::from_str(&claims.wallet).map_err(|_| {
+            KoraError::InvalidTransaction("Relay wallet identity is invalid".to_string())
+        })?;
+        let wallet_account = rpc_client.get_account(&wallet).await.map_err(|_| {
+            KoraError::InvalidTransaction("Relay wallet state is unavailable".to_string())
+        })?;
+        if wallet_account.owner != SYSTEM_PROGRAM_ID || !wallet_account.data.is_empty() {
+            return Err(KoraError::InvalidTransaction(
+                "Relay wallet is not a plain system account".to_string(),
+            ));
+        }
+        let expected_wallet_post =
+            claims.expected_wallet_post_lamports.parse::<u64>().map_err(|_| {
+                KoraError::InvalidTransaction("Relay wallet post-state is invalid".to_string())
+            })?;
+        let expected_source_post =
+            claims.expected_source_post_amount_raw.parse::<u64>().map_err(|_| {
+                KoraError::InvalidTransaction("Relay source post-state is invalid".to_string())
+            })?;
+        let amount = claims.input_amount_raw.parse::<u64>().map_err(|_| {
+            KoraError::InvalidTransaction("Relay input amount is invalid".to_string())
+        })?;
+        if claims.input_asset == "SOL" {
+            let post = wallet_account.lamports.checked_sub(amount).ok_or_else(|| {
+                KoraError::InvalidTransaction("Relay SOL balance is insufficient".to_string())
+            })?;
+            if expected_wallet_post != post || expected_source_post != post {
+                return Err(KoraError::InvalidTransaction(
+                    "Relay SOL post-state does not match live state".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let outer_count = transaction_resolved.transaction.message.instructions().len();
+        let outer = transaction_resolved.all_instructions.get(..outer_count).ok_or_else(|| {
+            KoraError::InvalidTransaction("Relay instructions are unresolved".to_string())
+        })?;
+        let relay = Pubkey::from_str(RELAY_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+        let instruction =
+            outer.iter().find(|instruction| instruction.program_id == relay).ok_or_else(|| {
+                KoraError::InvalidTransaction("Relay instruction is missing".to_string())
+            })?;
+        let source =
+            instruction.accounts.get(5).map(|account| account.pubkey).ok_or_else(|| {
+                KoraError::InvalidTransaction("Relay token source is missing".to_string())
+            })?;
+        let mint = Pubkey::from_str(&claims.input_mint).map_err(|_| {
+            KoraError::InvalidTransaction("Relay input mint is invalid".to_string())
+        })?;
+        let canonical = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &wallet,
+            &mint,
+            &spl_token_interface::id(),
+        );
+        if source != canonical {
+            return Err(KoraError::InvalidTransaction(
+                "Relay source is not the canonical Legacy ATA".to_string(),
+            ));
+        }
+        let source_account = rpc_client.get_account(&source).await.map_err(|_| {
+            KoraError::InvalidTransaction("Relay source state is unavailable".to_string())
+        })?;
+        if source_account.owner != spl_token_interface::id() {
+            return Err(KoraError::InvalidTransaction(
+                "Relay source is not owned by the Legacy Token Program".to_string(),
+            ));
+        }
+        let state = StateWithExtensions::<Token2022AccountState>::unpack(&source_account.data)
+            .map_err(|_| {
+                KoraError::InvalidTransaction("Relay source state is invalid".to_string())
+            })?;
+        if state.base.mint != mint
+            || state.base.owner != wallet
+            || state.base.state != TokenAccountState::Initialized
+            || state.base.is_native.is_some()
+            || state.base.delegate.is_some()
+            || state.base.delegated_amount != 0
+            || state.base.close_authority.is_some()
+            || !state
+                .get_extension_types()
+                .map_err(|_| {
+                    KoraError::InvalidTransaction("Relay source extensions are invalid".to_string())
+                })?
+                .is_empty()
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Relay source account is not an ordinary initialized Legacy ATA".to_string(),
+            ));
+        }
+        let post = state.base.amount.checked_sub(amount).ok_or_else(|| {
+            KoraError::InvalidTransaction("Relay token balance is insufficient".to_string())
+        })?;
+        if expected_wallet_post != wallet_account.lamports || expected_source_post != post {
+            return Err(KoraError::InvalidTransaction(
+                "Relay token post-state does not match live state".to_string(),
+            ));
+        }
         Ok(())
     }
 

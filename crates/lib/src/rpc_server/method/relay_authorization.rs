@@ -7,6 +7,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_message::VersionedMessage;
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey, signature::Signature};
 use std::{
@@ -25,6 +26,11 @@ const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const REPLAY_URL_ENV: &str = "KORA_RELAY_REDIS_REST_URL";
 const REPLAY_TOKEN_ENV: &str = "KORA_RELAY_REDIS_REST_TOKEN";
+const COMPUTE_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
+const LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+const AUGMENTED_COMPUTE_UNIT_LIMIT: u32 = 240_000;
+const AUGMENTED_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 100_000;
+const AUGMENTED_WALLET_SAFETY_OVERHEAD_LAMPORTS: u64 = 24_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct RelayAuthorization {
@@ -93,36 +99,66 @@ fn validate_claims(
     if message.header.num_required_signatures != 2
         || message.header.num_readonly_signed_accounts != 0
         || transaction.transaction.signatures.len() != 2
-        || transaction
-            .transaction
-            .signatures
-            .iter()
-            .any(|signature| *signature != Signature::default())
+        || transaction.transaction.signatures[0] != Signature::default()
         || signer_keys.first() != Some(payer)
         || signer_keys.get(1).map(ToString::to_string).as_deref() != Some(claims.wallet.as_str())
         || claims.fee_payer != payer.to_string()
         || claims.wallet == claims.fee_payer
+        || !policy.allowed_wallets.iter().any(|wallet| wallet == &claims.wallet)
     {
         return Err(KoraError::InvalidTransaction(
             "Relay payer or user signer binding is invalid".to_string(),
         ));
     }
+    let wallet = Pubkey::from_str(&claims.wallet).map_err(|_| {
+        KoraError::InvalidTransaction("Relay wallet identity is invalid".to_string())
+    })?;
+    let message_bytes = transaction.transaction.message.serialize();
+    if transaction.transaction.signatures[1] == Signature::default()
+        || !transaction.transaction.signatures[1].verify(wallet.as_ref(), &message_bytes)
+    {
+        return Err(KoraError::InvalidTransaction(
+            "Relay requires the valid user signature before payer signing".to_string(),
+        ));
+    }
+    let compute = Pubkey::from_str(COMPUTE_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+    let lighthouse = Pubkey::from_str(LIGHTHOUSE_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
+    let canonical = outer.len() == 1 && outer[0].program_id.to_string() == RELAY_PROGRAM_ID;
+    let augmented = outer.len() == 5
+        && outer[0].program_id == compute
+        && outer[0].accounts.is_empty()
+        && outer[0].data
+            == ComputeBudgetInstruction::set_compute_unit_price(
+                AUGMENTED_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+            )
+            .data
+        && outer[1].program_id == compute
+        && outer[1].accounts.is_empty()
+        && outer[1].data
+            == ComputeBudgetInstruction::set_compute_unit_limit(AUGMENTED_COMPUTE_UNIT_LIMIT).data
+        && outer[2].program_id.to_string() == RELAY_PROGRAM_ID
+        && outer[3].program_id == lighthouse
+        && outer[4].program_id == lighthouse;
+    if !canonical && !augmented {
+        return Err(KoraError::InvalidTransaction(
+            "Relay message is neither exact nor the approved wallet envelope".to_string(),
+        ));
+    }
+    let relay_instruction = if augmented { &outer[2] } else { &outer[0] };
     if message.address_table_lookups.len() != 1
         || message.address_table_lookups[0].account_key.to_string() != RELAY_LOOKUP_TABLE
-        || outer.len() != 1
-        || outer[0].program_id.to_string() != RELAY_PROGRAM_ID
         || transaction
             .all_instructions
             .iter()
             .any(|instruction| instruction.accounts.iter().any(|account| account.pubkey == *payer))
-        || outer[0].data.len() != 48
-        || outer[0].accounts.get(1).map(|account| account.pubkey) != Some(signer_keys[1])
-        || outer[0].accounts.get(2).map(|account| account.pubkey) != Some(signer_keys[1])
+        || relay_instruction.data.len() != 48
+        || relay_instruction.accounts.get(1).map(|account| account.pubkey) != Some(signer_keys[1])
+        || relay_instruction.accounts.get(2).map(|account| account.pubkey) != Some(signer_keys[1])
     {
         return Err(KoraError::InvalidTransaction("Relay message shape is invalid".to_string()));
     }
     let discriminator: [u8; 8] =
-        outer[0].data[..8].try_into().map_err(|_| KoraError::ConfigError)?;
+        relay_instruction.data[..8].try_into().map_err(|_| KoraError::ConfigError)?;
     let expected_accounts = if discriminator == NATIVE_DISCRIMINATOR {
         5
     } else if discriminator == TOKEN_DISCRIMINATOR {
@@ -145,9 +181,10 @@ fn validate_claims(
             "Relay inner program is not authorized for this deposit shape".to_string(),
         ));
     }
-    let amount =
-        u64::from_le_bytes(outer[0].data[8..16].try_into().map_err(|_| KoraError::ConfigError)?);
-    let order_id = format!("0x{}", hex::encode(&outer[0].data[16..48]));
+    let amount = u64::from_le_bytes(
+        relay_instruction.data[8..16].try_into().map_err(|_| KoraError::ConfigError)?,
+    );
+    let order_id = format!("0x{}", hex::encode(&relay_instruction.data[16..48]));
     let expected_mint = match claims.input_asset.as_str() {
         "SOL" => SYSTEM_PROGRAM_ID,
         "USDC" => USDC_MINT,
@@ -157,15 +194,47 @@ fn validate_claims(
     let instruction_mint = if discriminator == NATIVE_DISCRIMINATOR {
         SYSTEM_PROGRAM_ID.to_string()
     } else {
-        outer[0].accounts.get(4).map(|account| account.pubkey.to_string()).unwrap_or_default()
+        relay_instruction
+            .accounts
+            .get(4)
+            .map(|account| account.pubkey.to_string())
+            .unwrap_or_default()
     };
-    if outer[0].accounts.len() != expected_accounts
+    let expected_wallet_post = claims.expected_wallet_post_lamports.parse::<u64>().ok();
+    let expected_source_post = claims.expected_source_post_amount_raw.parse::<u64>().ok();
+    let envelope_economics_valid = if augmented {
+        claims.input_asset == "USDC"
+            && claims.destination_asset == "USDG"
+            && claims.wallet_safety_overhead_lamports == AUGMENTED_WALLET_SAFETY_OVERHEAD_LAMPORTS
+            && claims.max_sponsor_lamports
+                == claims
+                    .canonical_network_fee_lamports
+                    .saturating_add(AUGMENTED_WALLET_SAFETY_OVERHEAD_LAMPORTS)
+            && lighthouse_account_assertion_is_safe(
+                &outer[3],
+                wallet,
+                expected_wallet_post.unwrap_or_default(),
+            )
+            && relay_instruction.accounts.get(5).is_some_and(|source| {
+                lighthouse_token_assertion_is_safe(
+                    &outer[4],
+                    source.pubkey,
+                    wallet,
+                    expected_source_post.unwrap_or_default(),
+                )
+            })
+    } else {
+        claims.wallet_safety_overhead_lamports == 0
+            && claims.max_sponsor_lamports == claims.canonical_network_fee_lamports
+    };
+    if relay_instruction.accounts.len() != expected_accounts
         || claims.schema_version != "relay-authorization-v1"
         || claims.action != "CROSS_CHAIN_RELAY"
         || claims.network != policy.authorization_network
         || claims.message_hash
             != hex::encode(Sha256::digest(transaction.transaction.message.serialize()))
         || claims.input_amount_raw.parse::<u64>().ok() != Some(amount)
+        || claims.service_fee_amount_raw != "0"
         || claims.relay_order_id.to_lowercase() != order_id
         || claims.relay_request_id.is_empty()
         || claims.quote_id.is_empty()
@@ -179,6 +248,10 @@ fn validate_claims(
         || claims.recipient.len() != 42
         || hex::decode(&claims.recipient[2..]).map_or(true, |value| value.len() != 20)
         || claims.max_sponsor_lamports == 0
+        || expected_wallet_post.is_none()
+        || expected_source_post.is_none()
+        || !envelope_economics_valid
+        || !relay_accounts_are_safe(relay_instruction, discriminator, wallet, &claims.input_mint)
         || (claims.input_asset == "SOL") != (discriminator == NATIVE_DISCRIMINATOR)
     {
         return Err(KoraError::InvalidTransaction(
@@ -201,6 +274,96 @@ fn validate_claims(
         ));
     }
     Ok(())
+}
+
+fn relay_accounts_are_safe(
+    instruction: &Instruction,
+    discriminator: [u8; 8],
+    wallet: Pubkey,
+    input_mint: &str,
+) -> bool {
+    let Ok(relay) = Pubkey::from_str(RELAY_PROGRAM_ID) else { return false };
+    let (depository, _) = Pubkey::find_program_address(&[b"relay_depository"], &relay);
+    let (vault, _) = Pubkey::find_program_address(&[b"vault"], &relay);
+    let account = |index: usize| instruction.accounts.get(index);
+    let exact = |index: usize, pubkey: Pubkey, signer: bool, writable: bool| {
+        account(index).is_some_and(|meta| {
+            meta.pubkey == pubkey && meta.is_signer == signer && meta.is_writable == writable
+        })
+    };
+    if discriminator == NATIVE_DISCRIMINATOR {
+        return instruction.accounts.len() == 5
+            && exact(0, depository, false, false)
+            && exact(1, wallet, true, true)
+            && exact(2, wallet, true, true)
+            && exact(3, vault, false, true)
+            && exact(4, solana_system_interface::program::ID, false, false);
+    }
+    if discriminator != TOKEN_DISCRIMINATOR {
+        return false;
+    }
+    let Ok(mint) = Pubkey::from_str(input_mint) else { return false };
+    let token_program = spl_token_interface::id();
+    let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+        &wallet,
+        &mint,
+        &token_program,
+    );
+    let vault_token = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+        &vault,
+        &mint,
+        &token_program,
+    );
+    instruction.accounts.len() == 10
+        && exact(0, depository, false, false)
+        && exact(1, wallet, true, true)
+        && exact(2, wallet, true, true)
+        && exact(3, vault, false, false)
+        && exact(4, mint, false, false)
+        && exact(5, source, false, true)
+        && exact(6, vault_token, false, true)
+        && exact(7, token_program, false, false)
+        && exact(8, spl_associated_token_account_interface::program::ID, false, false)
+        && exact(9, solana_system_interface::program::ID, false, false)
+}
+
+fn lighthouse_account_assertion_is_safe(
+    instruction: &Instruction,
+    wallet: Pubkey,
+    expected_post_lamports: u64,
+) -> bool {
+    instruction.accounts.len() == 1
+        && instruction.accounts[0].pubkey == wallet
+        && instruction.accounts[0].is_signer
+        && instruction.accounts[0].is_writable
+        && instruction.data.len() == 26
+        && instruction.data[..4] == [6, 5, 3, 0]
+        && u64::from_le_bytes(instruction.data[4..12].try_into().unwrap_or([0; 8]))
+            <= expected_post_lamports
+        && instruction.data[12..17] == [4, 3, 0, 0, 1]
+        && instruction.data[17..25] == [0; 8]
+        && instruction.data[25] == 0
+}
+
+fn lighthouse_token_assertion_is_safe(
+    instruction: &Instruction,
+    source: Pubkey,
+    wallet: Pubkey,
+    expected_post_amount: u64,
+) -> bool {
+    instruction.accounts.len() == 1
+        && instruction.accounts[0].pubkey == source
+        && !instruction.accounts[0].is_signer
+        && instruction.accounts[0].is_writable
+        && instruction.data.len() == 64
+        && instruction.data[..5] == [10, 5, 6, 8, 2]
+        && u64::from_le_bytes(instruction.data[5..13].try_into().unwrap_or([0; 8]))
+            <= expected_post_amount
+        && instruction.data[13..18] == [4, 3, 0, 0, 6]
+        && instruction.data[18..26] == [0; 8]
+        && instruction.data[26..28] == [0, 1]
+        && instruction.data[28..60] == wallet.to_bytes()
+        && instruction.data[60..64] == [0, 7, 0, 0]
 }
 
 trait RelayReplayStore {
@@ -350,7 +513,7 @@ mod tests {
     struct Fixture {
         authority: Keypair,
         payer: Keypair,
-        wallet: Pubkey,
+        wallet: Keypair,
         policy: RelayPolicy,
         transaction: VersionedTransactionResolved,
     }
@@ -358,30 +521,68 @@ mod tests {
     fn fixture(token: bool) -> Fixture {
         let authority = Keypair::new();
         let payer = Keypair::new();
-        let wallet = Pubkey::new_unique();
+        let wallet = Keypair::new();
         let relay = Pubkey::from_str(RELAY_PROGRAM_ID).unwrap();
-        let account_count = if token { 10 } else { 5 };
-        let mut account_keys = vec![payer.pubkey(), wallet, relay];
-        account_keys.extend((0..account_count).map(|_| Pubkey::new_unique()));
-        if token {
-            account_keys[7] = Pubkey::from_str(USDC_MINT).unwrap();
-        }
+        let (depository, _) = Pubkey::find_program_address(&[b"relay_depository"], &relay);
+        let (vault, _) = Pubkey::find_program_address(&[b"vault"], &relay);
+        let mint = Pubkey::from_str(USDC_MINT).unwrap();
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &wallet.pubkey(),
+            &mint,
+            &spl_token_interface::id(),
+        );
+        let vault_token = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &vault,
+            &mint,
+            &spl_token_interface::id(),
+        );
+        let (account_keys, program_id_index, instruction_accounts, readonly_unsigned) = if token {
+            (
+                vec![
+                    payer.pubkey(),
+                    wallet.pubkey(),
+                    source,
+                    vault_token,
+                    relay,
+                    depository,
+                    vault,
+                    mint,
+                    spl_token_interface::id(),
+                    spl_associated_token_account_interface::program::ID,
+                    solana_system_interface::program::ID,
+                ],
+                4,
+                vec![5, 1, 1, 6, 7, 2, 3, 8, 9, 10],
+                7,
+            )
+        } else {
+            (
+                vec![
+                    payer.pubkey(),
+                    wallet.pubkey(),
+                    vault,
+                    relay,
+                    depository,
+                    solana_system_interface::program::ID,
+                ],
+                3,
+                vec![4, 1, 1, 2, 5],
+                3,
+            )
+        };
         let mut data = Vec::from(if token { TOKEN_DISCRIMINATOR } else { NATIVE_DISCRIMINATOR });
         data.extend_from_slice(&500u64.to_le_bytes());
         data.extend_from_slice(&[7u8; 32]);
-        let mut instruction_accounts: Vec<u8> = (3..3 + account_count as u8).collect();
-        instruction_accounts[1] = 1;
-        instruction_accounts[2] = 1;
         let message = Message {
             header: MessageHeader {
                 num_required_signatures: 2,
                 num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 0,
+                num_readonly_unsigned_accounts: readonly_unsigned,
             },
             account_keys,
             recent_blockhash: Hash::new_unique(),
             instructions: vec![CompiledInstruction {
-                program_id_index: 2,
+                program_id_index,
                 accounts: instruction_accounts,
                 data,
             }],
@@ -391,15 +592,17 @@ mod tests {
                 readonly_indexes: vec![],
             }],
         };
+        let mut signed = VersionedTransaction {
+            signatures: vec![Signature::default(), Signature::default()],
+            message: VersionedMessage::V0(message),
+        };
+        signed.signatures[1] = wallet.sign_message(&signed.message.serialize());
         let transaction =
-            VersionedTransactionResolved::from_kora_built_transaction(&VersionedTransaction {
-                signatures: vec![Signature::default(), Signature::default()],
-                message: VersionedMessage::V0(message),
-            })
-            .unwrap();
+            VersionedTransactionResolved::from_kora_built_transaction(&signed).unwrap();
         let policy = RelayPolicy {
             enabled: true,
             authorization_public_key: authority.pubkey().to_string(),
+            allowed_wallets: vec![wallet.pubkey().to_string()],
             authorization_network: "mainnet-beta".to_string(),
             authorization_max_lifetime_seconds: 90,
         };
@@ -407,7 +610,13 @@ mod tests {
     }
 
     fn authorize(fixture: &Fixture, nonce: String, issued_at: u64) -> RelayAuthorization {
-        let outer = &fixture.transaction.all_instructions[0];
+        let augmented = fixture.transaction.transaction.message.instructions().len() == 5;
+        let outer = fixture
+            .transaction
+            .all_instructions
+            .iter()
+            .find(|instruction| instruction.program_id.to_string() == RELAY_PROGRAM_ID)
+            .unwrap();
         let claims = RelayAuthorizationClaims {
             schema_version: "relay-authorization-v1".to_string(),
             action: "CROSS_CHAIN_RELAY".to_string(),
@@ -416,7 +625,7 @@ mod tests {
                 fixture.transaction.transaction.message.serialize(),
             )),
             fee_payer: fixture.payer.pubkey().to_string(),
-            wallet: fixture.wallet.to_string(),
+            wallet: fixture.wallet.pubkey().to_string(),
             relay_order_id: format!("0x{}", hex::encode(&outer.data[16..48])),
             relay_request_id: Pubkey::new_unique().to_string(),
             quote_id: Pubkey::new_unique().to_string(),
@@ -424,10 +633,15 @@ mod tests {
             input_mint: if outer.accounts.len() == 5 { SYSTEM_PROGRAM_ID } else { USDC_MINT }
                 .to_string(),
             input_amount_raw: "500".to_string(),
+            service_fee_amount_raw: "0".to_string(),
             destination_chain_id: 4663,
-            destination_asset: "ETH".to_string(),
+            destination_asset: if augmented { "USDG" } else { "ETH" }.to_string(),
             recipient: "0x1111111111111111111111111111111111111111".to_string(),
-            max_sponsor_lamports: 10_000,
+            canonical_network_fee_lamports: 10_000,
+            wallet_safety_overhead_lamports: if augmented { 24_000 } else { 0 },
+            max_sponsor_lamports: if augmented { 34_000 } else { 10_000 },
+            expected_wallet_post_lamports: if augmented { "1000" } else { "0" }.to_string(),
+            expected_source_post_amount_raw: if augmented { "500" } else { "0" }.to_string(),
             nonce,
             issued_at_unix_seconds: issued_at,
             expires_at_unix_seconds: issued_at + 60,
@@ -437,6 +651,84 @@ mod tests {
             payload: URL_SAFE_NO_PAD.encode(&payload),
             signature: fixture.authority.sign_message(&payload).to_string(),
         }
+    }
+
+    fn lighthouse_wallet_data(floor: u64) -> Vec<u8> {
+        let mut data = vec![6, 5, 3, 0];
+        data.extend_from_slice(&floor.to_le_bytes());
+        data.extend_from_slice(&[4, 3, 0, 0, 1]);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(0);
+        data
+    }
+
+    fn lighthouse_token_data(wallet: Pubkey, floor: u64) -> Vec<u8> {
+        let mut data = vec![10, 5, 6, 8, 2];
+        data.extend_from_slice(&floor.to_le_bytes());
+        data.extend_from_slice(&[4, 3, 0, 0, 6]);
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&[0, 1]);
+        data.extend_from_slice(wallet.as_ref());
+        data.extend_from_slice(&[0, 7, 0, 0]);
+        data
+    }
+
+    fn augmented_fixture() -> Fixture {
+        let mut fixture = fixture(true);
+        let mut transaction = fixture.transaction.transaction.clone();
+        let VersionedMessage::V0(message) = &mut transaction.message else { unreachable!() };
+        let relay = message.instructions[0].clone();
+        let source_index = relay.accounts[5];
+        let compute_index = message.account_keys.len() as u8;
+        message.account_keys.push(Pubkey::from_str(COMPUTE_PROGRAM_ID).unwrap());
+        let lighthouse_index = message.account_keys.len() as u8;
+        message.account_keys.push(Pubkey::from_str(LIGHTHOUSE_PROGRAM_ID).unwrap());
+        message.header.num_readonly_unsigned_accounts += 2;
+        message.instructions = vec![
+            CompiledInstruction {
+                program_id_index: compute_index,
+                accounts: vec![],
+                data: ComputeBudgetInstruction::set_compute_unit_price(
+                    AUGMENTED_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
+                )
+                .data,
+            },
+            CompiledInstruction {
+                program_id_index: compute_index,
+                accounts: vec![],
+                data: ComputeBudgetInstruction::set_compute_unit_limit(
+                    AUGMENTED_COMPUTE_UNIT_LIMIT,
+                )
+                .data,
+            },
+            relay,
+            CompiledInstruction {
+                program_id_index: lighthouse_index,
+                accounts: vec![1],
+                data: lighthouse_wallet_data(900),
+            },
+            CompiledInstruction {
+                program_id_index: lighthouse_index,
+                accounts: vec![source_index],
+                data: lighthouse_token_data(fixture.wallet.pubkey(), 400),
+            },
+        ];
+        transaction.signatures = vec![Signature::default(), Signature::default()];
+        transaction.signatures[1] = fixture.wallet.sign_message(&transaction.message.serialize());
+        fixture.transaction =
+            VersionedTransactionResolved::from_kora_built_transaction(&transaction).unwrap();
+        fixture
+    }
+
+    fn refresh_fixture(fixture: &mut Fixture) {
+        fixture.transaction.transaction.signatures =
+            vec![Signature::default(), Signature::default()];
+        fixture.transaction.transaction.signatures[1] =
+            fixture.wallet.sign_message(&fixture.transaction.transaction.message.serialize());
+        fixture.transaction = VersionedTransactionResolved::from_kora_built_transaction(
+            &fixture.transaction.transaction,
+        )
+        .unwrap();
     }
 
     fn now() -> u64 {
@@ -460,7 +752,7 @@ mod tests {
             signed.signatures[0] = fixture.payer.sign_message(&message);
             assert!(signed.signatures[0].verify(fixture.payer.pubkey().as_ref(), &message));
             assert_eq!(signed.message.serialize(), message);
-            assert_eq!(signed.signatures[1], Signature::default());
+            assert!(signed.signatures[1].verify(fixture.wallet.pubkey().as_ref(), &message));
             assert!(validate_relay_authorization(
                 &fixture.transaction,
                 &fixture.payer.pubkey(),
@@ -469,6 +761,63 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn augmented_relay_message_requires_the_exact_compute_lighthouse_and_account_envelope() {
+        let fixture = augmented_fixture();
+        let authorization = authorize(&fixture, Pubkey::new_unique().to_string(), now());
+        assert!(validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            Some(&authorization),
+        )
+        .is_ok());
+
+        for mutation in 0..12 {
+            let mut changed = augmented_fixture();
+            let VersionedMessage::V0(message) = &mut changed.transaction.transaction.message else {
+                unreachable!()
+            };
+            match mutation {
+                0 => message.instructions[0].data[1] ^= 1,
+                1 => message.instructions[1].data[1] ^= 1,
+                2 => message.instructions[2].accounts[5] = message.instructions[2].accounts[6],
+                3 => message.instructions[3].accounts[0] = message.instructions[2].accounts[5],
+                4 => message.instructions[4].accounts[0] = 1,
+                5 => message.instructions[3].data[0] = 9,
+                6 => message.instructions[4].data.truncate(20),
+                7 => message.instructions[3].data[4..12].copy_from_slice(&1001u64.to_le_bytes()),
+                8 => message.instructions[4].data[5..13].copy_from_slice(&501u64.to_le_bytes()),
+                9 => message.instructions.push(message.instructions[4].clone()),
+                10 => message.address_table_lookups[0].account_key = Pubkey::new_unique(),
+                11 => message.account_keys[0] = Pubkey::new_unique(),
+                _ => unreachable!(),
+            }
+            refresh_fixture(&mut changed);
+            let fresh = authorize(&changed, Pubkey::new_unique().to_string(), now());
+            assert!(
+                validate_relay_authorization(
+                    &changed.transaction,
+                    &changed.payer.pubkey(),
+                    &changed.policy,
+                    Some(&fresh),
+                )
+                .is_err(),
+                "mutation {mutation} was accepted"
+            );
+        }
+
+        let mut wrong_wallet_policy = fixture.policy.clone();
+        wrong_wallet_policy.allowed_wallets = vec![Pubkey::new_unique().to_string()];
+        assert!(validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &wrong_wallet_policy,
+            Some(&authorization),
+        )
+        .is_err());
     }
 
     #[test]
