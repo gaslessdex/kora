@@ -302,8 +302,12 @@ pub struct RecoverPolicy {
     pub slippage_bps: u16,
     #[serde(default = "default_recover_compute_unit_limit")]
     pub compute_unit_limit: u32,
+    #[serde(default = "default_recover_augmented_compute_unit_limit")]
+    pub augmented_compute_unit_limit: u32,
     #[serde(default = "default_recover_compute_unit_price")]
     pub compute_unit_price_micro_lamports: u64,
+    #[serde(default = "default_recover_wallet_safety_overhead")]
+    pub max_wallet_safety_overhead_lamports: u64,
     #[serde(default)]
     pub catastrophe_output_lamports: u64,
     #[serde(default)]
@@ -339,8 +343,14 @@ fn default_recover_slippage_bps() -> u16 {
 fn default_recover_compute_unit_limit() -> u32 {
     100_000
 }
+fn default_recover_augmented_compute_unit_limit() -> u32 {
+    120_000
+}
 fn default_recover_compute_unit_price() -> u64 {
     375_000
+}
+fn default_recover_wallet_safety_overhead() -> u64 {
+    10_000
 }
 fn default_recover_authorization_max_lifetime_seconds() -> u64 {
     90

@@ -70,6 +70,15 @@ fn claim_lighthouse_account_data_is_safe(data: &[u8], expected_post_lamports: u6
         && data[25] == 0
 }
 
+fn recover_lighthouse_account_data_is_safe(data: &[u8], expected_floor_lamports: u64) -> bool {
+    data.len() == 26
+        && data[..4] == [6, 5, 3, 0]
+        && u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8])) == expected_floor_lamports
+        && data[12..17] == [4, 3, 0, 0, 1]
+        && data[17..25] == [0; 8]
+        && data[25] == 0
+}
+
 fn claim_lighthouse_token_data_is_safe(
     data: &[u8],
     expected_post_amount: u64,
@@ -1295,26 +1304,30 @@ impl TransactionValidator {
             return Err(KoraError::ConfigError);
         }
         let outer = self.economic_outer(transaction)?;
-        let expected_compute_price_limit = [
-            ComputeBudgetInstruction::set_compute_unit_price(
-                policy.compute_unit_price_micro_lamports,
-            )
-            .data,
-            ComputeBudgetInstruction::set_compute_unit_limit(policy.compute_unit_limit).data,
-        ];
-        let expected_compute_limit_price =
-            [expected_compute_price_limit[1].clone(), expected_compute_price_limit[0].clone()];
-        let compute_matches = |expected: &[Vec<u8>; 2]| {
-            outer[..2].iter().zip(expected.iter()).all(|(instruction, data)| {
-                instruction.program_id == compute_program
-                    && instruction.accounts.is_empty()
-                    && instruction.data == *data
-            })
-        };
-        let phantom_augmented = Self::has_lighthouse(transaction)?;
+        let wallet_augmented = Self::has_lighthouse(transaction)?;
+        let expected_compute_price = ComputeBudgetInstruction::set_compute_unit_price(
+            policy.compute_unit_price_micro_lamports,
+        )
+        .data;
+        let compute_limit = outer.get(1).and_then(|instruction| {
+            if instruction.program_id != compute_program
+                || !instruction.accounts.is_empty()
+                || instruction.data.len() != 5
+                || instruction.data[0] != 2
+            {
+                return None;
+            }
+            Some(u32::from_le_bytes(instruction.data[1..5].try_into().ok()?))
+        });
         if outer.len() < 6
-            || (!compute_matches(&expected_compute_price_limit)
-                && !(phantom_augmented && compute_matches(&expected_compute_limit_price)))
+            || outer[0].program_id != compute_program
+            || !outer[0].accounts.is_empty()
+            || outer[0].data != expected_compute_price
+            || compute_limit.is_none()
+            || (!wallet_augmented && compute_limit != Some(policy.compute_unit_limit))
+            || (wallet_augmented
+                && !(policy.compute_unit_limit..=policy.augmented_compute_unit_limit)
+                    .contains(&compute_limit.unwrap_or_default()))
             || outer[2..].iter().any(|instruction| instruction.program_id == compute_program)
         {
             return Err(KoraError::InvalidTransaction(
@@ -1668,7 +1681,7 @@ impl TransactionValidator {
             )
             .await?
         };
-        let referenced = outer
+        let mut referenced = outer
             .iter()
             .flat_map(|instruction| {
                 std::iter::once(instruction.program_id)
@@ -1676,12 +1689,32 @@ impl TransactionValidator {
             })
             .chain(std::iter::once(self.fee_payer_pubkey))
             .collect::<HashSet<_>>();
+        if wallet_augmented {
+            referenced.insert(Self::lighthouse_program()?);
+        }
         if transaction.all_account_keys.iter().copied().collect::<HashSet<_>>() != referenced {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value contains unrelated accounts".to_string(),
             ));
         }
         let network_fee = rpc_client.get_fee_for_message(message).await?;
+        let compute_limit = u64::from(compute_limit.ok_or(KoraError::ConfigError)?);
+        let canonical_priority = u64::from(policy.compute_unit_limit)
+            .checked_mul(policy.compute_unit_price_micro_lamports)
+            .and_then(|value| value.checked_add(999_999))
+            .ok_or(KoraError::ConfigError)?
+            / 1_000_000;
+        let final_priority = compute_limit
+            .checked_mul(policy.compute_unit_price_micro_lamports)
+            .and_then(|value| value.checked_add(999_999))
+            .ok_or(KoraError::ConfigError)?
+            / 1_000_000;
+        let base_fee = network_fee.checked_sub(final_priority).ok_or_else(|| {
+            KoraError::InvalidTransaction("Recover Value network fee is incomplete".to_string())
+        })?;
+        let canonical_network_fee =
+            base_fee.checked_add(canonical_priority).ok_or(KoraError::ConfigError)?;
+        let wallet_safety_overhead = network_fee.saturating_sub(canonical_network_fee);
         let swap_fee = minimum_output
             .checked_mul(u64::from(policy.swap_fee_bps))
             .ok_or(KoraError::ConfigError)?
@@ -1693,7 +1726,7 @@ impl TransactionValidator {
             / 10_000;
         let expected_settlement = swap_fee
             .checked_add(rent_fee)
-            .and_then(|value| value.checked_add(network_fee))
+            .and_then(|value| value.checked_add(canonical_network_fee))
             .and_then(|value| value.checked_add(setup_rent))
             .ok_or(KoraError::ConfigError)?;
         let minimum_user_payout = minimum_output
@@ -1701,30 +1734,64 @@ impl TransactionValidator {
             .and_then(|value| value.checked_add(setup_rent))
             .and_then(|value| value.checked_sub(expected_settlement))
             .ok_or(KoraError::ConfigError)?;
+        let expected_user_payout = quoted_output
+            .checked_add(source_account.lamports)
+            .and_then(|value| value.checked_sub(swap_fee))
+            .and_then(|value| value.checked_sub(rent_fee))
+            .and_then(|value| value.checked_sub(canonical_network_fee))
+            .ok_or(KoraError::ConfigError)?;
+        let expected_lighthouse_floor = expected_user_payout
+            .checked_mul(75)
+            .and_then(|value| value.checked_add(99))
+            .ok_or(KoraError::ConfigError)?
+            / 100;
+        let outer_count = transaction.transaction.message.instructions().len();
+        let all_outer =
+            transaction.all_instructions.get(..outer_count).ok_or(KoraError::ConfigError)?;
+        let assertions = &all_outer[outer.len()..];
+        let lighthouse = Self::lighthouse_program()?;
+        let lighthouse_valid = if wallet_augmented {
+            assertions.len() == 1
+                && assertions[0].program_id == lighthouse
+                && assertions[0].accounts.len() == 1
+                && assertions[0].accounts[0].pubkey == wallet
+                && assertions[0].accounts[0].is_signer
+                && assertions[0].accounts[0].is_writable
+                && recover_lighthouse_account_data_is_safe(
+                    &assertions[0].data,
+                    expected_lighthouse_floor,
+                )
+        } else {
+            assertions.is_empty()
+        };
         let authorized_amount = |value: &str| {
             value.parse::<u64>().map_err(|_| {
                 KoraError::InvalidTransaction("Recover authorization amount is invalid".to_string())
             })
         };
-        let authorization_mismatch = if let Some(authorization) =
-            transaction.recover_authorization_claims.as_ref()
-        {
-            authorized_amount(&authorization.input_amount_raw)? != input_amount
-                || authorized_amount(&authorization.expected_output_lamports)? != quoted_output
-                || authorized_amount(&authorization.minimum_output_lamports)? != minimum_output
-                || authorized_amount(&authorization.minimum_user_payout_lamports)?
-                    != minimum_user_payout
-                || authorized_amount(&authorization.swap_fee_lamports)? != swap_fee
-                || authorized_amount(&authorization.rent_fee_lamports)? != rent_fee
-                || authorized_amount(&authorization.network_reimbursement_lamports)? != network_fee
-                || authorized_amount(&authorization.setup_rent_reimbursement_lamports)?
-                    != setup_rent
-                || authorized_amount(&authorization.sponsored_cost_lamports)?
-                    != network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
-        } else {
-            false
-        };
-        if settlement_lamports != expected_settlement
+        let authorization_mismatch =
+            if let Some(authorization) = transaction.recover_authorization_claims.as_ref() {
+                authorized_amount(&authorization.input_amount_raw)? != input_amount
+                    || authorized_amount(&authorization.expected_output_lamports)? != quoted_output
+                    || authorized_amount(&authorization.minimum_output_lamports)? != minimum_output
+                    || authorized_amount(&authorization.minimum_user_payout_lamports)?
+                        != minimum_user_payout
+                    || authorized_amount(&authorization.swap_fee_lamports)? != swap_fee
+                    || authorized_amount(&authorization.rent_fee_lamports)? != rent_fee
+                    || authorized_amount(&authorization.network_reimbursement_lamports)?
+                        != canonical_network_fee
+                    || authorized_amount(&authorization.setup_rent_reimbursement_lamports)?
+                        != setup_rent
+                    || authorized_amount(&authorization.sponsored_cost_lamports)?
+                        != canonical_network_fee
+                            .checked_add(setup_rent)
+                            .ok_or(KoraError::ConfigError)?
+            } else {
+                false
+            };
+        if !lighthouse_valid
+            || wallet_safety_overhead > policy.max_wallet_safety_overhead_lamports
+            || settlement_lamports != expected_settlement
             || network_fee.checked_add(setup_rent).ok_or(KoraError::ConfigError)?
                 > self.max_allowed_lamports
             || minimum_user_payout < policy.minimum_user_payout_lamports
@@ -4088,12 +4155,14 @@ mod tests {
         let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program);
         let input_amount = 1_779_926_u64;
         let minimum_output = quoted_output * 9_950 / 10_000;
-        let network_fee = 42_500_u64;
+        let canonical_network_fee = 42_500_u64;
+        let network_fee =
+            if semantic_mutation == Some(12) { 50_000 } else { canonical_network_fee };
         let source_rent = 2_039_280_u64;
         let setup_rent = 2_039_280_u64;
         let settlement = minimum_output * 30 / 10_000
             + source_rent * 300 / 10_000
-            + network_fee
+            + canonical_network_fee
             + if existing_wrapped { 0 } else { setup_rent };
 
         let mut raydium_accounts = vec![
@@ -4185,6 +4254,18 @@ mod tests {
             .unwrap(),
             transfer(&wallet, &treasury, settlement),
         ]);
+        if semantic_mutation == Some(12) {
+            instructions[1] = ComputeBudgetInstruction::set_compute_unit_limit(120_000);
+            let expected_user = quoted_output - minimum_output * 30 / 10_000 + source_rent
+                - source_rent * 300 / 10_000
+                - canonical_network_fee;
+            let floor = (expected_user * 75 + 99) / 100;
+            instructions.push(Instruction::new_with_bytes(
+                Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap(),
+                &claim_lighthouse_account_data(floor),
+                vec![AccountMeta::new(wallet, true)],
+            ));
+        }
         let mut message = solana_message::v0::Message::try_compile(
             &payer,
             &instructions,
@@ -4243,7 +4324,9 @@ mod tests {
             rent_fee_bps: 300,
             slippage_bps: 50,
             compute_unit_limit: 100_000,
+            augmented_compute_unit_limit: 120_000,
             compute_unit_price_micro_lamports: 375_000,
+            max_wallet_safety_overhead_lamports: 10_000,
             catastrophe_output_lamports: 1_000_000,
             minimum_user_payout_lamports: 1_000_000,
             approved_pool_accounts: vec![],
@@ -4454,6 +4537,36 @@ mod tests {
                 "unsafe wrapped SOL state mutation {mutation} must fail"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_only_bounded_exact_wallet_safety_augmentation() {
+        let (mut validator, transaction, rpc, payer_creations) =
+            recover_fixture_with_output_and_semantic_mutation(
+                false,
+                None,
+                None,
+                1_000_000_000,
+                Some(12),
+                None,
+            );
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+
+        let mut wrong_assertion = transaction.clone();
+        wrong_assertion.all_instructions[7].data[4] ^= 1;
+        assert!(validator.validate_recover(&wrong_assertion, &rpc, payer_creations).await.is_err());
+
+        let mut excessive_compute = transaction.clone();
+        excessive_compute.all_instructions[1].data =
+            ComputeBudgetInstruction::set_compute_unit_limit(120_001).data;
+        assert!(validator
+            .validate_recover(&excessive_compute, &rpc, payer_creations)
+            .await
+            .is_err());
+
+        validator.fee_payer_policy.system.recover.max_wallet_safety_overhead_lamports = 7_499;
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
     }
 
     #[tokio::test]

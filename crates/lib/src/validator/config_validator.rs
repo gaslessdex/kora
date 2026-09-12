@@ -615,9 +615,11 @@ impl ConfigValidator {
                 );
             }
             if recover.compute_unit_limit != 100_000
+                || recover.augmented_compute_unit_limit != 120_000
                 || recover.compute_unit_price_micro_lamports != 375_000
+                || recover.max_wallet_safety_overhead_lamports != 10_000
             {
-                errors.push("Recover V1 compute policy must be exactly 100000 CU at 375000 micro-lamports/CU".to_string());
+                errors.push("Recover V1 compute policy must be exactly 100000 canonical CU, 120000 augmented CU, 375000 micro-lamports/CU, and 10000 lamports wallet overhead".to_string());
             }
             let recover_families = if recover.approved_dex_families.is_empty() {
                 vec![recover.approved_dex_family.as_str()]
@@ -1097,7 +1099,9 @@ mod tests {
             rent_fee_bps: 300,
             slippage_bps: 50,
             compute_unit_limit: 100_000,
+            augmented_compute_unit_limit: 120_000,
             compute_unit_price_micro_lamports: 375_000,
+            max_wallet_safety_overhead_lamports: 10_000,
             catastrophe_output_lamports: 1_000_000,
             minimum_user_payout_lamports: 1_000_000,
             approved_pool_accounts: if route_policy == "exact_snapshot" {
