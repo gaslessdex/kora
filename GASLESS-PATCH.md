@@ -30,6 +30,15 @@ Adding a SEND token is a validated runtime configuration change, not a Kora reco
 
 All existing authentication, method, signer, program allowlist, payer-outflow, fee, and transaction validation remains in force. `CreateAccountWithSeed`, direct CreateAccount, payer transfers, allocate, assign, multiple creations, wrong parent/depth, non-canonical destinations, non-legacy token ownership, wrong rent/space, and non-Jupiter/Raydium swap shapes remain denied.
 
+## Relay wallet admission
+
+Relay authorization remains mandatory for every Relay transaction. Staging uses an explicit
+`allowed_wallets` list. A public deployment may instead set
+`allow_public_authorized_wallets = true` only with an empty `allowed_wallets` list; this admits
+wallets solely after a valid application authorization and does not relax the exact Relay,
+route, signer, account, compute, Lighthouse, LUT, live-state, or sponsor checks. The default is
+false, and configuring both modes is rejected.
+
 ## Local-only CLEAN policy
 
 This policy is disabled by default and has not been deployed:

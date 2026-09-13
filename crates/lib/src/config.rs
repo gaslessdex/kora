@@ -187,6 +187,8 @@ pub struct RelayPolicy {
     #[serde(default)]
     pub allowed_wallets: Vec<String>,
     #[serde(default)]
+    pub allow_public_authorized_wallets: bool,
+    #[serde(default)]
     pub authorization_network: String,
     #[serde(default = "default_relay_authorization_max_lifetime_seconds")]
     pub authorization_max_lifetime_seconds: u64,
