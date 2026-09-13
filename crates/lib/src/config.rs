@@ -275,6 +275,8 @@ pub struct RecoverUserPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct RecoverPolicy {
     pub enabled: bool,
+    #[serde(default)]
+    pub allow_public_authorized_wallets: bool,
     #[serde(default = "default_recover_route_policy")]
     pub route_policy: String,
     #[serde(default = "default_recover_dex_family")]

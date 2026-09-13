@@ -111,13 +111,17 @@ fn validate_claims(
         .ok()
         .zip(Pubkey::from_str(&claims.input_mint).ok())
         .map(|(wallet, mint)| spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &spl_token_interface::id()).to_string());
+    let wallet_is_admitted = policy.allowed_users.iter().any(|identity| {
+        claims.pilot_wallet == identity.wallet
+            && (dynamic_mints || claims.source_token_account == identity.source_account)
+    }) || (policy.allow_public_authorized_wallets
+        && policy.allowed_users.is_empty()
+        && dynamic_mints
+        && canonical_source.as_deref() == Some(claims.source_token_account.as_str()));
     if claims.schema_version != "recover-authorization-v1"
         || claims.action != "CLEAN_RECOVER"
         || claims.network != policy.authorization_network
-        || !policy.allowed_users.iter().any(|identity| {
-            claims.pilot_wallet == identity.wallet
-                && (dynamic_mints || claims.source_token_account == identity.source_account)
-        })
+        || !wallet_is_admitted
         || !allowed_mint
         || (dynamic_mints
             && canonical_source.as_deref() != Some(claims.source_token_account.as_str()))
@@ -241,8 +245,17 @@ mod tests {
         let wallet = Pubkey::new_unique();
         let treasury = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let source = Pubkey::new_unique();
-        let wrapped = Pubkey::new_unique();
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &wallet,
+            &mint,
+            &spl_token_interface::id(),
+        );
+        let wrapped_mint = Pubkey::from_str(WRAPPED_SOL_MINT).unwrap();
+        let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+            &wallet,
+            &wrapped_mint,
+            &spl_token_interface::id(),
+        );
         let jupiter = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
         let mut route_data = vec![0u8; 39];
         route_data[..8].copy_from_slice(&[187, 100, 250, 204, 49, 196, 175, 20]);
@@ -351,6 +364,33 @@ mod tests {
         assert!(
             validate_recover_authorization(&fixture.transaction, &fixture.policy, None).is_err()
         );
+    }
+
+    #[test]
+    fn public_recover_requires_server_authorization_and_canonical_dynamic_accounts() {
+        let mut fixture = fixture(100, Hash::new_unique());
+        let authorization = authorize(&fixture, now());
+        fixture.policy.allowed_input_mints = vec![fixture.policy.input_mint.clone()];
+        fixture.policy.allowed_users.clear();
+        fixture.policy.allow_public_authorized_wallets = true;
+        assert!(validate_recover_authorization(
+            &fixture.transaction,
+            &fixture.policy,
+            Some(&authorization)
+        )
+        .is_ok());
+        assert!(
+            validate_recover_authorization(&fixture.transaction, &fixture.policy, None).is_err()
+        );
+
+        let mut disabled = fixture.policy.clone();
+        disabled.allow_public_authorized_wallets = false;
+        assert!(validate_recover_authorization(
+            &fixture.transaction,
+            &disabled,
+            Some(&authorization)
+        )
+        .is_err());
     }
 
     #[test]

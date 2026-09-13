@@ -511,9 +511,24 @@ impl ConfigValidator {
                     errors.push(format!("Invalid Recover {name}"));
                 }
             }
-            if recover.allowed_users.is_empty() || recover.allowed_users.len() > 10 {
+            if recover.allow_public_authorized_wallets && !recover.allowed_users.is_empty() {
                 errors.push(
-                    "Recover allowed_users must contain between 1 and 10 entries".to_string(),
+                    "Recover public wallet admission and an explicit wallet allowlist are mutually exclusive"
+                        .to_string(),
+                );
+            }
+            if recover.allow_public_authorized_wallets && recover.allowed_input_mints.is_empty() {
+                errors.push(
+                    "Recover public wallet admission requires an explicit dynamic mint allowlist"
+                        .to_string(),
+                );
+            }
+            if (!recover.allow_public_authorized_wallets && recover.allowed_users.is_empty())
+                || recover.allowed_users.len() > 10
+            {
+                errors.push(
+                    "Recover allowed_users must contain between 1 and 10 entries unless public authorized wallets are enabled"
+                        .to_string(),
                 );
             }
             let dynamic_mints = !recover.allowed_input_mints.is_empty();
@@ -1070,6 +1085,7 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.recover = RecoverPolicy {
             enabled: true,
+            allow_public_authorized_wallets: false,
             route_policy: route_policy.to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
             approved_dex_families: vec![],
@@ -1125,6 +1141,29 @@ mod tests {
         update_config(config).unwrap();
         let rpc_client = RpcClient::new("http://localhost:8899".to_string());
         ConfigValidator::validate_with_result(&rpc_client, true).await.err().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_public_authorization_requires_dynamic_mints_and_no_static_users() {
+        let mut public = recover_config("semantic_family");
+        let mint = public.validation.fee_payer_policy.system.recover.input_mint.clone();
+        public.validation.fee_payer_policy.system.recover.allowed_input_mints = vec![mint];
+        public.validation.fee_payer_policy.system.recover.input_mint.clear();
+        public.validation.fee_payer_policy.system.recover.allowed_users.clear();
+        public.validation.fee_payer_policy.system.recover.allow_public_authorized_wallets = true;
+        assert!(recover_config_errors(public.clone()).await.is_empty());
+
+        let mut mixed = public.clone();
+        mixed.validation.fee_payer_policy.system.recover.allowed_users.push(RecoverUserPolicy {
+            wallet: Pubkey::new_unique().to_string(),
+            source_account: Pubkey::new_unique().to_string(),
+            wrapped_sol_account: Pubkey::new_unique().to_string(),
+        });
+        assert!(!recover_config_errors(mixed).await.is_empty());
+
+        public.validation.fee_payer_policy.system.recover.allowed_input_mints.clear();
+        assert!(!recover_config_errors(public).await.is_empty());
     }
 
     #[tokio::test]

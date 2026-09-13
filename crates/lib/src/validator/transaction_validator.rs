@@ -1158,19 +1158,27 @@ impl TransactionValidator {
         let wallet = signer_keys.get(1).copied().ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value user signer is missing".to_string())
         })?;
-        let identity = policy
-            .allowed_users
-            .iter()
-            .find(|identity| identity.wallet == wallet.to_string())
-            .ok_or_else(|| {
-                KoraError::InvalidTransaction("Recover Value user is not allowed".to_string())
-            })?;
+        let identity =
+            policy.allowed_users.iter().find(|identity| identity.wallet == wallet.to_string());
+        if identity.is_none()
+            && !(policy.allow_public_authorized_wallets
+                && policy.allowed_users.is_empty()
+                && dynamic_mints)
+        {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value user is not allowed".to_string(),
+            ));
+        }
         let source = if dynamic_mints {
             spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program)
         } else {
-            parse(&identity.source_account)?
+            parse(&identity.ok_or(KoraError::ConfigError)?.source_account)?
         };
-        let wrapped = parse(&identity.wrapped_sol_account)?;
+        let wrapped = if policy.allow_public_authorized_wallets {
+            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program)
+        } else {
+            parse(&identity.ok_or(KoraError::ConfigError)?.wrapped_sol_account)?
+        };
         if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
             return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
         }
@@ -1617,7 +1625,10 @@ impl TransactionValidator {
         let authorization_mismatch = if let Some(authorization) =
             transaction.recover_authorization_claims.as_ref()
         {
-            authorized_amount(&authorization.input_amount_raw)? != input_amount
+            authorization.pilot_wallet != wallet.to_string()
+                || authorization.source_token_account != source.to_string()
+                || authorization.input_mint != mint.to_string()
+                || authorized_amount(&authorization.input_amount_raw)? != input_amount
                 || authorized_amount(&authorization.expected_output_lamports)? != quoted_output
                 || authorized_amount(&authorization.minimum_output_lamports)? != minimum_output
                 || authorized_amount(&authorization.minimum_user_payout_lamports)?
@@ -3956,6 +3967,7 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.recover = RecoverPolicy {
             enabled: true,
+            allow_public_authorized_wallets: false,
             route_policy: "semantic_family".to_string(),
             approved_dex_family: "RAYDIUM_CLMM".to_string(),
             approved_dex_families: vec![],
@@ -4414,7 +4426,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn recover_authorization_economics_must_match_each_rpc_verified_value() {
-        let (validator, mut transaction, rpc, payer_creations) =
+        let (mut validator, mut transaction, rpc, payer_creations) =
             recover_fixture_with_output(false, None, None, 1_000_000_000);
         let minimum = 995_000_000_u64;
         let swap_fee = minimum * 30 / 10_000;
@@ -4450,8 +4462,13 @@ mod tests {
             expires_at_unix_seconds: 2,
         };
         transaction.recover_authorization_claims = Some(claims.clone());
-        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
-        for field in 0..9 {
+        let public_policy = &mut validator.fee_payer_policy.system.recover;
+        public_policy.allowed_input_mints = vec![public_policy.input_mint.clone()];
+        public_policy.allowed_users.clear();
+        public_policy.allow_public_authorized_wallets = true;
+        let public_result = validator.validate_recover(&transaction, &rpc, payer_creations).await;
+        assert!(public_result.is_ok(), "{public_result:?}");
+        for field in 0..12 {
             let mut mutated = transaction.clone();
             let claims = mutated.recover_authorization_claims.as_mut().unwrap();
             match field {
@@ -4463,7 +4480,10 @@ mod tests {
                 5 => claims.rent_fee_lamports = (rent_fee + 1).to_string(),
                 6 => claims.network_reimbursement_lamports = (network + 1).to_string(),
                 7 => claims.setup_rent_reimbursement_lamports = (setup + 1).to_string(),
-                _ => claims.sponsored_cost_lamports = (network + setup + 1).to_string(),
+                8 => claims.sponsored_cost_lamports = (network + setup + 1).to_string(),
+                9 => claims.pilot_wallet = Pubkey::new_unique().to_string(),
+                10 => claims.source_token_account = Pubkey::new_unique().to_string(),
+                _ => claims.input_mint = Pubkey::new_unique().to_string(),
             }
             assert!(
                 validator.validate_recover(&mutated, &rpc, payer_creations).await.is_err(),
