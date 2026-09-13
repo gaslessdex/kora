@@ -96,6 +96,8 @@ fn validate_claims(
         _ => return Err(KoraError::InvalidTransaction("Relay requires a v0 message".to_string())),
     };
     let signer_keys = transaction.transaction.message.static_account_keys();
+    let wallet_is_admitted = policy.allowed_wallets.iter().any(|wallet| wallet == &claims.wallet)
+        || (policy.allow_public_authorized_wallets && policy.allowed_wallets.is_empty());
     if message.header.num_required_signatures != 2
         || message.header.num_readonly_signed_accounts != 0
         || transaction.transaction.signatures.len() != 2
@@ -104,7 +106,7 @@ fn validate_claims(
         || signer_keys.get(1).map(ToString::to_string).as_deref() != Some(claims.wallet.as_str())
         || claims.fee_payer != payer.to_string()
         || claims.wallet == claims.fee_payer
-        || !policy.allowed_wallets.iter().any(|wallet| wallet == &claims.wallet)
+        || !wallet_is_admitted
     {
         return Err(KoraError::InvalidTransaction(
             "Relay payer or user signer binding is invalid".to_string(),
@@ -603,6 +605,7 @@ mod tests {
             enabled: true,
             authorization_public_key: authority.pubkey().to_string(),
             allowed_wallets: vec![wallet.pubkey().to_string()],
+            allow_public_authorized_wallets: false,
             authorization_network: "mainnet-beta".to_string(),
             authorization_max_lifetime_seconds: 90,
         };
@@ -761,6 +764,36 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn public_relay_wallet_admission_is_explicit_and_still_requires_authorization() {
+        let mut fixture = fixture(true);
+        fixture.policy.allowed_wallets.clear();
+        let authorization = authorize(&fixture, Pubkey::new_unique().to_string(), now());
+        assert!(validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            Some(&authorization),
+        )
+        .is_err());
+
+        fixture.policy.allow_public_authorized_wallets = true;
+        assert!(validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            Some(&authorization),
+        )
+        .is_ok());
+        assert!(validate_relay_authorization(
+            &fixture.transaction,
+            &fixture.payer.pubkey(),
+            &fixture.policy,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

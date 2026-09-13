@@ -727,6 +727,15 @@ impl ConfigValidator {
                         .to_string(),
                 );
             }
+            if relay.allow_public_authorized_wallets && !relay.allowed_wallets.is_empty() {
+                errors.push(
+                    "Relay public wallet admission and an explicit wallet allowlist are mutually exclusive"
+                        .to_string(),
+                );
+            }
+            if relay.allowed_wallets.iter().any(|wallet| Pubkey::from_str(wallet).is_err()) {
+                errors.push("Invalid Relay allowed_wallets entry".to_string());
+            }
             if config
                 .validation
                 .allowed_programs
