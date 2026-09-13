@@ -81,9 +81,12 @@ impl KoraRpc {
         &self,
         request: SignTransactionRequest,
     ) -> Result<SignTransactionResponse, KoraError> {
-        info!("Sign transaction request: {request:?}");
+        info!("Sign transaction request received");
         let result = sign_transaction(&self.rpc_client, request).await;
-        info!("Sign transaction response: {result:?}");
+        info!(
+            "Sign transaction response: {}",
+            if result.is_ok() { "ok" } else { "error" }
+        );
         result
     }
 
