@@ -1054,6 +1054,10 @@ impl TransactionValidator {
         let token_instructions = &outer[2..outer.len() - 1];
         let is_burn = token_instructions.first().and_then(|instruction| instruction.data.first())
             == Some(&15);
+        let is_legacy_close_claim = !is_burn
+            && token_instructions.len() == 1
+            && token_instructions[0].program_id == legacy_token_program
+            && token_instructions[0].data.as_slice() == [9];
         if is_burn {
             if !policy.burn_enabled
                 || compute_price != BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
@@ -1067,7 +1071,7 @@ impl TransactionValidator {
             }
         } else if !policy.claim_enabled
             || (wallet_augmented
-                && (!policy.claim_v2_enabled
+                && (!(policy.claim_v2_enabled || is_legacy_close_claim)
                     || compute_limit < policy.claim_compute_unit_limit
                     || compute_limit > CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_LIMIT
                     || compute_price < policy.claim_min_compute_unit_price_micro_lamports
@@ -4343,6 +4347,7 @@ mod tests {
     }
 
     fn claim_lighthouse_fixture(
+        claim_v2_enabled: bool,
     ) -> (TransactionValidator, VersionedTransactionResolved, std::sync::Arc<RpcClient>) {
         let payer = Pubkey::new_unique();
         let wallet = Pubkey::new_unique();
@@ -4363,7 +4368,7 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.clean = CleanPolicy {
             claim_enabled: true,
-            claim_v2_enabled: true,
+            claim_v2_enabled,
             burn_enabled: false,
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
@@ -4454,7 +4459,7 @@ mod tests {
         let mut policy = FeePayerPolicy::default();
         policy.system.clean = CleanPolicy {
             claim_enabled: true,
-            claim_v2_enabled: true,
+            claim_v2_enabled: false,
             burn_enabled: false,
             settlement_wallet: treasury.to_string(),
             fee_bps: 300,
@@ -5534,13 +5539,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn claim_v2_accepts_exact_solflare_lighthouse_suffix() {
-        let (validator, transaction, rpc) = claim_lighthouse_fixture();
+        let (validator, transaction, rpc) = claim_lighthouse_fixture(true);
         assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
 
         for (wallet_floor, token_floor) in
             [(801_792_u64, 2_838_810_u64), (1_069_080_u64, 3_785_080_u64)]
         {
-            let (validator, mut transaction, rpc) = claim_lighthouse_fixture();
+            let (validator, mut transaction, rpc) = claim_lighthouse_fixture(true);
             let wallet = transaction.all_instructions[4].accounts[0].pubkey;
             transaction.all_instructions[4].data = claim_lighthouse_account_data(wallet_floor);
             transaction.all_instructions[5].data = claim_lighthouse_token_data(token_floor, wallet);
@@ -5551,7 +5556,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn claim_v2_rejects_lighthouse_and_compute_mutations() {
-        let (validator, original, rpc) = claim_lighthouse_fixture();
+        let (validator, original, rpc) = claim_lighthouse_fixture(true);
         for mutation in 0..14 {
             let mut transaction = original.clone();
             match mutation {
@@ -5583,7 +5588,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn claim_v2_accepts_semantic_closeaccount_wallet_augmentations() {
+    async fn public_legacy_claim_accepts_semantic_closeaccount_wallet_augmentations() {
         for phantom_style in [true, false] {
             for wallet_exists in [true, false] {
                 let (validator, transaction, rpc, _, _) =
@@ -5600,7 +5605,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn claim_v2_rejects_closeaccount_lighthouse_mutations() {
+    async fn public_legacy_claim_rejects_closeaccount_lighthouse_mutations() {
         let (validator, original, rpc, wallet, _) = claim_close_lighthouse_fixture(false, 0, true);
         for mutation in 0..12 {
             let mut transaction = original.clone();
@@ -5648,6 +5653,16 @@ mod tests {
             validator.validate_clean(&transaction, &rpc).await.is_err(),
             "duplicate wallet post-state assertions must fail"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn withdraw_excess_lighthouse_remains_isolated_to_claim_v2() {
+        let (validator, transaction, rpc) = claim_lighthouse_fixture(false);
+        assert!(validator.validate_clean(&transaction, &rpc).await.is_err());
+
+        let (validator, transaction, rpc) = claim_lighthouse_fixture(true);
+        assert!(validator.validate_clean(&transaction, &rpc).await.is_ok());
     }
 
     #[tokio::test]

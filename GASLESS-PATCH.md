@@ -57,6 +57,12 @@ claim_max_compute_unit_price_micro_lamports = 100000
 
 Claim/Burn validation is shape-specific: v0, exactly payer and user signers, current eligible SPL state, and user recovery destination. Claim requires the configured bounded compute prefix and a settlement of exactly the integer-floor 3% service fee; Kora's payer absorbs the network fee. Burn retains the exact 375000/100000 compute prefix, full-balance validation, and 3% fee plus network reimbursement. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
 
+Legacy SPL `CloseAccount` Lighthouse validation belongs to the ordinary `claim_enabled`
+policy and remains available when `claim_v2_enabled = false`. It is limited to one empty
+Legacy source, the unchanged 3% settlement, the bounded compute envelope, and the exact
+semantic Phantom/Solflare assertion suffixes. `claim_v2_enabled` continues to gate
+`WithdrawExcessLamports` and every Token-2022 Claim shape.
+
 ## Recover Value policy
 
 Recover is disabled by default. When explicitly configured, Kora decodes the Jupiter v6
