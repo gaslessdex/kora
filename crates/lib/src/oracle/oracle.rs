@@ -25,6 +25,7 @@ pub enum PriceSource {
 }
 
 #[automock]
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait PriceOracle {
     async fn get_price(&self, client: &Client, mint_address: &str)

@@ -65,6 +65,7 @@ impl Deref for VersionedTransactionResolved {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait VersionedTransactionOps {
     fn encode_b64_transaction(&self) -> Result<String, KoraError>;

@@ -7,6 +7,7 @@ use redis::AsyncCommands;
 use crate::{error::KoraError, sanitize_error};
 
 /// Trait for storing and retrieving usage counts
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait UsageStore: Send + Sync {
     /// Increment usage count for a key and return the new value

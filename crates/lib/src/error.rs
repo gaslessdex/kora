@@ -1,3 +1,4 @@
+#[cfg(not(feature = "unsafe-debug"))]
 use crate::sanitize::sanitize_message;
 use jsonrpsee::{core::Error as RpcError, types::error::CallError};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,7 @@ pub enum KoraError {
 impl From<ClientError> for KoraError {
     fn from(e: ClientError) -> Self {
         let error_string = e.to_string();
+        #[cfg(not(feature = "unsafe-debug"))]
         let sanitized_error_string = sanitize_message(&error_string);
         if error_string.contains("AccountNotFound")
             || error_string.contains("could not find account")

@@ -13,7 +13,6 @@ import {
     TransferTransactionRequest,
     TransferTransactionResponse,
     RpcError,
-    RpcRequest,
     AuthenticationHeaders,
     KoraClientOptions,
     GetPayerSignerResponse,

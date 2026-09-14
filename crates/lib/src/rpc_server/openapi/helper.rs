@@ -66,6 +66,7 @@ pub(crate) fn request_schema(name: &str, params: Option<RefOr<Schema>>) -> RefOr
     RefOr::T(Schema::Object(builder.build()))
 }
 
+#[allow(dead_code)]
 pub(crate) fn find_all_components(schema: RefOr<Schema>) -> HashSet<String> {
     let mut components = HashSet::new();
 
@@ -105,6 +106,7 @@ pub(crate) fn find_all_components(schema: RefOr<Schema>) -> HashSet<String> {
     components
 }
 
+#[allow(dead_code)]
 pub(crate) fn filter_unused_components(
     request: Option<RefOr<Schema>>,
     response: RefOr<Schema>,
@@ -138,6 +140,7 @@ pub(crate) fn filter_unused_components(
 }
 
 #[allow(non_snake_case)]
+#[allow(dead_code)]
 pub(crate) fn fix_examples_for_allOf_references(schema: RefOr<Schema>) -> RefOr<Schema> {
     match schema {
         RefOr::T(mut schema) => match schema {
@@ -154,7 +157,7 @@ pub(crate) fn fix_examples_for_allOf_references(schema: RefOr<Schema>) -> RefOr<
             })),
             Schema::Array(ref mut array) => RefOr::T(Schema::Array({
                 // Handle array items recursively
-                array.items = Box::new(fix_examples_for_allOf_references(*array.items.clone()));
+                *array.items = fix_examples_for_allOf_references(*array.items.clone());
                 array.clone()
             })),
             Schema::AllOf(ref all_of) => {
@@ -187,6 +190,7 @@ pub(crate) fn fix_examples_for_allOf_references(schema: RefOr<Schema>) -> RefOr<
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn add_referenced_components(schema: RefOr<Schema>, components: &mut Components) {
     match schema {
         RefOr::T(Schema::Object(obj)) => {

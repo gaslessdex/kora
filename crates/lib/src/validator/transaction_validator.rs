@@ -2084,6 +2084,7 @@ impl TransactionValidator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_recover_route(
         &self,
         instruction: &Instruction,
@@ -2407,7 +2408,7 @@ impl TransactionValidator {
         let expected_limit =
             ComputeBudgetInstruction::set_compute_unit_limit(SWAP_COMPUTE_UNIT_LIMIT).data;
         let compute_valid =
-            outer.get(0).is_some_and(|instruction| {
+            outer.first().is_some_and(|instruction| {
                 instruction.program_id == compute_program
                     && instruction.accounts.is_empty()
                     && instruction.data == expected_limit
@@ -4741,7 +4742,7 @@ mod tests {
             let expected_user = quoted_output - minimum_output * 30 / 10_000 + source_rent
                 - source_rent * 300 / 10_000
                 - canonical_network_fee;
-            let floor = (expected_user * 75 + 99) / 100;
+            let floor = (expected_user * 75).div_ceil(100);
             instructions.push(Instruction::new_with_bytes(
                 Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap(),
                 &claim_lighthouse_account_data(floor),
