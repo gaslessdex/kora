@@ -1331,10 +1331,11 @@ impl TransactionValidator {
                             "Lighthouse Claim source is malformed".to_string(),
                         )
                     })?;
-            let wallet_account =
-                accounts.last().and_then(|account| account.as_ref()).ok_or_else(|| {
-                    KoraError::InvalidTransaction("Lighthouse Claim wallet is missing".to_string())
-                })?;
+            let wallet_account = accounts.last().ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Lighthouse Claim wallet state is missing".to_string(),
+                )
+            })?;
             let outer_count = transaction.transaction.message.instructions().len();
             let full_outer = transaction.all_instructions.get(..outer_count).ok_or_else(|| {
                 KoraError::InvalidTransaction(
@@ -1345,14 +1346,17 @@ impl TransactionValidator {
                 KoraError::InvalidTransaction("Lighthouse Claim assertions are missing".to_string())
             })?;
             let expected_wallet_post = wallet_account
-                .lamports
+                .as_ref()
+                .map_or(0, |account| account.lamports)
                 .checked_add(reclaimed)
                 .and_then(|value| value.checked_sub(service_fee))
                 .ok_or(KoraError::ConfigError)?;
+            let wallet_account_is_safe = wallet_account.as_ref().is_none_or(|account| {
+                account.owner == SYSTEM_PROGRAM_ID && account.data.is_empty() && !account.executable
+            });
             if token_instructions.len() != 1
                 || token_instructions[0].program_id != legacy_token_program
-                || wallet_account.owner != SYSTEM_PROGRAM_ID
-                || !wallet_account.data.is_empty()
+                || !wallet_account_is_safe
                 || network_fee > CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS
             {
                 return Err(KoraError::InvalidTransaction(
@@ -4418,6 +4422,7 @@ mod tests {
     fn claim_close_lighthouse_fixture(
         phantom_style: bool,
         source_amount: u64,
+        wallet_exists: bool,
     ) -> (
         TransactionValidator,
         VersionedTransactionResolved,
@@ -4503,7 +4508,7 @@ mod tests {
         token_data[64..72].copy_from_slice(&source_amount.to_le_bytes());
         token_data[108] = 1;
         let source_account = json!({ "data": [base64::engine::general_purpose::STANDARD.encode(token_data), "base64"], "executable": false, "lamports": reclaimed, "owner": token_program.to_string(), "rentEpoch": 0 });
-        let wallet_account = json!({ "data": ["", "base64"], "executable": false, "lamports": 0, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 });
+        let wallet_account = wallet_exists.then(|| json!({ "data": ["", "base64"], "executable": false, "lamports": 0, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 }));
         let mut mocks = HashMap::new();
         mocks.insert(
             RpcRequest::GetMultipleAccounts,
@@ -5560,20 +5565,23 @@ mod tests {
     #[serial]
     async fn claim_v2_accepts_semantic_closeaccount_wallet_augmentations() {
         for phantom_style in [true, false] {
-            let (validator, transaction, rpc, _, _) =
-                claim_close_lighthouse_fixture(phantom_style, 0);
-            assert!(
-                validator.validate_clean(&transaction, &rpc).await.is_ok(),
-                "captured {} CloseAccount shape must pass",
-                if phantom_style { "Phantom" } else { "Solflare" }
-            );
+            for wallet_exists in [true, false] {
+                let (validator, transaction, rpc, _, _) =
+                    claim_close_lighthouse_fixture(phantom_style, 0, wallet_exists);
+                assert!(
+                    validator.validate_clean(&transaction, &rpc).await.is_ok(),
+                    "captured {} CloseAccount shape with {} wallet must pass",
+                    if phantom_style { "Phantom" } else { "Solflare" },
+                    if wallet_exists { "existing" } else { "unfunded" }
+                );
+            }
         }
     }
 
     #[tokio::test]
     #[serial]
     async fn claim_v2_rejects_closeaccount_lighthouse_mutations() {
-        let (validator, original, rpc, wallet, _) = claim_close_lighthouse_fixture(false, 0);
+        let (validator, original, rpc, wallet, _) = claim_close_lighthouse_fixture(false, 0, true);
         for mutation in 0..12 {
             let mut transaction = original.clone();
             match mutation {
@@ -5607,13 +5615,14 @@ mod tests {
             );
         }
 
-        let (validator, transaction, rpc, _, _) = claim_close_lighthouse_fixture(false, 1);
+        let (validator, transaction, rpc, _, _) = claim_close_lighthouse_fixture(false, 1, true);
         assert!(
             validator.validate_clean(&transaction, &rpc).await.is_err(),
             "CloseAccount must reject a non-empty source"
         );
 
-        let (validator, mut transaction, rpc, wallet, _) = claim_close_lighthouse_fixture(true, 0);
+        let (validator, mut transaction, rpc, wallet, _) =
+            claim_close_lighthouse_fixture(true, 0, true);
         transaction.all_instructions[4].accounts[0].pubkey = wallet;
         assert!(
             validator.validate_clean(&transaction, &rpc).await.is_err(),
