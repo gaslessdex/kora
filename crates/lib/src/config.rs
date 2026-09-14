@@ -256,6 +256,8 @@ impl Default for SendMintPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct CleanPolicy {
     pub claim_enabled: bool,
+    #[serde(default)]
+    pub claim_v2_enabled: bool,
     pub burn_enabled: bool,
     #[serde(default)]
     pub settlement_wallet: String,
@@ -263,6 +265,12 @@ pub struct CleanPolicy {
     pub fee_bps: u16,
     #[serde(default = "default_clean_claim_accounts")]
     pub maximum_claim_accounts: u8,
+    #[serde(default = "default_claim_compute_unit_limit")]
+    pub claim_compute_unit_limit: u32,
+    #[serde(default = "default_claim_min_compute_unit_price")]
+    pub claim_min_compute_unit_price_micro_lamports: u64,
+    #[serde(default = "default_claim_max_compute_unit_price")]
+    pub claim_max_compute_unit_price_micro_lamports: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
@@ -300,8 +308,12 @@ pub struct RecoverPolicy {
     pub slippage_bps: u16,
     #[serde(default = "default_recover_compute_unit_limit")]
     pub compute_unit_limit: u32,
+    #[serde(default = "default_recover_augmented_compute_unit_limit")]
+    pub augmented_compute_unit_limit: u32,
     #[serde(default = "default_recover_compute_unit_price")]
     pub compute_unit_price_micro_lamports: u64,
+    #[serde(default = "default_recover_wallet_safety_overhead")]
+    pub max_wallet_safety_overhead_lamports: u64,
     #[serde(default)]
     pub catastrophe_output_lamports: u64,
     #[serde(default)]
@@ -337,8 +349,14 @@ fn default_recover_slippage_bps() -> u16 {
 fn default_recover_compute_unit_limit() -> u32 {
     100_000
 }
+fn default_recover_augmented_compute_unit_limit() -> u32 {
+    120_000
+}
 fn default_recover_compute_unit_price() -> u64 {
     375_000
+}
+fn default_recover_wallet_safety_overhead() -> u64 {
+    10_000
 }
 fn default_recover_authorization_max_lifetime_seconds() -> u64 {
     90
@@ -349,6 +367,15 @@ fn default_clean_fee_bps() -> u16 {
 }
 fn default_clean_claim_accounts() -> u8 {
     10
+}
+fn default_claim_compute_unit_limit() -> u32 {
+    10_000
+}
+fn default_claim_min_compute_unit_price() -> u64 {
+    1_000
+}
+fn default_claim_max_compute_unit_price() -> u64 {
+    100_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
