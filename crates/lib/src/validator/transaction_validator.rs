@@ -1843,7 +1843,7 @@ impl TransactionValidator {
             jupiter_program,
             dex.program_id,
         ]);
-        allowed_jupiter_accounts.extend(auxiliary_accounts);
+        allowed_jupiter_accounts.extend(auxiliary_accounts.iter().copied());
         allowed_jupiter_accounts.extend(dex.accounts.iter().map(|account| account.pubkey));
         if outer[jupiter_index].accounts.iter().any(|account| {
             !allowed_jupiter_accounts.contains(&account.pubkey)
@@ -1858,6 +1858,31 @@ impl TransactionValidator {
         }) {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value Jupiter route contains an unapproved or unrelated account"
+                    .to_string(),
+            ));
+        }
+        let event_authority =
+            Pubkey::find_program_address(&[b"__event_authority"], &jupiter_program).0;
+        let inert_auxiliary_accounts = outer[jupiter_index]
+            .accounts
+            .iter()
+            .filter(|account| {
+                auxiliary_accounts.contains(&account.pubkey)
+                    && account.pubkey != event_authority
+                    && account.pubkey != self.fee_payer_pubkey
+            })
+            .map(|account| account.pubkey)
+            .collect::<HashSet<_>>();
+        if transaction.inner_instruction_contexts.iter().any(|context| {
+            context.outer_instruction_index as usize == jupiter_index
+                && context
+                    .instruction
+                    .accounts
+                    .iter()
+                    .any(|account| inert_auxiliary_accounts.contains(&account.pubkey))
+        }) {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value Jupiter auxiliary placeholder cannot be used inside a CPI"
                     .to_string(),
             ));
         }
@@ -5395,6 +5420,36 @@ mod tests {
         let sponsor_cpi = transfer(&payer, &Pubkey::new_unique(), 1);
         transaction.inner_instruction_contexts.push(InnerInstructionContext {
             instruction: sponsor_cpi,
+            outer_instruction_index: 3,
+            stack_height: Some(2),
+        });
+        assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_allows_only_inert_pinned_auxiliary_placeholders() {
+        let (mut validator, mut transaction, rpc, payer_creations) =
+            recover_fixture(false, None, None);
+        let placeholder = Pubkey::new_unique();
+        validator
+            .fee_payer_policy
+            .system
+            .recover
+            .allowed_jupiter_auxiliary_accounts
+            .push(placeholder.to_string());
+        transaction.all_instructions[3].accounts.push(AccountMeta::new(placeholder, false));
+        transaction.all_account_keys.push(placeholder);
+        let accepted =
+            validator.validate_recover(&transaction, &rpc, payer_creations.clone()).await;
+        assert!(accepted.is_ok(), "{accepted:?}");
+
+        transaction.inner_instruction_contexts.push(InnerInstructionContext {
+            instruction: transfer(
+                &transaction.all_instructions[3].accounts[0].pubkey,
+                &placeholder,
+                1,
+            ),
             outer_instruction_index: 3,
             stack_height: Some(2),
         });
