@@ -161,6 +161,12 @@ fn valid_raydium_exact_in_route(raydium_data: &[u8], jupiter_data: &[u8]) -> boo
         && jupiter_data[26] == 0
 }
 
+fn valid_jupiter_recover_route_shape(data: &[u8], family: &str) -> bool {
+    matches!(data.len(), 39 | 43)
+        && data.get(..8) == Some(JUPITER_ROUTE_DISCRIMINATOR.as_slice())
+        && (data.len() == 39 || family == "METEORA_DLMM")
+}
+
 fn raydium_tick_accounts_start(
     instruction: &Instruction,
     jupiter_instruction: &Instruction,
@@ -1647,7 +1653,7 @@ impl TransactionValidator {
             ));
         }
         let route_data = &outer[jupiter_index].data;
-        if route_data.len() != 39 || route_data[..8] != [187, 100, 250, 204, 49, 196, 175, 20] {
+        if !matches!(route_data.len(), 39 | 43) || route_data[..8] != JUPITER_ROUTE_DISCRIMINATOR {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value Jupiter instruction is not the approved route form".to_string(),
             ));
@@ -1738,6 +1744,15 @@ impl TransactionValidator {
         } else {
             "PUMPSWAP"
         };
+        let meteora_input_matches = family != "METEORA_DLMM"
+            || dex.data.get(8..16).and_then(|bytes| bytes.try_into().ok()).map(u64::from_le_bytes)
+                == Some(input_amount);
+        if !valid_jupiter_recover_route_shape(route_data, family) || !meteora_input_matches {
+            return Err(KoraError::InvalidTransaction(
+                "Recover Value Jupiter route encoding does not match the approved DEX leg"
+                    .to_string(),
+            ));
+        }
         let approved_families = if policy.approved_dex_families.is_empty() {
             vec![policy.approved_dex_family.as_str()]
         } else {
@@ -3911,6 +3926,24 @@ mod tests {
         data.extend_from_slice(&slippage_bps.to_le_bytes());
         data.extend_from_slice(&[0; 13]);
         data
+    }
+
+    #[test]
+    fn recover_jupiter_route_shape_admits_only_the_current_meteora_extension() {
+        let legacy = current_jupiter_route_data(1, 1, 50);
+        assert!(valid_jupiter_recover_route_shape(&legacy, "RAYDIUM_CLMM"));
+        assert!(valid_jupiter_recover_route_shape(&legacy, "METEORA_DLMM"));
+
+        let mut meteora = legacy.clone();
+        meteora.extend_from_slice(&[0; 4]);
+        assert!(valid_jupiter_recover_route_shape(&meteora, "METEORA_DLMM"));
+        assert!(!valid_jupiter_recover_route_shape(&meteora, "RAYDIUM_CLMM"));
+        assert!(!valid_jupiter_recover_route_shape(&meteora, "PUMPSWAP"));
+
+        meteora[0] ^= 1;
+        assert!(!valid_jupiter_recover_route_shape(&meteora, "METEORA_DLMM"));
+        assert!(!valid_jupiter_recover_route_shape(&[0; 42], "METEORA_DLMM"));
+        assert!(!valid_jupiter_recover_route_shape(&[0; 44], "METEORA_DLMM"));
     }
 
     fn current_raydium_swap_data(amount: u64, minimum_output: u64) -> Vec<u8> {

@@ -15,6 +15,7 @@ use std::{
 use utoipa::ToSchema;
 
 const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const JUPITER_ROUTE_DISCRIMINATOR: [u8; 8] = [187, 100, 250, 204, 49, 196, 175, 20];
 const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const CLOCK_SKEW_SECONDS: u64 = 30;
 
@@ -165,7 +166,10 @@ fn validate_claims(
         outer.iter().find(|instruction| instruction.program_id == jupiter).ok_or_else(|| {
             KoraError::InvalidTransaction("Recover authorization route is missing".to_string())
         })?;
-    if route.data.len() != 39 {
+    if !matches!(route.data.len(), 39 | 43)
+        || route.data[..8] != JUPITER_ROUTE_DISCRIMINATOR
+        || route.data[26] != 0
+    {
         return Err(KoraError::InvalidTransaction(
             "Recover authorization route is invalid".to_string(),
         ));
@@ -250,10 +254,11 @@ mod tests {
         transaction: VersionedTransactionResolved,
     }
 
-    fn fixture_with_program(
+    fn fixture_with_program_and_route_length(
         settlement_lamports: u64,
         blockhash: Hash,
         token_2022_input: bool,
+        route_length: usize,
     ) -> Fixture {
         let authority = Keypair::new();
         let payer = Keypair::new();
@@ -277,8 +282,8 @@ mod tests {
             &spl_token_interface::id(),
         );
         let jupiter = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
-        let mut route_data = vec![0u8; 39];
-        route_data[..8].copy_from_slice(&[187, 100, 250, 204, 49, 196, 175, 20]);
+        let mut route_data = vec![0u8; route_length];
+        route_data[..8].copy_from_slice(&JUPITER_ROUTE_DISCRIMINATOR);
         route_data[8..16].copy_from_slice(&500u64.to_le_bytes());
         route_data[16..24].copy_from_slice(&1_000u64.to_le_bytes());
         route_data[24..26].copy_from_slice(&50u16.to_le_bytes());
@@ -335,6 +340,14 @@ mod tests {
             ..RecoverPolicy::default()
         };
         Fixture { authority, payer, policy, transaction }
+    }
+
+    fn fixture_with_program(
+        settlement_lamports: u64,
+        blockhash: Hash,
+        token_2022_input: bool,
+    ) -> Fixture {
+        fixture_with_program_and_route_length(settlement_lamports, blockhash, token_2022_input, 39)
     }
 
     fn fixture(settlement_lamports: u64, blockhash: Hash) -> Fixture {
@@ -396,6 +409,38 @@ mod tests {
         assert!(
             validate_recover_authorization(&fixture.transaction, &fixture.policy, None).is_err()
         );
+    }
+
+    #[test]
+    fn exact_current_meteora_route_encoding_is_authorized() {
+        let fixture = fixture_with_program_and_route_length(100, Hash::new_unique(), true, 43);
+        let authorization = authorize(&fixture, now());
+        assert!(validate_recover_authorization(
+            &fixture.transaction,
+            &fixture.policy,
+            Some(&authorization),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn recover_route_encoding_mutations_are_rejected() {
+        for mutation in 0..3 {
+            let fixture = fixture(100, Hash::new_unique());
+            let authorization = authorize(&fixture, now());
+            let mut transaction = fixture.transaction.clone();
+            match mutation {
+                0 => transaction.all_instructions[0].data.push(0),
+                1 => transaction.all_instructions[0].data[0] ^= 1,
+                _ => transaction.all_instructions[0].data[26] = 1,
+            }
+            assert!(validate_recover_authorization(
+                &transaction,
+                &fixture.policy,
+                Some(&authorization),
+            )
+            .is_err());
+        }
     }
 
     #[test]
