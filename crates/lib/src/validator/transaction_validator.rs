@@ -393,16 +393,35 @@ fn valid_xstock_token_account(
 }
 
 fn valid_xstock_program_vault(account: &Account, mint: Pubkey, authority: Pubkey) -> bool {
-    // Current Raydium and Meteora xStock vaults are program-derived Token-2022 accounts,
-    // not ATAs. Their live 175-byte profile has PausableAccount and TransferHookAccount
-    // but intentionally lacks ATA-only ImmutableOwner. PDA/authority relationships are
-    // validated separately by each venue-specific validator.
+    // Current Raydium xStock vaults are program-derived Token-2022 accounts with the
+    // 175-byte PausableAccount + TransferHookAccount profile. PDA/authority relationships
+    // are validated separately by the venue-specific validator.
     valid_xstock_token_account_with_extensions(
         account,
         mint,
         Some(authority),
         175,
         &[ExtensionType::TransferHookAccount, ExtensionType::PausableAccount],
+    )
+}
+
+fn valid_xstock_immutable_program_vault(
+    account: &Account,
+    mint: Pubkey,
+    authority: Pubkey,
+) -> bool {
+    // Current Meteora xStock vaults use the exact ordinary 179-byte extension profile even
+    // though their address and authority remain venue PDAs rather than user ATAs.
+    valid_xstock_token_account_with_extensions(
+        account,
+        mint,
+        Some(authority),
+        179,
+        &[
+            ExtensionType::ImmutableOwner,
+            ExtensionType::TransferHookAccount,
+            ExtensionType::PausableAccount,
+        ],
     )
 }
 
@@ -2950,6 +2969,11 @@ impl TransactionValidator {
                     )
                 } else {
                     !valid_xstock_program_vault(vault, mint, instruction.accounts[0].pubkey)
+                        && !valid_xstock_immutable_program_vault(
+                            vault,
+                            mint,
+                            instruction.accounts[0].pubkey,
+                        )
                 }
             {
                 return Err(invalid());
@@ -8194,6 +8218,16 @@ mod tests {
         data
     }
 
+    fn xstock_immutable_program_vault_data(mint: Pubkey, authority: Pubkey) -> Vec<u8> {
+        // Sanitized current CRCLx Meteora vault profile captured on mainnet on 2026-09-16.
+        let mut data = base64::engine::general_purpose::STANDARD
+            .decode("B+gUMR5zExL9UIO0lwh3ituxS62Sx+R5eV0ZK5sHHPwGb1kiUcxHdHglpZrRQi6kNXP1KNpd7ir3gSsxT5lF4+DZymqOIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAAbAAAADwABAAA=")
+            .unwrap();
+        data[..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(authority.as_ref());
+        data
+    }
+
     fn raydium_current_semantic_fixture(
     ) -> (TransactionValidator, Instruction, Vec<Option<Account>>, Pubkey, Pubkey, Pubkey, Pubkey)
     {
@@ -8439,6 +8473,37 @@ mod tests {
     }
 
     #[test]
+    fn meteora_xstock_program_vault_profiles_remain_exact() {
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let legacy_profile = Account {
+            lamports: 1,
+            data: xstock_program_vault_data(mint, authority),
+            owner: TOKEN_2022_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let current_profile = Account {
+            data: xstock_immutable_program_vault_data(mint, authority),
+            ..legacy_profile.clone()
+        };
+        assert!(valid_xstock_program_vault(&legacy_profile, mint, authority));
+        assert!(!valid_xstock_immutable_program_vault(&legacy_profile, mint, authority));
+        assert!(!valid_xstock_program_vault(&current_profile, mint, authority));
+        assert!(valid_xstock_immutable_program_vault(&current_profile, mint, authority));
+
+        let mut wrong_authority = current_profile.clone();
+        wrong_authority.data[32] ^= 1;
+        assert!(!valid_xstock_immutable_program_vault(&wrong_authority, mint, authority));
+        let mut wrong_extension = current_profile.clone();
+        wrong_extension.data[166] ^= 1;
+        assert!(!valid_xstock_immutable_program_vault(&wrong_extension, mint, authority));
+        let mut wrong_size = current_profile;
+        wrong_size.data.pop();
+        assert!(!valid_xstock_immutable_program_vault(&wrong_size, mint, authority));
+    }
+
+    #[test]
     #[serial]
     fn swap_raydium_current_shape_rejects_wrong_user_payer_and_instruction_data() {
         let (validator, instruction, _, wallet, _, _, token_program) =
@@ -8571,7 +8636,10 @@ mod tests {
             rpc_account(pair_data, if corrupt_pair_owner { SYSTEM_PROGRAM_ID } else { program }),
             filler.clone(),
             if xstock_input {
-                rpc_account(xstock_program_vault_data(mint_x, pair), TOKEN_2022_PROGRAM_ID)
+                rpc_account(
+                    xstock_immutable_program_vault_data(mint_x, pair),
+                    TOKEN_2022_PROGRAM_ID,
+                )
             } else {
                 rpc_account(legacy_token_data(mint_x, pair), token_program)
             },
