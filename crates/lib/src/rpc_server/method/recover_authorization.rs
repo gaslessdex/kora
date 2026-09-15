@@ -36,7 +36,8 @@ pub fn is_recover_transaction(transaction: &VersionedTransactionResolved) -> boo
         && outer
             .iter()
             .filter(|instruction| {
-                instruction.program_id == spl_token_interface::id()
+                (instruction.program_id == spl_token_interface::id()
+                    || instruction.program_id == spl_token_2022_interface::id())
                     && matches!(instruction.data.first(), Some(9))
             })
             .count()
@@ -107,24 +108,34 @@ fn validate_claims(
     } else {
         claims.input_mint == policy.input_mint
     };
-    let canonical_source = Pubkey::from_str(&claims.pilot_wallet)
+    let canonical_sources = Pubkey::from_str(&claims.pilot_wallet)
         .ok()
         .zip(Pubkey::from_str(&claims.input_mint).ok())
-        .map(|(wallet, mint)| spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &spl_token_interface::id()).to_string());
+        .map(|(wallet, mint)| {
+            [spl_token_interface::id(), spl_token_2022_interface::id()]
+                .map(|program| {
+                    spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                        &wallet, &mint, &program,
+                    )
+                    .to_string()
+                })
+        });
+    let source_is_canonical = canonical_sources
+        .as_ref()
+        .is_some_and(|sources| sources.contains(&claims.source_token_account));
     let wallet_is_admitted = policy.allowed_users.iter().any(|identity| {
         claims.pilot_wallet == identity.wallet
             && (dynamic_mints || claims.source_token_account == identity.source_account)
     }) || (policy.allow_public_authorized_wallets
         && policy.allowed_users.is_empty()
         && dynamic_mints
-        && canonical_source.as_deref() == Some(claims.source_token_account.as_str()));
+        && source_is_canonical);
     if claims.schema_version != "recover-authorization-v1"
         || claims.action != "CLEAN_RECOVER"
         || claims.network != policy.authorization_network
         || !wallet_is_admitted
         || !allowed_mint
-        || (dynamic_mints
-            && canonical_source.as_deref() != Some(claims.source_token_account.as_str()))
+        || (dynamic_mints && !source_is_canonical)
         || claims.output_mint != WRAPPED_SOL_MINT
         || claims.treasury != policy.settlement_wallet
         || claims.quote_id.is_empty()
@@ -239,16 +250,25 @@ mod tests {
         transaction: VersionedTransactionResolved,
     }
 
-    fn fixture(settlement_lamports: u64, blockhash: Hash) -> Fixture {
+    fn fixture_with_program(
+        settlement_lamports: u64,
+        blockhash: Hash,
+        token_2022_input: bool,
+    ) -> Fixture {
         let authority = Keypair::new();
         let payer = Keypair::new();
         let wallet = Pubkey::new_unique();
         let treasury = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
+        let input_token_program = if token_2022_input {
+            spl_token_2022_interface::id()
+        } else {
+            spl_token_interface::id()
+        };
         let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
             &wallet,
             &mint,
-            &spl_token_interface::id(),
+            &input_token_program,
         );
         let wrapped_mint = Pubkey::from_str(WRAPPED_SOL_MINT).unwrap();
         let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
@@ -262,9 +282,9 @@ mod tests {
         route_data[8..16].copy_from_slice(&500u64.to_le_bytes());
         route_data[16..24].copy_from_slice(&1_000u64.to_le_bytes());
         route_data[24..26].copy_from_slice(&50u16.to_le_bytes());
-        let close = |account| {
+        let close = |program, account| {
             spl_token_interface::instruction::close_account(
-                &spl_token_interface::id(),
+                &program,
                 &account,
                 &wallet,
                 &wallet,
@@ -278,8 +298,16 @@ mod tests {
                 accounts: vec![AccountMeta::new(source, false)],
                 data: route_data,
             },
-            close(source),
-            close(wrapped),
+            Instruction::new_with_bytes(
+                input_token_program,
+                &[9],
+                vec![
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(wallet, false),
+                    AccountMeta::new_readonly(wallet, true),
+                ],
+            ),
+            close(spl_token_interface::id(), wrapped),
             system_instruction::transfer(&wallet, &treasury, settlement_lamports),
         ];
         let message =
@@ -307,6 +335,10 @@ mod tests {
             ..RecoverPolicy::default()
         };
         Fixture { authority, payer, policy, transaction }
+    }
+
+    fn fixture(settlement_lamports: u64, blockhash: Hash) -> Fixture {
+        fixture_with_program(settlement_lamports, blockhash, false)
     }
 
     fn authorize(fixture: &Fixture, issued_at: u64) -> RecoverAuthorization {
@@ -455,6 +487,7 @@ mod tests {
                 "signed authorization mutation {field} must fail"
             );
         }
+
         let mut wrong_signature = valid.clone();
         wrong_signature.signature = Keypair::new().sign_message(b"wrong").to_string();
         assert!(validate_recover_authorization(
@@ -482,6 +515,23 @@ mod tests {
             Some(&valid)
         )
         .is_err());
+    }
+
+    #[test]
+    fn public_recover_authorizes_a_canonical_token_2022_source() {
+        let mut fixture = fixture_with_program(100, Hash::new_unique(), true);
+        let authorization = authorize(&fixture, now());
+        fixture.policy.allowed_input_mints = vec![fixture.policy.input_mint.clone()];
+        fixture.policy.allowed_users.clear();
+        fixture.policy.allow_public_authorized_wallets = true;
+
+        assert!(is_recover_transaction(&fixture.transaction));
+        assert!(validate_recover_authorization(
+            &fixture.transaction,
+            &fixture.policy,
+            Some(&authorization),
+        )
+        .is_ok());
     }
 
     #[test]

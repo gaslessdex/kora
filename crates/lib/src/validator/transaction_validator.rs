@@ -829,7 +829,8 @@ impl TransactionValidator {
         let recover_close_count = outer
             .iter()
             .filter(|instruction| {
-                instruction.program_id == spl_token_interface::id()
+                (instruction.program_id == spl_token_interface::id()
+                    || instruction.program_id == TOKEN_2022_PROGRAM_ID)
                     && matches!(instruction.data.first(), Some(9))
             })
             .count();
