@@ -116,8 +116,11 @@ fn claim_lighthouse_token_data_is_safe(
 }
 
 fn valid_raydium_tick_array_sequence(starts: &[i32], current_start: i32, interval: i32) -> bool {
-    if !(2..=3).contains(&starts.len()) || interval <= 0 {
+    if !(1..=3).contains(&starts.len()) || interval <= 0 {
         return false;
+    }
+    if starts.len() == 1 {
+        return starts[0] == current_start;
     }
     let Some(first_delta) = starts[1].checked_sub(starts[0]) else { return false };
     if first_delta == 0 || first_delta % interval != 0 {
@@ -168,10 +171,10 @@ fn raydium_tick_accounts_start(
 ) -> Option<usize> {
     let legacy = instruction.data.len() == 41
         && instruction.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
-        && (12..=13).contains(&instruction.accounts.len());
+        && (11..=13).contains(&instruction.accounts.len());
     let v2 = instruction.data.len() == 41
         && instruction.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
-        && (16..=17).contains(&instruction.accounts.len());
+        && (15..=17).contains(&instruction.accounts.len());
     if (!legacy && !v2)
         || !valid_raydium_exact_in_route(&instruction.data, &jupiter_instruction.data)
         || instruction.accounts[0].pubkey != wallet
@@ -1764,12 +1767,12 @@ impl TransactionValidator {
             tick_accounts_start = if dex.data.len() == 41
                 && dex.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
                 && input_token_program == legacy_token_program
-                && (12..=13).contains(&dex.accounts.len())
+                && (11..=13).contains(&dex.accounts.len())
             {
                 9
             } else if dex.data.len() == 41
                 && dex.data[..8] == RAYDIUM_SWAP_V2_DISCRIMINATOR
-                && (16..=17).contains(&dex.accounts.len())
+                && (15..=17).contains(&dex.accounts.len())
                 && dex.accounts[9].pubkey == token_2022_program
                 && dex.accounts[10].pubkey == memo_program
                 && dex.accounts[11].pubkey == mint
@@ -2181,7 +2184,7 @@ impl TransactionValidator {
         error_message: &str,
     ) -> Result<(), KoraError> {
         let invalid = || KoraError::InvalidTransaction(error_message.to_string());
-        if !(8..=9).contains(&accounts.len()) || accounts.iter().any(Option::is_none) {
+        if !(7..=9).contains(&accounts.len()) || accounts.iter().any(Option::is_none) {
             return Err(invalid());
         }
         let accounts = accounts.iter().map(|account| account.as_ref().unwrap()).collect::<Vec<_>>();
@@ -3894,6 +3897,8 @@ mod tests {
         assert!(valid_raydium_tick_array_sequence(&[-600, -1200, -1800], -600, 600));
         assert!(valid_raydium_tick_array_sequence(&[-600, 600], -600, 600));
         assert!(valid_raydium_tick_array_sequence(&[0, 600], -600, 600));
+        assert!(valid_raydium_tick_array_sequence(&[-600], -600, 600));
+        assert!(!valid_raydium_tick_array_sequence(&[0], -600, 600));
         assert!(!valid_raydium_tick_array_sequence(&[0, -600], -600, 600));
         assert!(!valid_raydium_tick_array_sequence(&[-600, 1], -600, 600));
         assert!(!valid_raydium_tick_array_sequence(&[-600, 0, -1200], -600, 600));
@@ -4660,7 +4665,7 @@ mod tests {
         });
         let RecoverFixtureIdentity { payer, wallet, treasury, mint, pool, lookup_table } = identity;
         let legacy_token_program = spl_token_interface::id();
-        let token_2022_input = semantic_mutation == Some(13);
+        let token_2022_input = matches!(semantic_mutation, Some(13 | 14));
         let input_token_program =
             if token_2022_input { TOKEN_2022_PROGRAM_ID } else { legacy_token_program };
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
@@ -4719,7 +4724,10 @@ mod tests {
         if semantic_mutation == Some(9) {
             raydium_accounts.remove(11);
         }
-        if matches!(semantic_mutation, Some(10 | 13)) {
+        if semantic_mutation == Some(14) {
+            raydium_accounts.truncate(11);
+        }
+        if matches!(semantic_mutation, Some(10 | 13 | 14)) {
             raydium_accounts.splice(
                 9..9,
                 [
@@ -4839,7 +4847,7 @@ mod tests {
                 stack_height: Some(2),
             });
         }
-        let mut raydium_data = if matches!(semantic_mutation, Some(10 | 13)) {
+        let mut raydium_data = if matches!(semantic_mutation, Some(10 | 13 | 14)) {
             RAYDIUM_SWAP_V2_DISCRIMINATOR.to_vec()
         } else {
             RAYDIUM_SWAP_DISCRIMINATOR.to_vec()
@@ -5069,6 +5077,9 @@ mod tests {
         if semantic_mutation == Some(9) {
             account_values.remove(10);
         }
+        if semantic_mutation == Some(14) {
+            account_values.truncate(10);
+        }
         let mut mocks = HashMap::new();
         mocks.insert(
             RpcRequest::GetMultipleAccounts,
@@ -5258,6 +5269,22 @@ mod tests {
                 None,
             );
         assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_single_exact_current_tick_token_2022_route() {
+        let (validator, transaction, rpc, payer_creations) =
+            recover_fixture_with_output_and_semantic_mutation(
+                false,
+                None,
+                None,
+                1_000_000_000,
+                Some(14),
+                None,
+            );
+        let accepted = validator.validate_recover(&transaction, &rpc, payer_creations).await;
+        assert!(accepted.is_ok(), "{accepted:?}");
     }
 
     #[tokio::test]
