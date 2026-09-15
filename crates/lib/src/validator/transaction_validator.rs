@@ -1508,7 +1508,8 @@ impl TransactionValidator {
         let mint = parse(mint_value)?;
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")
             .map_err(|_| KoraError::ConfigError)?;
-        let token_program = spl_token_interface::id();
+        let legacy_token_program = spl_token_interface::id();
+        let token_2022_program = spl_token_2022_interface::id();
         let ata_program = spl_associated_token_account_interface::program::id();
         let compute_program = solana_compute_budget_interface::id();
         let jupiter_program =
@@ -1538,17 +1539,36 @@ impl TransactionValidator {
                 "Recover Value user is not allowed".to_string(),
             ));
         }
-        let source = if dynamic_mints {
-            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program)
+        let configured_source = if dynamic_mints {
+            parse(
+                &transaction
+                    .recover_authorization_claims
+                    .as_ref()
+                    .ok_or(KoraError::ConfigError)?
+                    .source_token_account,
+            )?
         } else {
             parse(&identity.ok_or(KoraError::ConfigError)?.source_account)?
         };
+        let input_token_program = [legacy_token_program, token_2022_program]
+            .into_iter()
+            .find(|program| {
+                spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(
+                    &wallet, &mint, program,
+                ) == configured_source
+            })
+            .ok_or_else(|| {
+                KoraError::InvalidTransaction(
+                    "Recover Value source is not a canonical supported token account".to_string(),
+                )
+            })?;
+        let source = configured_source;
         let wrapped = if policy.allow_public_authorized_wallets {
-            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program)
+            spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &legacy_token_program)
         } else {
             parse(&identity.ok_or(KoraError::ConfigError)?.wrapped_sol_account)?
         };
-        if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || source != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program) || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program) {
+        if wallet == self.fee_payer_pubkey || wallet == treasury || treasury == self.fee_payer_pubkey || wrapped != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &legacy_token_program) {
             return Err(KoraError::InvalidTransaction("Recover Value identities or canonical accounts are invalid".to_string()));
         }
         if transaction.transaction.message.header().num_required_signatures != 2
@@ -1614,8 +1634,8 @@ impl TransactionValidator {
         let jupiter_index = 2 + usize::from(setup);
         if outer.len() != jupiter_index + 4
             || outer[jupiter_index].program_id != jupiter_program
-            || outer[jupiter_index + 1].program_id != token_program
-            || outer[jupiter_index + 2].program_id != token_program
+            || outer[jupiter_index + 1].program_id != input_token_program
+            || outer[jupiter_index + 2].program_id != legacy_token_program
             || outer[jupiter_index + 3].program_id != SYSTEM_PROGRAM_ID
         {
             return Err(KoraError::InvalidTransaction(
@@ -1738,11 +1758,11 @@ impl TransactionValidator {
                     .accounts
                     .get(2)
                     .is_some_and(|account| approved_pools.contains(&account.pubkey));
-            let token_2022_program = spl_token_2022_interface::id();
             let memo_program =
                 Pubkey::from_str(MEMO_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
             tick_accounts_start = if dex.data.len() == 41
                 && dex.data[..8] == RAYDIUM_SWAP_DISCRIMINATOR
+                && input_token_program == legacy_token_program
                 && (12..=13).contains(&dex.accounts.len())
             {
                 9
@@ -1765,7 +1785,7 @@ impl TransactionValidator {
                 || dex.accounts[2].pubkey == self.fee_payer_pubkey
                 || dex.accounts[3].pubkey != source
                 || dex.accounts[4].pubkey != wrapped
-                || dex.accounts[8].pubkey != token_program
+                || dex.accounts[8].pubkey != legacy_token_program
                 || !pool_is_approved
             {
                 return Err(KoraError::InvalidTransaction(
@@ -1816,7 +1836,8 @@ impl TransactionValidator {
             wrapped,
             mint,
             native_mint,
-            token_program,
+            input_token_program,
+            legacy_token_program,
             SYSTEM_PROGRAM_ID,
             jupiter_program,
             dex.program_id,
@@ -1871,9 +1892,21 @@ impl TransactionValidator {
                 dex,
                 &accounts[3..],
                 raydium_program,
-                token_program,
+                input_token_program,
+                legacy_token_program,
                 mint,
                 native_mint,
+                supported_mint_decimals(
+                    accounts[1].as_ref().ok_or_else(|| {
+                        KoraError::InvalidTransaction("Recover Value mint is missing".to_string())
+                    })?,
+                    input_token_program,
+                )
+                .ok_or_else(|| {
+                    KoraError::InvalidTransaction(
+                        "Recover Value mint identity is invalid".to_string(),
+                    )
+                })?,
                 tick_accounts_start,
             )?,
             "METEORA_DLMM" => self.validate_meteora_dlmm(dex, rpc_client, wallet).await?,
@@ -1884,15 +1917,8 @@ impl TransactionValidator {
             KoraError::InvalidTransaction("Recover Value source is missing".to_string())
         })?;
         let source_data = &source_account.data;
-        if source_account.owner != token_program
-            || source_data.len() != 165
-            || source_data[0..32] != mint.to_bytes()
-            || source_data[32..64] != wallet.to_bytes()
-            || source_data[72..76] != [0, 0, 0, 0]
-            || source_data[108] != 1
-            || source_data[109..113] != [0, 0, 0, 0]
-            || source_data[121..129] != [0, 0, 0, 0, 0, 0, 0, 0]
-            || source_data[129..133] != [0, 0, 0, 0]
+        if supported_token_account_identity(source_account, wallet)
+            != Some((mint, input_token_program))
         {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value source state is ineligible".to_string(),
@@ -1908,12 +1934,8 @@ impl TransactionValidator {
         let mint_account = accounts[1].as_ref().ok_or_else(|| {
             KoraError::InvalidTransaction("Recover Value mint is missing".to_string())
         })?;
-        if mint_account.owner != token_program
-            || mint_account.data.len() != 82
-            || (!dynamic_mints && mint_account.data[44] != policy.decimals)
-            || (dynamic_mints && (mint_account.data[44] == 0 || mint_account.data[44] > 9))
-            || mint_account.data[45] != 1
-        {
+        let mint_decimals = supported_mint_decimals(mint_account, input_token_program);
+        if mint_decimals.is_none() || (!dynamic_mints && mint_decimals != Some(policy.decimals)) {
             return Err(KoraError::InvalidTransaction(
                 "Recover Value mint identity is invalid".to_string(),
             ));
@@ -1922,7 +1944,7 @@ impl TransactionValidator {
             let data = &wrapped_account.data;
             if setup
                 || payer_creations != 0
-                || wrapped_account.owner != token_program
+                || wrapped_account.owner != legacy_token_program
                 || data.len() != 165
                 || data[0..32] != native_mint.to_bytes()
                 || data[32..64] != wallet.to_bytes()
@@ -2090,9 +2112,11 @@ impl TransactionValidator {
         instruction: &Instruction,
         accounts: &[Option<Account>],
         raydium_program: Pubkey,
-        token_program: Pubkey,
+        input_token_program: Pubkey,
+        output_token_program: Pubkey,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        input_decimals: u8,
         tick_accounts_start: usize,
     ) -> Result<(), KoraError> {
         if instruction.program_id != raydium_program {
@@ -2104,11 +2128,11 @@ impl TransactionValidator {
             instruction,
             accounts,
             raydium_program,
-            token_program,
-            token_program,
+            input_token_program,
+            output_token_program,
             input_mint,
             output_mint,
-            self.fee_payer_policy.system.recover.decimals,
+            input_decimals,
             9,
             tick_accounts_start,
             "Recover Value Raydium CLMM account relationships are invalid",
@@ -4609,7 +4633,10 @@ mod tests {
             lookup_table: Pubkey::new_unique(),
         });
         let RecoverFixtureIdentity { payer, wallet, treasury, mint, pool, lookup_table } = identity;
-        let token_program = spl_token_interface::id();
+        let legacy_token_program = spl_token_interface::id();
+        let token_2022_input = semantic_mutation == Some(13);
+        let input_token_program =
+            if token_2022_input { TOKEN_2022_PROGRAM_ID } else { legacy_token_program };
         let native_mint = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
         let jupiter_program = Pubkey::from_str(JUPITER_V6_PROGRAM_ID).unwrap();
         let raydium_program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
@@ -4634,14 +4661,14 @@ mod tests {
             &raydium_program,
         )
         .0;
-        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &token_program);
-        let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &token_program);
+        let source = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &mint, &input_token_program);
+        let wrapped = spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &native_mint, &legacy_token_program);
         let input_amount = 1_779_926_u64;
         let minimum_output = quoted_output * 9_950 / 10_000;
         let canonical_network_fee = 42_500_u64;
         let network_fee =
             if semantic_mutation == Some(12) { 50_000 } else { canonical_network_fee };
-        let source_rent = 2_039_280_u64;
+        let source_rent = if token_2022_input { 1_944_231_u64 } else { 2_039_280_u64 };
         let setup_rent = 2_039_280_u64;
         let settlement = minimum_output * 30 / 10_000
             + source_rent * 300 / 10_000
@@ -4657,7 +4684,7 @@ mod tests {
             AccountMeta::new(input_vault, false),
             AccountMeta::new(output_vault, false),
             AccountMeta::new(observation, false),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(legacy_token_program, false),
             AccountMeta::new(tick_arrays[0], false),
             AccountMeta::new(bitmap, false),
             AccountMeta::new(tick_arrays[1], false),
@@ -4666,7 +4693,7 @@ mod tests {
         if semantic_mutation == Some(9) {
             raydium_accounts.remove(11);
         }
-        if semantic_mutation == Some(10) {
+        if matches!(semantic_mutation, Some(10 | 13)) {
             raydium_accounts.splice(
                 9..9,
                 [
@@ -4688,7 +4715,7 @@ mod tests {
             AccountMeta::new(pool, false),
             AccountMeta::new_readonly(raydium_program, false),
             AccountMeta::new(wallet, true),
-            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(input_token_program, false),
         ];
         for account in &raydium_accounts {
             if !route_accounts.iter().any(|existing| existing.pubkey == account.pubkey) {
@@ -4712,23 +4739,35 @@ mod tests {
                     &payer,
                     &wallet,
                     &native_mint,
-                    &token_program,
+                    &legacy_token_program,
                 ),
             );
         }
         let jupiter_index = instructions.len();
-        instructions.extend([
-            route,
-            spl_token_interface::instruction::close_account(
-                &token_program,
+        let close_source = if token_2022_input {
+            spl_token_2022_interface::instruction::close_account(
+                &input_token_program,
                 &source,
                 &wallet,
                 &wallet,
                 &[],
             )
-            .unwrap(),
+            .unwrap()
+        } else {
             spl_token_interface::instruction::close_account(
-                &token_program,
+                &input_token_program,
+                &source,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap()
+        };
+        instructions.extend([
+            route,
+            close_source,
+            spl_token_interface::instruction::close_account(
+                &legacy_token_program,
                 &wrapped,
                 &wallet,
                 &wallet,
@@ -4766,7 +4805,7 @@ mod tests {
         )
         .unwrap();
         if !existing_wrapped {
-            let create = create_account(&payer, &wrapped, setup_rent, 165, &token_program);
+            let create = create_account(&payer, &wrapped, setup_rent, 165, &legacy_token_program);
             transaction.all_instructions.push(create.clone());
             transaction.inner_instruction_contexts.push(InnerInstructionContext {
                 instruction: create,
@@ -4774,7 +4813,7 @@ mod tests {
                 stack_height: Some(2),
             });
         }
-        let mut raydium_data = if semantic_mutation == Some(10) {
+        let mut raydium_data = if matches!(semantic_mutation, Some(10 | 13)) {
             RAYDIUM_SWAP_V2_DISCRIMINATOR.to_vec()
         } else {
             RAYDIUM_SWAP_DISCRIMINATOR.to_vec()
@@ -4803,7 +4842,7 @@ mod tests {
             settlement_wallet: treasury.to_string(),
             input_mint: mint.to_string(),
             allowed_input_mints: vec![],
-            decimals: 6,
+            decimals: if token_2022_input { 8 } else { 6 },
             swap_fee_bps: 30,
             rent_fee_bps: 300,
             slippage_bps: 50,
@@ -4829,7 +4868,8 @@ mod tests {
             .with_price_source(PriceSource::Mock)
             .with_allowed_programs(vec![
                 SYSTEM_PROGRAM_ID.to_string(),
-                token_program.to_string(),
+                legacy_token_program.to_string(),
+                input_token_program.to_string(),
                 jupiter_program.to_string(),
                 raydium_program.to_string(),
                 spl_associated_token_account_interface::program::id().to_string(),
@@ -4840,12 +4880,18 @@ mod tests {
             .build();
         update_config(config).unwrap();
 
-        let mut source_data = vec![0_u8; 165];
+        let mut source_data = if token_2022_input {
+            base64::engine::general_purpose::STANDARD
+                .decode("B+gUMR5zExL9UIO0lwh3ituxS62Sx+R5eV0ZK5sHHPwGb1kiUcxHdHglpZrRQi6kNXP1KNpd7ir3gSsxT5lF4+DZymqOIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgcAAAAbAAAADwABAAA=")
+                .unwrap()
+        } else {
+            vec![0_u8; 165]
+        };
         source_data[0..32].copy_from_slice(mint.as_ref());
         source_data[32..64].copy_from_slice(wallet.as_ref());
         source_data[64..72].copy_from_slice(&input_amount.to_le_bytes());
         source_data[108] = 1;
-        let mut source_owner = token_program;
+        let mut source_owner = input_token_program;
         match source_mutation {
             Some(0) => source_data[64..72].copy_from_slice(&(input_amount - 1).to_le_bytes()),
             Some(1) => source_data[0..32].copy_from_slice(Pubkey::new_unique().as_ref()),
@@ -4854,18 +4900,25 @@ mod tests {
             Some(4) => source_data[108] = 2,
             Some(5) => source_data[109..113].copy_from_slice(&1_u32.to_le_bytes()),
             Some(6) => source_data[129..133].copy_from_slice(&1_u32.to_le_bytes()),
-            Some(7) => source_owner = spl_token_2022_interface::id(),
+            Some(7) => {
+                source_owner =
+                    if token_2022_input { legacy_token_program } else { TOKEN_2022_PROGRAM_ID }
+            }
             _ => {}
         }
         let source_json = Some(
             json!({ "data": [base64::engine::general_purpose::STANDARD.encode(source_data), "base64"], "executable": false, "lamports": source_rent, "owner": source_owner.to_string(), "rentEpoch": 0 }),
         );
-        let mut mint_data = vec![0_u8; 82];
-        mint_data[44] = if source_mutation == Some(8) { 5 } else { 6 };
-        mint_data[45] = 1;
-        let mint_json = Some(
-            json!({ "data": [base64::engine::general_purpose::STANDARD.encode(mint_data), "base64"], "executable": false, "lamports": 1_461_600, "owner": token_program.to_string(), "rentEpoch": 0 }),
-        );
+        let mint_json = if token_2022_input {
+            Some(xstock_mint_json())
+        } else {
+            let mut mint_data = vec![0_u8; 82];
+            mint_data[44] = if source_mutation == Some(8) { 5 } else { 6 };
+            mint_data[45] = 1;
+            Some(
+                json!({ "data": [base64::engine::general_purpose::STANDARD.encode(mint_data), "base64"], "executable": false, "lamports": 1_461_600, "owner": legacy_token_program.to_string(), "rentEpoch": 0 }),
+            )
+        };
         let wrapped_json = if existing_wrapped {
             let mut data = vec![0_u8; 165];
             data[0..32].copy_from_slice(native_mint.as_ref());
@@ -4873,7 +4926,7 @@ mod tests {
             data[108] = 1;
             data[109..113].copy_from_slice(&1_u32.to_le_bytes());
             data[113..121].copy_from_slice(&setup_rent.to_le_bytes());
-            let mut owner = token_program;
+            let mut owner = legacy_token_program;
             match wrapped_mutation {
                 Some(0) => data[64..72].copy_from_slice(&1_u64.to_le_bytes()),
                 Some(1) => data[0..32].copy_from_slice(Pubkey::new_unique().as_ref()),
@@ -4912,7 +4965,7 @@ mod tests {
         pool_data[169..201].copy_from_slice(input_vault.as_ref());
         pool_data[201..233].copy_from_slice(observation.as_ref());
         pool_data[233] = 9;
-        pool_data[234] = 6;
+        pool_data[234] = if token_2022_input { 8 } else { 6 };
         pool_data[235..237].copy_from_slice(&1_u16.to_le_bytes());
         pool_data[269..273].copy_from_slice(&1_i32.to_le_bytes());
         if semantic_mutation == Some(11) {
@@ -4930,12 +4983,15 @@ mod tests {
         if semantic_mutation == Some(8) {
             pool_data[389] |= 1 << 4;
         }
-        let vault_json = |vault_mint: Pubkey, authority: Pubkey| {
-            let mut data = vec![0_u8; 165];
+        let vault_json = |vault_mint: Pubkey, authority: Pubkey, program: Pubkey| {
+            let mut data = vec![0_u8; if program == TOKEN_2022_PROGRAM_ID { 175 } else { 165 }];
             data[..32].copy_from_slice(vault_mint.as_ref());
             data[32..64].copy_from_slice(authority.as_ref());
             data[108] = 1;
-            account_json(data, token_program)
+            if program == TOKEN_2022_PROGRAM_ID {
+                data[165..].copy_from_slice(&[2, 27, 0, 0, 0, 15, 0, 1, 0, 0]);
+            }
+            account_json(data, program)
         };
         let mut observation_data = vec![0_u8; 4483];
         observation_data[..8].copy_from_slice(&RAYDIUM_OBSERVATION_DISCRIMINATOR);
@@ -4959,26 +5015,27 @@ mod tests {
             wrapped_json,
             account_json(
                 amm_data,
-                if semantic_mutation == Some(0) { token_program } else { raydium_program },
+                if semantic_mutation == Some(0) { legacy_token_program } else { raydium_program },
             ),
             account_json(pool_data, raydium_program),
             vault_json(
                 mint,
                 if semantic_mutation == Some(5) { Pubkey::new_unique() } else { pool },
+                input_token_program,
             ),
-            vault_json(native_mint, pool),
+            vault_json(native_mint, pool, legacy_token_program),
             account_json(observation_data, raydium_program),
             if semantic_mutation == Some(3) {
                 let mut data = vec![0_u8; 10240];
                 data[..8].copy_from_slice(&RAYDIUM_TICK_ARRAY_DISCRIMINATOR);
                 data[8..40].copy_from_slice(pool.as_ref());
-                account_json(data, token_program)
+                account_json(data, legacy_token_program)
             } else {
                 tick_json(0)
             },
             account_json(
                 bitmap_data,
-                if semantic_mutation == Some(4) { token_program } else { raydium_program },
+                if semantic_mutation == Some(4) { legacy_token_program } else { raydium_program },
             ),
             tick_json(60),
             tick_json(120),
@@ -5175,6 +5232,70 @@ mod tests {
                 None,
             );
         assert!(validator.validate_recover(&transaction, &rpc, payer_creations).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_accepts_only_exact_authorized_xstock_token_2022_input() {
+        let (mut validator, mut transaction, rpc, payer_creations) =
+            recover_fixture_with_output_and_semantic_mutation(
+                false,
+                None,
+                None,
+                1_000_000_000,
+                Some(13),
+                None,
+            );
+        let minimum = 995_000_000_u64;
+        let source_rent = 1_944_231_u64;
+        let setup_rent = 2_039_280_u64;
+        let network = 42_500_u64;
+        let swap_fee = minimum * 30 / 10_000;
+        let rent_fee = source_rent * 300 / 10_000;
+        let settlement = swap_fee + rent_fee + network + setup_rent;
+        let policy = &validator.fee_payer_policy.system.recover;
+        transaction.recover_authorization_claims = Some(RecoverAuthorizationClaims {
+            schema_version: "recover-authorization-v1".to_string(),
+            action: "CLEAN_RECOVER".to_string(),
+            network: "mainnet-beta".to_string(),
+            pilot_wallet: policy.allowed_users[0].wallet.clone(),
+            source_token_account: policy.allowed_users[0].source_account.clone(),
+            input_mint: policy.input_mint.clone(),
+            input_amount_raw: "1779926".to_string(),
+            output_mint: "So11111111111111111111111111111111111111112".to_string(),
+            expected_output_lamports: "1000000000".to_string(),
+            minimum_output_lamports: minimum.to_string(),
+            minimum_user_payout_lamports: (minimum + source_rent + setup_rent - settlement)
+                .to_string(),
+            swap_fee_lamports: swap_fee.to_string(),
+            rent_fee_lamports: rent_fee.to_string(),
+            network_reimbursement_lamports: network.to_string(),
+            setup_rent_reimbursement_lamports: setup_rent.to_string(),
+            sponsored_cost_lamports: (network + setup_rent).to_string(),
+            treasury: policy.settlement_wallet.clone(),
+            message_hash: "verified-before-structural-policy".to_string(),
+            quote_id: "quote".to_string(),
+            intent_id: "intent".to_string(),
+            nonce: "nonce".to_string(),
+            issued_at_unix_seconds: 1,
+            expires_at_unix_seconds: 2,
+        });
+        let policy = &mut validator.fee_payer_policy.system.recover;
+        policy.allowed_input_mints = vec![policy.input_mint.clone()];
+        policy.allowed_users.clear();
+        policy.allow_public_authorized_wallets = true;
+
+        let accepted = validator.validate_recover(&transaction, &rpc, payer_creations).await;
+        assert!(accepted.is_ok(), "{accepted:?}");
+
+        let mut legacy_close = transaction.clone();
+        legacy_close.all_instructions[4].program_id = spl_token_interface::id();
+        assert!(validator.validate_recover(&legacy_close, &rpc, payer_creations).await.is_err());
+
+        let mut wrong_source = transaction.clone();
+        wrong_source.recover_authorization_claims.as_mut().unwrap().source_token_account =
+            Pubkey::new_unique().to_string();
+        assert!(validator.validate_recover(&wrong_source, &rpc, payer_creations).await.is_err());
     }
 
     #[tokio::test]
