@@ -2858,8 +2858,10 @@ impl TransactionValidator {
         rpc_client: &RpcClient,
         wallet: Pubkey,
     ) -> Result<(), KoraError> {
-        let invalid = || {
-            KoraError::InvalidTransaction("Meteora DLMM route semantics are invalid".to_string())
+        let invalid = |stage: &str| {
+            KoraError::InvalidTransaction(format!(
+                "Meteora DLMM route semantics are invalid ({stage})"
+            ))
         };
         let program =
             Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
@@ -2870,14 +2872,17 @@ impl TransactionValidator {
             || instruction.data.len() < 24
             || instruction.data.len() > 256
             || ![METEORA_SWAP_DISCRIMINATOR, METEORA_SWAP2_DISCRIMINATOR]
-                .contains(&instruction.data[..8].try_into().map_err(|_| invalid())?)
-            || u64::from_le_bytes(instruction.data[8..16].try_into().map_err(|_| invalid())?) == 0
+                .contains(&instruction.data[..8].try_into().map_err(|_| invalid("envelope"))?)
+            || u64::from_le_bytes(
+                instruction.data[8..16].try_into().map_err(|_| invalid("envelope"))?,
+            ) == 0
             || (instruction.data[..8] == METEORA_SWAP2_DISCRIMINATOR
-                && u64::from_le_bytes(instruction.data[16..24].try_into().map_err(|_| invalid())?)
-                    == 0)
+                && u64::from_le_bytes(
+                    instruction.data[16..24].try_into().map_err(|_| invalid("envelope"))?,
+                ) == 0)
             || !(17..=20).contains(&instruction.accounts.len())
         {
-            return Err(invalid());
+            return Err(invalid("envelope"));
         }
         let has_memo = instruction.accounts[13].pubkey == memo;
         let event_index = if has_memo { 14 } else { 13 };
@@ -2896,14 +2901,16 @@ impl TransactionValidator {
                 != Pubkey::find_program_address(&[b"__event_authority"], &program).0
             || instruction.accounts[program_index].pubkey != program
         {
-            return Err(invalid());
+            return Err(invalid("roles"));
         }
         let addresses = instruction.accounts.iter().map(|meta| meta.pubkey).collect::<Vec<_>>();
         let states = rpc_client.get_multiple_accounts(&addresses).await?;
-        let state = |index: usize| states.get(index).and_then(Option::as_ref).ok_or_else(invalid);
-        let pair = state(0)?;
-        let mint_x = state(6)?;
-        let mint_y = state(7)?;
+        let state = |index: usize, stage: &str| {
+            states.get(index).and_then(Option::as_ref).ok_or_else(|| invalid(stage))
+        };
+        let pair = state(0, "pair")?;
+        let mint_x = state(6, "pair")?;
+        let mint_y = state(7, "pair")?;
         let token_program_x = instruction.accounts[11].pubkey;
         let token_program_y = instruction.accounts[12].pubkey;
         if pair.owner != program
@@ -2919,7 +2926,7 @@ impl TransactionValidator {
             || pair.data[184..216] != instruction.accounts[3].pubkey.to_bytes()
             || pair.data[552..584] != instruction.accounts[8].pubkey.to_bytes()
         {
-            return Err(invalid());
+            return Err(invalid("pair"));
         }
         let mut ordered_mints = [instruction.accounts[6].pubkey, instruction.accounts[7].pubkey];
         ordered_mints.sort();
@@ -2947,13 +2954,13 @@ impl TransactionValidator {
             .0,
         ];
         if !pair_candidates.contains(&instruction.accounts[0].pubkey) {
-            return Err(invalid());
+            return Err(invalid("pair-pda"));
         }
         for (index, mint, mint_program) in [
             (2, instruction.accounts[6].pubkey, token_program_x),
             (3, instruction.accounts[7].pubkey, token_program_y),
         ] {
-            let vault = state(index)?;
+            let vault = state(index, "vault")?;
             if instruction.accounts[index].pubkey
                 != Pubkey::find_program_address(
                     &[instruction.accounts[0].pubkey.as_ref(), mint.as_ref()],
@@ -2976,18 +2983,18 @@ impl TransactionValidator {
                         )
                 }
             {
-                return Err(invalid());
+                return Err(invalid("vault"));
             }
         }
-        let user_in = state(4)?;
+        let user_in = state(4, "user")?;
         let (input_mint, input_token_program) =
-            supported_token_account_identity(user_in, wallet).ok_or_else(invalid)?;
+            supported_token_account_identity(user_in, wallet).ok_or_else(|| invalid("user"))?;
         let (output_mint, output_token_program) = if input_mint == instruction.accounts[6].pubkey {
             (instruction.accounts[7].pubkey, token_program_y)
         } else if input_mint == instruction.accounts[7].pubkey {
             (instruction.accounts[6].pubkey, token_program_x)
         } else {
-            return Err(invalid());
+            return Err(invalid("user"));
         };
         let user_out = states.get(5).and_then(Option::as_ref);
         if input_mint == output_mint
@@ -2998,9 +3005,9 @@ impl TransactionValidator {
             || instruction.accounts[5].pubkey != spl_associated_token_account_interface::address::get_associated_token_address_with_program_id(&wallet, &output_mint, &output_token_program)
             || user_out.is_some_and(|account| supported_token_account_identity(account, wallet) != Some((output_mint, output_token_program)))
         {
-            return Err(invalid());
+            return Err(invalid("user"));
         }
-        let oracle = state(8)?;
+        let oracle = state(8, "oracle")?;
         if instruction.accounts[8].pubkey
             != Pubkey::find_program_address(
                 &[b"oracle", instruction.accounts[0].pubkey.as_ref()],
@@ -3011,10 +3018,10 @@ impl TransactionValidator {
             || oracle.data.len() != 3232
             || oracle.data[..8] != METEORA_ORACLE_DISCRIMINATOR
         {
-            return Err(invalid());
+            return Err(invalid("oracle"));
         }
         if instruction.accounts[1].pubkey != program {
-            let bitmap = state(1)?;
+            let bitmap = state(1, "bitmap")?;
             if instruction.accounts[1].pubkey
                 != Pubkey::find_program_address(
                     &[b"bitmap", instruction.accounts[0].pubkey.as_ref()],
@@ -3024,20 +3031,21 @@ impl TransactionValidator {
                 || bitmap.owner != program
                 || bitmap.data.get(..8) != Some(METEORA_BITMAP_DISCRIMINATOR.as_slice())
             {
-                return Err(invalid());
+                return Err(invalid("bitmap"));
             }
         }
         let mut bin_indexes = Vec::new();
         for index in bins_start..instruction.accounts.len() {
-            let bin = state(index)?;
+            let bin = state(index, "bin-array")?;
             if bin.owner != program
                 || bin.data.len() != 10136
                 || bin.data[..8] != METEORA_BIN_ARRAY_DISCRIMINATOR
                 || bin.data[24..56] != instruction.accounts[0].pubkey.to_bytes()
             {
-                return Err(invalid());
+                return Err(invalid("bin-array"));
             }
-            let bin_index = i64::from_le_bytes(bin.data[8..16].try_into().map_err(|_| invalid())?);
+            let bin_index =
+                i64::from_le_bytes(bin.data[8..16].try_into().map_err(|_| invalid("bin-array"))?);
             if instruction.accounts[index].pubkey
                 != Pubkey::find_program_address(
                     &[
@@ -3049,14 +3057,14 @@ impl TransactionValidator {
                 )
                 .0
             {
-                return Err(invalid());
+                return Err(invalid("bin-array-pda"));
             }
             bin_indexes.push(bin_index);
         }
         if !(2..=4).contains(&bin_indexes.len())
             || bin_indexes.windows(2).any(|pair| pair[0] == pair[1])
         {
-            return Err(invalid());
+            return Err(invalid("bin-array-count"));
         }
         Ok(())
     }
