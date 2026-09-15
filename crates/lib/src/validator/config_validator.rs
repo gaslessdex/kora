@@ -29,6 +29,15 @@ use spl_token_interface::{
     ID as SPL_TOKEN_PROGRAM_ID,
 };
 
+const MAX_RECOVER_INPUT_MINTS: usize = 128;
+
+fn recover_input_mints_are_valid(mints: &[String]) -> bool {
+    !mints.is_empty()
+        && mints.len() <= MAX_RECOVER_INPUT_MINTS
+        && mints.iter().collect::<std::collections::HashSet<_>>().len() == mints.len()
+        && !mints.iter().any(|value| Pubkey::from_str(value).is_err())
+}
+
 pub struct ConfigValidator {}
 
 impl ConfigValidator {
@@ -559,15 +568,11 @@ impl ConfigValidator {
             } else {
                 vec![recover.input_mint.clone()]
             };
-            if effective_mints.is_empty()
-                || effective_mints.len() > 100
-                || effective_mints.iter().collect::<std::collections::HashSet<_>>().len()
-                    != effective_mints.len()
-                || effective_mints.iter().any(|value| Pubkey::from_str(value).is_err())
-            {
+            if !recover_input_mints_are_valid(&effective_mints) {
                 errors.push(
-                    "Recover allowed_input_mints must be a unique list of at most 100 valid mints"
-                        .to_string(),
+                    format!(
+                        "Recover allowed_input_mints must be a unique list of at most {MAX_RECOVER_INPUT_MINTS} valid mints"
+                    ),
                 );
             }
             let token_program = spl_token_interface::id();
@@ -1240,6 +1245,17 @@ mod tests {
             .await
             .iter()
             .any(|error| error.contains("allowed_input_mints")));
+    }
+
+    #[test]
+    fn recover_input_mint_registry_accepts_the_108_asset_rollout_and_rejects_overflow() {
+        let rollout = (0..108).map(|_| Pubkey::new_unique().to_string()).collect::<Vec<_>>();
+        assert!(recover_input_mints_are_valid(&rollout));
+
+        let overflow = (0..=MAX_RECOVER_INPUT_MINTS)
+            .map(|_| Pubkey::new_unique().to_string())
+            .collect::<Vec<_>>();
+        assert!(!recover_input_mints_are_valid(&overflow));
     }
 
     #[tokio::test]
