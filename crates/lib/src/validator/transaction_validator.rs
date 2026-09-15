@@ -37,6 +37,7 @@ const JUPITER_V6_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const ANCHOR_EVENT_CPI_DISCRIMINATOR: [u8; 8] = [228, 69, 165, 46, 81, 203, 154, 29];
 const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_LIMIT: u32 = 50_000;
 const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 100_000;
 const CLAIM_LIGHTHOUSE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000;
@@ -165,6 +166,53 @@ fn valid_jupiter_recover_route_shape(data: &[u8], family: &str) -> bool {
     matches!(data.len(), 39 | 43)
         && data.get(..8) == Some(JUPITER_ROUTE_DISCRIMINATOR.as_slice())
         && (data.len() == 39 || family == "METEORA_DLMM")
+}
+
+fn is_inert_meteora_event_cpi(
+    context: &crate::transaction::InnerInstructionContext,
+    direct_dex_program: Pubkey,
+    jupiter_index: usize,
+) -> bool {
+    let event_authority =
+        Pubkey::find_program_address(&[b"__event_authority"], &direct_dex_program).0;
+    Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).ok() == Some(direct_dex_program)
+        && context.outer_instruction_index as usize == jupiter_index
+        && context.stack_height == Some(3)
+        && context.instruction.program_id == direct_dex_program
+        && (9..=256).contains(&context.instruction.data.len())
+        && context.instruction.data[..8] == ANCHOR_EVENT_CPI_DISCRIMINATOR
+        && context.instruction.accounts.len() == 1
+        && context.instruction.accounts[0].pubkey == event_authority
+        && !context.instruction.accounts[0].is_signer
+        && !context.instruction.accounts[0].is_writable
+}
+
+fn direct_recover_dex_instruction<'a>(
+    contexts: &'a [crate::transaction::InnerInstructionContext],
+    dex_programs: &[Pubkey; 3],
+    jupiter_index: usize,
+) -> Option<&'a Instruction> {
+    let direct = contexts
+        .iter()
+        .filter(|context| {
+            dex_programs.contains(&context.instruction.program_id)
+                && context.outer_instruction_index as usize == jupiter_index
+                && context.stack_height == Some(2)
+        })
+        .collect::<Vec<_>>();
+    if direct.len() != 1 {
+        return None;
+    }
+    let dex = &direct[0].instruction;
+    if contexts.iter().any(|context| {
+        dex_programs.contains(&context.instruction.program_id)
+            && !(context.outer_instruction_index as usize == jupiter_index
+                && context.stack_height == Some(2))
+            && !is_inert_meteora_event_cpi(context, dex.program_id, jupiter_index)
+    }) {
+        return None;
+    }
+    Some(dex)
 }
 
 fn raydium_tick_accounts_start(
@@ -1722,21 +1770,17 @@ impl TransactionValidator {
         let pumpswap_program =
             Pubkey::from_str(PUMPSWAP_PROGRAM_ID).map_err(|_| KoraError::ConfigError)?;
         let dex_programs = [raydium_program, meteora_program, pumpswap_program];
-        let dex_contexts = transaction
-            .inner_instruction_contexts
-            .iter()
-            .filter(|context| dex_programs.contains(&context.instruction.program_id))
-            .collect::<Vec<_>>();
-        if dex_contexts.len() != 1
-            || dex_contexts[0].outer_instruction_index as usize != jupiter_index
-            || dex_contexts[0].stack_height != Some(2)
-        {
-            return Err(KoraError::InvalidTransaction(
+        let dex = direct_recover_dex_instruction(
+            &transaction.inner_instruction_contexts,
+            &dex_programs,
+            jupiter_index,
+        )
+        .ok_or_else(|| {
+            KoraError::InvalidTransaction(
                 "Recover Value requires exactly one direct approved DEX CPI from Jupiter"
                     .to_string(),
-            ));
-        }
-        let dex = &dex_contexts[0].instruction;
+            )
+        })?;
         let family = if dex.program_id == raydium_program {
             "RAYDIUM_CLMM"
         } else if dex.program_id == meteora_program {
@@ -3907,6 +3951,84 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn recover_accepts_only_inert_meteora_event_self_cpis() {
+        let program = Pubkey::from_str(METEORA_DLMM_PROGRAM_ID).unwrap();
+        let event_authority = Pubkey::find_program_address(&[b"__event_authority"], &program).0;
+        let mut data = ANCHOR_EVENT_CPI_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&[1; 137]);
+        let current = InnerInstructionContext {
+            instruction: Instruction::new_with_bytes(
+                program,
+                &data,
+                vec![AccountMeta::new_readonly(event_authority, false)],
+            ),
+            outer_instruction_index: 3,
+            stack_height: Some(3),
+        };
+        assert!(is_inert_meteora_event_cpi(&current, program, 3));
+        let programs = [
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap(),
+            program,
+            Pubkey::from_str(PUMPSWAP_PROGRAM_ID).unwrap(),
+        ];
+        let direct = InnerInstructionContext {
+            instruction: Instruction::new_with_bytes(program, &[1], vec![]),
+            outer_instruction_index: 3,
+            stack_height: Some(2),
+        };
+        let current_second = current.clone();
+        let contexts = vec![direct.clone(), current.clone(), current_second];
+        assert_eq!(
+            direct_recover_dex_instruction(&contexts, &programs, 3)
+                .map(|instruction| instruction.program_id),
+            Some(program)
+        );
+        let mut duplicate_direct = contexts.clone();
+        duplicate_direct.push(direct.clone());
+        assert!(direct_recover_dex_instruction(&duplicate_direct, &programs, 3).is_none());
+
+        let mut mutations = vec![];
+        let mut wrong_parent = current.clone();
+        wrong_parent.outer_instruction_index = 2;
+        mutations.push(wrong_parent);
+        let mut wrong_stack = current.clone();
+        wrong_stack.stack_height = Some(2);
+        mutations.push(wrong_stack);
+        let mut wrong_discriminator = current.clone();
+        wrong_discriminator.instruction.data[0] ^= 1;
+        mutations.push(wrong_discriminator);
+        let mut writable = current.clone();
+        writable.instruction.accounts[0].is_writable = true;
+        mutations.push(writable);
+        let mut signer = current.clone();
+        signer.instruction.accounts[0].is_signer = true;
+        mutations.push(signer);
+        let mut wrong_authority = current.clone();
+        wrong_authority.instruction.accounts[0].pubkey = Pubkey::new_unique();
+        mutations.push(wrong_authority);
+        let mut extra_account = current.clone();
+        extra_account
+            .instruction
+            .accounts
+            .push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+        mutations.push(extra_account);
+        let mut oversized = current.clone();
+        oversized.instruction.data.resize(257, 0);
+        mutations.push(oversized);
+
+        for mutation in mutations {
+            assert!(!is_inert_meteora_event_cpi(&mutation, program, 3));
+            assert!(direct_recover_dex_instruction(&[direct.clone(), mutation], &programs, 3,)
+                .is_none());
+        }
+        assert!(!is_inert_meteora_event_cpi(
+            &current,
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap(),
+            3,
+        ));
+    }
+
+    #[test]
     fn raydium_tick_arrays_must_start_at_current_range_and_be_consecutive_in_one_direction() {
         assert!(valid_raydium_tick_array_sequence(&[-600, 0, 600], -600, 600));
         assert!(valid_raydium_tick_array_sequence(&[-600, -1200, -1800], -600, 600));
@@ -5500,8 +5622,7 @@ mod tests {
             .push(placeholder.to_string());
         transaction.all_instructions[3].accounts.push(AccountMeta::new(placeholder, false));
         transaction.all_account_keys.push(placeholder);
-        let accepted =
-            validator.validate_recover(&transaction, &rpc, payer_creations.clone()).await;
+        let accepted = validator.validate_recover(&transaction, &rpc, payer_creations).await;
         assert!(accepted.is_ok(), "{accepted:?}");
 
         transaction.inner_instruction_contexts.push(InnerInstructionContext {
