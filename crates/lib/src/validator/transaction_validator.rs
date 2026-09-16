@@ -1132,9 +1132,10 @@ impl TransactionValidator {
         let is_burn = token_instructions.first().and_then(|instruction| instruction.data.first())
             == Some(&15);
         let is_legacy_close_claim = !is_burn
-            && token_instructions.len() == 1
-            && token_instructions[0].program_id == legacy_token_program
-            && token_instructions[0].data.as_slice() == [9];
+            && !token_instructions.is_empty()
+            && token_instructions.iter().all(|instruction| {
+                instruction.program_id == legacy_token_program && instruction.data.as_slice() == [9]
+            });
         if is_burn {
             if !policy.burn_enabled
                 || compute_price != BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS
@@ -1435,7 +1436,7 @@ impl TransactionValidator {
             let wallet_account_is_safe = wallet_account.as_ref().is_none_or(|account| {
                 account.owner == SYSTEM_PROGRAM_ID && account.data.is_empty() && !account.executable
             });
-            if token_instructions.len() != 1
+            if (!is_legacy_close_claim && token_instructions.len() != 1)
                 || token_instructions[0].program_id != legacy_token_program
                 || !wallet_account_is_safe
                 || network_fee > CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS
@@ -1479,9 +1480,8 @@ impl TransactionValidator {
                         "Lighthouse Claim augmentation is invalid".to_string(),
                     ));
                 }
-            } else if token_instructions[0].data.as_slice() == [9] && source_state.base.amount == 0
-            {
-                let mut source_closed = false;
+            } else if is_legacy_close_claim {
+                let mut closed_sources = std::collections::HashSet::new();
                 let mut wallet_system = false;
                 let mut wallet_floor = false;
                 for assertion in assertions {
@@ -1491,13 +1491,12 @@ impl TransactionValidator {
                         ));
                     }
                     let account = &assertion.accounts[0];
-                    let accepted = if account.pubkey == *source
+                    let accepted = if source_keys.contains(&account.pubkey)
                         && !account.is_signer
                         && account.is_writable
                         && claim_lighthouse_closed_system_account_data_is_safe(&assertion.data)
-                        && !source_closed
+                        && closed_sources.insert(account.pubkey)
                     {
-                        source_closed = true;
                         true
                     } else if account.pubkey == wallet && account.is_signer && account.is_writable {
                         if claim_lighthouse_closed_system_account_data_is_safe(&assertion.data)
@@ -4781,6 +4780,93 @@ mod tests {
         (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet, source)
     }
 
+    fn claim_close_batch_lighthouse_fixture(
+        count: usize,
+    ) -> (
+        TransactionValidator,
+        VersionedTransactionResolved,
+        std::sync::Arc<RpcClient>,
+        Pubkey,
+        Vec<Pubkey>,
+    ) {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let token_program = spl_token_interface::id();
+        let lighthouse = Pubkey::from_str(PHANTOM_LIGHTHOUSE_PROGRAM_ID).unwrap();
+        let sources = (0..count).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
+        let reclaimed = 2_039_280_u64.checked_mul(count as u64).unwrap();
+        let service_fee = reclaimed * 300 / 10_000;
+        let expected_wallet_post = reclaimed - service_fee;
+        let mut policy = FeePayerPolicy::default();
+        policy.system.clean = CleanPolicy {
+            claim_enabled: true,
+            claim_v2_enabled: false,
+            burn_enabled: false,
+            settlement_wallet: treasury.to_string(),
+            fee_bps: 300,
+            maximum_claim_accounts: 10,
+            claim_compute_unit_limit: 10_000,
+            claim_min_compute_unit_price_micro_lamports: 1_000,
+            claim_max_compute_unit_price_micro_lamports: 100_000,
+        };
+        setup_config_with_policy(policy);
+        let mut instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(100_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(30_000),
+        ];
+        instructions.extend(sources.iter().map(|source| {
+            spl_token_interface::instruction::close_account(
+                &token_program,
+                source,
+                &wallet,
+                &wallet,
+                &[],
+            )
+            .unwrap()
+        }));
+        instructions.push(transfer(&wallet, &treasury, service_fee));
+        instructions.push(Instruction::new_with_bytes(
+            lighthouse,
+            &claim_lighthouse_account_data(expected_wallet_post),
+            vec![AccountMeta::new_readonly(wallet, false)],
+        ));
+        let message = solana_message::v0::Message::try_compile(
+            &payer,
+            &instructions,
+            &[],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        let transaction = TransactionUtil::new_unsigned_versioned_transaction_resolved(
+            VersionedMessage::V0(message),
+        )
+        .unwrap();
+        let mut source_accounts = sources
+            .iter()
+            .map(|_| {
+                let mint = Pubkey::new_unique();
+                let mut token_data = vec![0_u8; 165];
+                token_data[0..32].copy_from_slice(mint.as_ref());
+                token_data[32..64].copy_from_slice(wallet.as_ref());
+                token_data[108] = 1;
+                json!({ "data": [base64::engine::general_purpose::STANDARD.encode(token_data), "base64"], "executable": false, "lamports": 2_039_280, "owner": token_program.to_string(), "rentEpoch": 0 })
+            })
+            .collect::<Vec<_>>();
+        source_accounts.push(json!({ "data": ["", "base64"], "executable": false, "lamports": 0, "owner": SYSTEM_PROGRAM_ID.to_string(), "rentEpoch": 0 }));
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetMultipleAccounts,
+            json!({ "context": { "slot": 1 }, "value": source_accounts }),
+        );
+        mocks.insert(
+            RpcRequest::GetFeeForMessage,
+            json!({ "context": { "slot": 1 }, "value": 13_000 }),
+        );
+        let rpc = RpcMockBuilder::new().with_custom_mocks(mocks).build();
+        (TransactionValidator::new(payer).unwrap(), transaction, rpc, wallet, sources)
+    }
+
     fn recover_fixture(
         existing_wrapped: bool,
         source_mutation: Option<usize>,
@@ -5991,6 +6077,41 @@ mod tests {
                     if wallet_exists { "existing" } else { "unfunded" }
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_legacy_claim_accepts_bounded_closeaccount_batches() {
+        for count in [2, 3, 10] {
+            let (validator, transaction, rpc, _, _) = claim_close_batch_lighthouse_fixture(count);
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_ok(),
+                "legacy CloseAccount batch of {count} must pass"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_legacy_claim_batch_rejects_duplicate_source_settlement_and_assertion_mutations()
+    {
+        for mutation in 0..3 {
+            let (validator, mut transaction, rpc, _, sources) =
+                claim_close_batch_lighthouse_fixture(2);
+            match mutation {
+                0 => transaction.all_instructions[3].accounts[0].pubkey = sources[0],
+                1 => {
+                    transaction.all_instructions[4].data =
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 122_357 })
+                            .unwrap()
+                }
+                _ => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
+            }
+            assert!(
+                validator.validate_clean(&transaction, &rpc).await.is_err(),
+                "legacy CloseAccount batch mutation {mutation} must fail"
+            );
         }
     }
 
