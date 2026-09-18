@@ -506,11 +506,6 @@ impl ConfigValidator {
             {
                 errors.push("CLEAN Claim compute and priority-fee bounds are invalid".to_string());
             }
-            if clean.claim_v2_enabled && clean.maximum_claim_accounts != 1 {
-                errors.push(
-                    "CLEAN Claim V2 canary requires exactly one maximum_claim_account".to_string(),
-                );
-            }
             let mut required_programs =
                 vec![SYSTEM_PROGRAM_ID.to_string(), SPL_TOKEN_PROGRAM_ID.to_string()];
             if clean.claim_v2_enabled {
@@ -1078,8 +1073,8 @@ fn validate_token2022_extensions(config: &Token2022Config) -> Result<(), String>
 mod tests {
     use crate::{
         config::{
-            AuthConfig, CacheConfig, Config, EnabledMethods, FeePayerPolicy, KoraConfig,
-            MetricsConfig, NonceInstructionPolicy, RecoverPolicy, RecoverUserPolicy,
+            AuthConfig, CacheConfig, CleanPolicy, Config, EnabledMethods, FeePayerPolicy,
+            KoraConfig, MetricsConfig, NonceInstructionPolicy, RecoverPolicy, RecoverUserPolicy,
             SplTokenConfig, SplTokenInstructionPolicy, SystemInstructionPolicy,
             Token2022InstructionPolicy, UsageLimitConfig, ValidationConfig,
         },
@@ -1422,6 +1417,65 @@ mod tests {
         let mut broad_system = swap_config(families);
         broad_system.validation.fee_payer_policy.system.allow_transfer = true;
         assert!(swap_config_result(broad_system).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claim_v2_config_accepts_one_through_ten_accounts_and_rejects_wider_bounds() {
+        for maximum_claim_accounts in [1, 10] {
+            let mut policy = FeePayerPolicy::default();
+            policy.system.clean = CleanPolicy {
+                claim_enabled: true,
+                claim_v2_enabled: true,
+                burn_enabled: false,
+                settlement_wallet: Pubkey::new_unique().to_string(),
+                fee_bps: 300,
+                maximum_claim_accounts,
+                claim_compute_unit_limit: 10_000,
+                claim_min_compute_unit_price_micro_lamports: 1_000,
+                claim_max_compute_unit_price_micro_lamports: 100_000,
+            };
+            let config = ConfigMockBuilder::new()
+                .with_allowed_programs(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                    TOKEN_2022_PROGRAM_ID.to_string(),
+                ])
+                .with_fee_payer_policy(policy)
+                .build();
+            update_config(config).unwrap();
+            let rpc_client = RpcClient::new("http://localhost:8899".to_string());
+            let result = ConfigValidator::validate_with_result(&rpc_client, true).await;
+            assert!(result.is_ok(), "Claim V2 maximum {maximum_claim_accounts} failed: {result:?}");
+        }
+
+        for maximum_claim_accounts in [0, 11] {
+            let mut policy = FeePayerPolicy::default();
+            policy.system.clean = CleanPolicy {
+                claim_enabled: true,
+                claim_v2_enabled: true,
+                burn_enabled: false,
+                settlement_wallet: Pubkey::new_unique().to_string(),
+                fee_bps: 300,
+                maximum_claim_accounts,
+                claim_compute_unit_limit: 10_000,
+                claim_min_compute_unit_price_micro_lamports: 1_000,
+                claim_max_compute_unit_price_micro_lamports: 100_000,
+            };
+            let config = ConfigMockBuilder::new()
+                .with_allowed_programs(vec![
+                    SYSTEM_PROGRAM_ID.to_string(),
+                    SPL_TOKEN_PROGRAM_ID.to_string(),
+                    TOKEN_2022_PROGRAM_ID.to_string(),
+                ])
+                .with_fee_payer_policy(policy)
+                .build();
+            update_config(config).unwrap();
+            let rpc_client = RpcClient::new("http://localhost:8899".to_string());
+            let errors =
+                ConfigValidator::validate_with_result(&rpc_client, true).await.unwrap_err();
+            assert!(errors.iter().any(|error| error.contains("between 1 and 10")));
+        }
     }
 
     #[tokio::test]
