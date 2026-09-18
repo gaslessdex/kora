@@ -4176,7 +4176,7 @@ mod tests {
         v2[..8].copy_from_slice(&RAYDIUM_SWAP_V2_DISCRIMINATOR);
         assert!(valid_raydium_exact_in_route(&v2, &jupiter));
 
-        for mutation in 0..13 {
+        for mutation in 0..9 {
             let mut raydium = raydium.clone();
             let mut jupiter = jupiter.clone();
             match mutation {
@@ -6325,7 +6325,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn claim_v2_eight_account_batch_rejects_semantic_mutations() {
-        for mutation in 0..9 {
+        for mutation in 0..13 {
             let (validator, mut transaction, rpc, wallet, sources) =
                 claim_v2_mixed_eight_lighthouse_fixture();
             match mutation {
