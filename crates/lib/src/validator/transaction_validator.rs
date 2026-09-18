@@ -59,6 +59,13 @@ fn claim_lighthouse_account_data(lamport_floor: u64) -> Vec<u8> {
 }
 
 #[cfg(test)]
+fn claim_lighthouse_plaintext_account_data(lamport_floor: u64) -> Vec<u8> {
+    let mut data = claim_lighthouse_account_data(lamport_floor);
+    data[1] = 4;
+    data
+}
+
+#[cfg(test)]
 fn claim_lighthouse_closed_system_account_data() -> Vec<u8> {
     vec![6, 4, 2, 3, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
@@ -75,9 +82,21 @@ fn claim_lighthouse_token_data(amount_floor: u64, wallet: Pubkey) -> Vec<u8> {
     data
 }
 
+#[cfg(test)]
+fn claim_lighthouse_compact_token_data(amount_floor: u64) -> Vec<u8> {
+    let mut data = vec![10, 4, 4, 2];
+    data.extend_from_slice(&amount_floor.to_le_bytes());
+    data.extend_from_slice(&[4, 3, 0, 0, 6]);
+    data.extend_from_slice(&0_u64.to_le_bytes());
+    data.extend_from_slice(&[5, 8]);
+    data
+}
+
 fn claim_lighthouse_account_data_is_safe(data: &[u8], expected_post_lamports: u64) -> bool {
     data.len() == 26
-        && data[..4] == [6, 5, 3, 0]
+        && data[0] == 6
+        && matches!(data[1], 4 | 5)
+        && data[2..4] == [3, 0]
         && u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8])) <= expected_post_lamports
         && data[12..17] == [4, 3, 0, 0, 1]
         && data[17..25] == [0; 8]
@@ -117,14 +136,20 @@ fn claim_lighthouse_token_data_is_safe(
     expected_post_amount: u64,
     wallet: Pubkey,
 ) -> bool {
-    data.len() == 64
+    (data.len() == 64
         && data[..5] == [10, 5, 6, 8, 2]
         && u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8])) <= expected_post_amount
         && data[13..18] == [4, 3, 0, 0, 6]
         && data[18..26] == [0; 8]
         && data[26..28] == [0, 1]
         && data[28..60] == wallet.to_bytes()
-        && data[60..64] == [0, 7, 0, 0]
+        && data[60..64] == [0, 7, 0, 0])
+        || (data.len() == 27
+            && data[..4] == [10, 4, 4, 2]
+            && u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8])) <= expected_post_amount
+            && data[12..17] == [4, 3, 0, 0, 6]
+            && data[17..25] == [0; 8]
+            && data[25..27] == [5, 8])
 }
 
 fn valid_raydium_tick_array_sequence(starts: &[i32], current_start: i32, interval: i32) -> bool {
@@ -4151,7 +4176,7 @@ mod tests {
         v2[..8].copy_from_slice(&RAYDIUM_SWAP_V2_DISCRIMINATOR);
         assert!(valid_raydium_exact_in_route(&v2, &jupiter));
 
-        for mutation in 0..9 {
+        for mutation in 0..13 {
             let mut raydium = raydium.clone();
             let mut jupiter = jupiter.clone();
             match mutation {
@@ -4978,13 +5003,13 @@ mod tests {
         instructions.extend(withdraw_sources.iter().map(|source| {
             Instruction::new_with_bytes(
                 lighthouse,
-                &claim_lighthouse_token_data(0, wallet),
+                &claim_lighthouse_compact_token_data(1_000_000),
                 vec![AccountMeta::new_readonly(*source, false)],
             )
         }));
         instructions.push(Instruction::new_with_bytes(
             lighthouse,
-            &claim_lighthouse_account_data(reclaimed - service_fee),
+            &claim_lighthouse_plaintext_account_data(reclaimed - service_fee),
             vec![AccountMeta::new_readonly(wallet, false)],
         ));
 
@@ -6313,7 +6338,7 @@ mod tests {
                 3 => {
                     transaction.all_instructions.pop();
                 }
-                4 => transaction.all_instructions[17].data[5..13]
+                4 => transaction.all_instructions[17].data[4..12]
                     .copy_from_slice(&1_000_001_u64.to_le_bytes()),
                 5 => transaction.all_instructions[11].accounts[0].pubkey = Pubkey::new_unique(),
                 6 => transaction.all_instructions[19].data[4..12]
@@ -6321,7 +6346,11 @@ mod tests {
                 7 => transaction
                     .all_instructions
                     .insert(2, transfer(&validator.fee_payer_pubkey, &wallet, 1)),
-                _ => transaction.all_instructions[8].accounts[2].pubkey = Pubkey::new_unique(),
+                8 => transaction.all_instructions[8].accounts[2].pubkey = Pubkey::new_unique(),
+                9 => transaction.all_instructions[17].data[14] = 1,
+                10 => transaction.all_instructions[17].data[25] = 4,
+                11 => transaction.all_instructions[17].data[26] = 7,
+                _ => transaction.all_instructions[19].data[1] = 3,
             }
             assert!(
                 validator.validate_clean(&transaction, &rpc).await.is_err(),
