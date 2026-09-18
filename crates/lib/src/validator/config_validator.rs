@@ -495,8 +495,8 @@ impl ConfigValidator {
             if clean.fee_bps != 300 {
                 errors.push("CLEAN V1 fee_bps must be exactly 300".to_string());
             }
-            if clean.maximum_claim_accounts == 0 || clean.maximum_claim_accounts > 10 {
-                errors.push("CLEAN maximum_claim_accounts must be between 1 and 10".to_string());
+            if clean.maximum_claim_accounts == 0 || clean.maximum_claim_accounts > 64 {
+                errors.push("CLEAN maximum_claim_accounts must be between 1 and 64".to_string());
             }
             if clean.claim_enabled
                 && (!(2_500..=100_000).contains(&clean.claim_compute_unit_limit)
@@ -1421,8 +1421,8 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn claim_v2_config_accepts_one_through_ten_accounts_and_rejects_wider_bounds() {
-        for maximum_claim_accounts in [1, 10] {
+    async fn claim_config_uses_the_solana_key_ceiling_not_a_batch_shape() {
+        for maximum_claim_accounts in [1, 10, 64] {
             let mut policy = FeePayerPolicy::default();
             policy.system.clean = CleanPolicy {
                 claim_enabled: true,
@@ -1449,7 +1449,7 @@ mod tests {
             assert!(result.is_ok(), "Claim V2 maximum {maximum_claim_accounts} failed: {result:?}");
         }
 
-        for maximum_claim_accounts in [0, 11] {
+        for maximum_claim_accounts in [0, 65] {
             let mut policy = FeePayerPolicy::default();
             policy.system.clean = CleanPolicy {
                 claim_enabled: true,
@@ -1474,7 +1474,7 @@ mod tests {
             let rpc_client = RpcClient::new("http://localhost:8899".to_string());
             let errors =
                 ConfigValidator::validate_with_result(&rpc_client, true).await.unwrap_err();
-            assert!(errors.iter().any(|error| error.contains("between 1 and 10")));
+            assert!(errors.iter().any(|error| error.contains("between 1 and 64")));
         }
     }
 

@@ -38,10 +38,10 @@ const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgr
 const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const ANCHOR_EVENT_CPI_DISCRIMINATOR: [u8; 8] = [228, 69, 165, 46, 81, 203, 154, 29];
-const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_LIMIT: u32 = 50_000;
+const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const CLAIM_LIGHTHOUSE_MAX_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 100_000;
-const CLAIM_LIGHTHOUSE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 5_000;
-const CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS: u64 = 15_000;
+const CLAIM_LIGHTHOUSE_MAX_PRIORITY_FEE_LAMPORTS: u64 = 20_000;
+const CLAIM_LIGHTHOUSE_MAX_NETWORK_FEE_LAMPORTS: u64 = 30_000;
 const BURN_CANONICAL_COMPUTE_UNIT_LIMIT: u32 = 100_000;
 const BURN_AUGMENTED_COMPUTE_UNIT_LIMIT: u32 = 120_000;
 const BURN_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 375_000;
@@ -271,7 +271,9 @@ const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const PHANTOM_LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
 const RELAY_PROGRAM_ID: &str = "99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2";
-const MAX_LIGHTHOUSE_ASSERTIONS: usize = 4;
+// One independently decoded post-state assertion per Claim source plus the wallet.
+// The Solana static-key limit is the tighter protocol bound for real transactions.
+const MAX_LIGHTHOUSE_ASSERTIONS: usize = 65;
 const MAX_LIGHTHOUSE_DATA_BYTES: usize = 256;
 // This validator intentionally supports Raydium's legacy SPL-token-only `swap`
 // account layout. Its 13-account shape is different from `swap_v2`, even though
@@ -1555,7 +1557,17 @@ impl TransactionValidator {
         } else {
             service_fee
         };
-        if settlement_lamports != expected_settlement {
+        // A partitioned Claim allocates floor(total * 3%) exactly across its
+        // transactions. A batch therefore settles either its local floor or the
+        // single-lamport carry produced by cumulative integer division. Kora still
+        // rejects any larger user debit independently of GASLESS.
+        let settlement_valid = if is_burn {
+            settlement_lamports == expected_settlement
+        } else {
+            settlement_lamports == expected_settlement
+                || settlement_lamports == expected_settlement.saturating_add(1)
+        };
+        if !settlement_valid {
             return Err(KoraError::InvalidTransaction(
                 "CLEAN settlement does not match the action fee policy".to_string(),
             ));
@@ -6205,7 +6217,7 @@ mod tests {
                 10 => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
                 11 => transaction.all_instructions[4].program_id = Pubkey::new_unique(),
                 12 => transaction.all_instructions[1].data[1..5]
-                    .copy_from_slice(&50_001_u32.to_le_bytes()),
+                    .copy_from_slice(&200_001_u32.to_le_bytes()),
                 _ => transaction.all_instructions[0].data[1..9]
                     .copy_from_slice(&100_001_u64.to_le_bytes()),
             }
@@ -6256,7 +6268,7 @@ mod tests {
                 0 => transaction.all_instructions[3].accounts[0].pubkey = sources[0],
                 1 => {
                     transaction.all_instructions[4].data =
-                        bincode::serialize(&SystemInstruction::Transfer { lamports: 122_357 })
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 122_358 })
                             .unwrap()
                 }
                 _ => transaction.all_instructions[5].accounts[0].pubkey = Pubkey::new_unique(),
@@ -6275,6 +6287,14 @@ mod tests {
         assert_eq!(sources.len(), 8);
         let result = validator.validate_clean(&transaction, &rpc).await;
         assert!(result.is_ok(), "exact mixed eight-account batch failed: {result:?}");
+        let (validator, mut transaction, rpc, _, _) = claim_v2_mixed_eight_lighthouse_fixture();
+        transaction.all_instructions[1].data =
+            ComputeBudgetInstruction::set_compute_unit_limit(200_000).data;
+        let result = validator.validate_clean(&transaction, &rpc).await;
+        assert!(
+            result.is_ok(),
+            "semantic eight-account batch must not depend on the old 50k-CU shape: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -6323,7 +6343,7 @@ mod tests {
                 3 => transaction.all_instructions[4].accounts[0].pubkey = Pubkey::new_unique(),
                 4 => transaction.all_instructions[4].program_id = Pubkey::new_unique(),
                 5 => transaction.all_instructions[1].data[1..5]
-                    .copy_from_slice(&50_001_u32.to_le_bytes()),
+                    .copy_from_slice(&200_001_u32.to_le_bytes()),
                 6 => transaction.all_instructions[0].data[1..9]
                     .copy_from_slice(&100_001_u64.to_le_bytes()),
                 7 => transaction.all_instructions[0].data[1..9]
@@ -6333,7 +6353,7 @@ mod tests {
                 9 => transaction.all_instructions[2].data = vec![38],
                 10 => {
                     transaction.all_instructions[3].data =
-                        bincode::serialize(&SystemInstruction::Transfer { lamports: 61_179 })
+                        bincode::serialize(&SystemInstruction::Transfer { lamports: 61_180 })
                             .unwrap()
                 }
                 _ => {

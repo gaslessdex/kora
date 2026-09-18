@@ -39,9 +39,9 @@ wallets solely after a valid application authorization and does not relax the ex
 route, signer, account, compute, Lighthouse, LUT, live-state, or sponsor checks. The default is
 false, and configuring both modes is rejected.
 
-## Local-only CLEAN policy
+## CLEAN policy
 
-This policy is disabled by default and has not been deployed:
+Claim and Burn remain independently opt-in through configuration:
 
 ```toml
 [validation.fee_payer_policy.system.clean]
@@ -49,19 +49,27 @@ claim_enabled = false
 burn_enabled = false
 settlement_wallet = "EEFxZ3mtdPXNKkBQkbuAw1HBPvQvU2HVKWvRVbuciSsb"
 fee_bps = 300
-maximum_claim_accounts = 10
+maximum_claim_accounts = 64
 claim_compute_unit_limit = 10000
 claim_min_compute_unit_price_micro_lamports = 1000
 claim_max_compute_unit_price_micro_lamports = 100000
 ```
 
-Claim/Burn validation is shape-specific: v0, exactly payer and user signers, current eligible SPL state, and user recovery destination. Claim requires the configured bounded compute prefix and a settlement of exactly the integer-floor 3% service fee; Kora's payer absorbs the network fee. Burn retains the exact 375000/100000 compute prefix, full-balance validation, and 3% fee plus network reimbursement. Global create-account, System transfer, SPL burn, and SPL close permissions must remain false. Recover uses the separate narrow policy below.
+Claim validation is generic across each currently executable Legacy SPL and Token-2022
+`CloseAccount` or `WithdrawExcessLamports` source in a v0 message with exactly payer and user
+signers. It validates every source against live RPC state, exact authority/program/recovery
+semantics, the user recovery destination, and one 3% settlement. A partitioned workflow may
+settle either the batch-local integer floor or its one-lamport cumulative-floor carry; GASLESS
+binds the batch fees to exactly `floor(total gross * 3%)`. The semantic Lighthouse suffix is
+decoded per source plus wallet and is bounded to 200,000 compute units, 100,000
+micro-lamports/unit, 20,000 priority-fee lamports, and 30,000 total network-fee lamports. It is
+not keyed to wallet brand or source count. `claim_v2_enabled` remains the execution switch for
+WithdrawExcessLamports and Token-2022 internals; the public product remains one Claim feature.
 
-Legacy SPL `CloseAccount` Lighthouse validation belongs to the ordinary `claim_enabled`
-policy and remains available when `claim_v2_enabled = false`. It is limited to one empty
-Legacy source, the unchanged 3% settlement, the bounded compute envelope, and the exact
-semantic Phantom/Solflare assertion suffixes. `claim_v2_enabled` continues to gate
-`WithdrawExcessLamports` and every Token-2022 Claim shape.
+Burn retains the exact 375000/100000 compute prefix, full-balance validation, and 3% fee plus
+network reimbursement. Global create-account, arbitrary System transfer, SPL burn, and SPL close
+permissions remain false. Kora exposes sign-only for these paths; sign-and-send remains disabled.
+Recover uses the separate narrow policy below.
 
 ## Recover Value policy
 
